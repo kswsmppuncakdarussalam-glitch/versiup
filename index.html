@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DISIPLIN KITA BISA</title>
+    <meta name="description" content="Aplikasi presensi dan kedisiplinan siswa sekolah dengan sistem scan/RFID instan, izin keluar kelas berkuota, pencatatan pelanggaran, rekap real time, dan sinkronisasi multi-perangkat." />
+    <meta property="og:title" content="DISIPLIN KITA BISA" />
+    <meta property="og:description" content="Aplikasi presensi dan kedisiplinan siswa sekolah dengan sistem scan/RFID instan, izin keluar kelas berkuota, pencatatan pelanggaran, rekap real time, dan sinkronisasi multi-perangkat." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#0f172a" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="alternate icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <script>
+      // Suppress benign WebSocket errors from Vite HMR in cloud sandbox environments
+      (function () {
+        if (typeof window !== 'undefined') {
+          // 1. Intercept console.error and console.warn for Vite WebSocket HMR messages
+          const origConsoleError = console.error;
+          console.error = function (...args) {
+            const str = args.map((a) => (typeof a === 'object' && a?.message ? a.message : String(a))).join(' ');
+            if (str.includes('WebSocket') || str.includes('websocket') || str.includes('vite-hmr') || str.includes('closed without opened')) {
+              return;
+            }
+            origConsoleError.apply(console, args);
+          };
+
+          const origConsoleWarn = console.warn;
+          console.warn = function (...args) {
+            const str = args.map((a) => (typeof a === 'object' && a?.message ? a.message : String(a))).join(' ');
+            if (str.includes('WebSocket') || str.includes('websocket') || str.includes('vite-hmr') || str.includes('closed without opened')) {
+              return;
+            }
+            origConsoleWarn.apply(console, args);
+          };
+
+          // 2. Mock WebSocket for vite-hmr to avoid connection failure in sandbox
+          if (window.WebSocket) {
+            const OrigWebSocket = window.WebSocket;
+            window.WebSocket = function (url, protocols) {
+              if (
+                protocols === 'vite-hmr' ||
+                (Array.isArray(protocols) && protocols.includes('vite-hmr')) ||
+                (typeof url === 'string' && (url.includes('token=') || url.includes('/@vite/client')))
+              ) {
+                const target = new EventTarget();
+                const fakeSocket = {
+                  readyState: 1, // OPEN
+                  url: String(url),
+                  protocol: 'vite-hmr',
+                  binaryType: 'blob',
+                  send: function () {},
+                  close: function () {
+                    fakeSocket.readyState = 3;
+                  },
+                  addEventListener: function (type, listener, options) {
+                    target.addEventListener(type, listener, options);
+                    if (type === 'open') {
+                      setTimeout(() => {
+                        const evt = new Event('open');
+                        target.dispatchEvent(evt);
+                        if (typeof fakeSocket.onopen === 'function') fakeSocket.onopen(evt);
+                      }, 0);
+                    }
+                  },
+                  removeEventListener: function (type, listener, options) {
+                    target.removeEventListener(type, listener, options);
+                  },
+                  dispatchEvent: function (event) {
+                    return target.dispatchEvent(event);
+                  },
+                  onopen: null,
+                  onmessage: null,
+                  onerror: null,
+                  onclose: null,
+                };
+                return fakeSocket;
+              }
+              return new OrigWebSocket(url, protocols);
+            };
+            window.WebSocket.prototype = OrigWebSocket.prototype;
+            window.WebSocket.CONNECTING = OrigWebSocket.CONNECTING || 0;
+            window.WebSocket.OPEN = OrigWebSocket.OPEN || 1;
+            window.WebSocket.CLOSING = OrigWebSocket.CLOSING || 2;
+            window.WebSocket.CLOSED = OrigWebSocket.CLOSED || 3;
+          }
+
+          // 3. Suppress global error events
+          window.addEventListener(
+            'unhandledrejection',
+            function (e) {
+              const msg = (e && e.reason && (e.reason.message || String(e.reason))) || '';
+              if (
+                typeof msg === 'string' &&
+                (msg.includes('WebSocket') || msg.includes('websocket') || msg.includes('vite') || msg.includes('closed without opened'))
+              ) {
+                e.preventDefault();
+                if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+              }
+            },
+            true
+          );
+
+          window.addEventListener(
+            'error',
+            function (e) {
+              const msg = (e && (e.message || (e.error && e.error.message))) || '';
+              if (
+                typeof msg === 'string' &&
+                (msg.includes('WebSocket') || msg.includes('websocket') || msg.includes('vite') || msg.includes('closed without opened'))
+              ) {
+                e.preventDefault();
+                if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+                return true;
+              }
+            },
+            true
+          );
+        }
+      })();
+    </script>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
