@@ -531,7 +531,8 @@
     "google_account_email": "kswsmp.puncakdarussalam@gmail.com",
     "google_account_name": "Kesiswaan SMP Puncak Darussalam",
     "google_last_synced_at": "2026-11-10T09:38:00.000Z",
-    "updated_at": "2026-11-10T09:38:00.000Z"
+    "updated_at": "2026-11-10T09:38:00.000Z",
+    "google_client_id": "1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com"
   },
   "notification_settings": {
     "email_enabled": false,

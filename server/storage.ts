@@ -59,11 +59,22 @@ class StorageManager {
       }
       // If deployed on Vercel, copy bundled seed data to /tmp if not already present
       if (IS_VERCEL && !fs.existsSync(DB_FILE)) {
-        const bundledDb = path.resolve(process.cwd(), '.data', 'database.json');
-        if (fs.existsSync(bundledDb)) {
-          try {
-            fs.copyFileSync(bundledDb, DB_FILE);
-          } catch {}
+        const candidates = [
+          path.resolve(process.cwd(), '.data', 'database.json'),
+          path.resolve(process.cwd(), '..', '.data', 'database.json'),
+          path.resolve('/var/task', '.data', 'database.json'),
+          path.resolve('/var/task', 'database.json'),
+        ];
+        for (const candidate of candidates) {
+          if (fs.existsSync(candidate)) {
+            try {
+              fs.copyFileSync(candidate, DB_FILE);
+              console.log('[Storage] Successfully seeded Vercel /tmp DB from:', candidate);
+              break;
+            } catch (copyErr) {
+              console.warn('[Storage] Copy failed from:', candidate, copyErr);
+            }
+          }
         }
       }
     } catch (err) {
@@ -112,6 +123,19 @@ class StorageManager {
             this.db.notification_settings.weekly_recap_enabled = true;
             this.db.notification_settings.weekly_recap_day = 5; // Friday
             this.db.notification_settings.weekly_recap_time = '15:00';
+            modified = true;
+          }
+        }
+
+        // Ensure google_account_email is configured
+        if (this.db?.settings) {
+          if (!this.db.settings.google_account_email) {
+            this.db.settings.google_account_email = 'kswsmp.puncakdarussalam@gmail.com';
+            this.db.settings.google_account_name = 'Kesiswaan SMP Puncak Darussalam';
+            modified = true;
+          }
+          if (this.db.settings.toggle_email_notifications === undefined) {
+            this.db.settings.toggle_email_notifications = true;
             modified = true;
           }
         }
@@ -1471,8 +1495,11 @@ class StorageManager {
         out_of_class_bab_duration: 10,
         out_of_class_other_duration: 2,
         toggle_allow_edit_violation_points: true,
-        toggle_email_notifications: false,
+        toggle_email_notifications: true,
         toggle_kiosk_mode: false,
+        google_account_email: 'kswsmp.puncakdarussalam@gmail.com',
+        google_account_name: 'Kesiswaan SMP Puncak Darussalam',
+        google_client_id: '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com',
         updated_at: now,
       },
       notification_settings: {
