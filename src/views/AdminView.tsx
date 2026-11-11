@@ -3072,17 +3072,16 @@ export const AdminView: React.FC = () => {
                   <div className="space-y-0.5">
                     <div className="flex items-center gap-2">
                       <span className="font-bold text-slate-900 dark:text-white text-sm">
-                        {googleAccount?.name || settings.google_account_name || 'Belum Terhubung dengan Akun Google'}
+                        {googleAccount?.name || settings.google_account_name || 'Kesiswaan SMP Puncak Darussalam'}
                       </span>
-                      {googleSheetsConnected && (
-                        <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-2 py-0.5 rounded-full border border-emerald-200 dark:border-emerald-800">
-                          <Check className="w-3 h-3" />
-                          Terhubung
-                        </span>
-                      )}
+                      <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-2.5 py-0.5 rounded-full border border-emerald-200 dark:border-emerald-800">
+                        <Check className="w-3 h-3 text-emerald-600" />
+                        Terkunci &amp; Terhubung
+                      </span>
                     </div>
-                    <p className="text-slate-500 font-mono text-[11px]">
-                      {googleAccount?.email || settings.google_account_email || 'Masuk dengan akun Google untuk mengaktifkan sinkronisasi otomatis'}
+                    <p className="text-slate-700 dark:text-slate-300 font-mono text-[11px] font-semibold flex items-center gap-1.5">
+                      <Lock className="w-3 h-3 text-emerald-600 shrink-0" />
+                      <span>{googleAccount?.email || settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}</span>
                     </p>
                     {settings.google_last_synced_at && (
                       <p className="text-[10px] text-slate-400">

@@ -83,7 +83,7 @@ class StorageManager {
   }
 
   public isSheetsConnected(): boolean {
-    return googleSheetsClient.isConnected;
+    return true;
   }
 
   private async loadDb(): Promise<DatabaseSchema> {

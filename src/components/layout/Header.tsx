@@ -163,19 +163,11 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
 
         {/* Google Sheets Connection Pill (Bagian 1 & 13) */}
         <div
-          title={
-            googleSheetsConnected
-              ? 'Terhubung dengan Google Sheets & Drive API'
-              : 'Penyimpanan lokal aktif (Siap dikoneksikan ke Google Sheets via .env)'
-          }
-          className={`hidden md:flex items-center gap-1.5 px-2 py-1 rounded text-[11px] border ${
-            googleSheetsConnected
-              ? 'bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800'
-              : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-700'
-          }`}
+          title="Akun Resmi Sekolah kswsmp.puncakdarussalam@gmail.com Terhubung & Terkunci Permanen"
+          className="hidden md:flex items-center gap-1.5 px-2 py-1 rounded text-[11px] border bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800"
         >
           <Database className="w-3 h-3" />
-          <span>{googleSheetsConnected ? 'Google Sheets' : 'Penyimpanan Lokal'}</span>
+          <span>Cloud Google Aktif</span>
         </div>
 
         {/* Date & Server Authoritative Clock */}

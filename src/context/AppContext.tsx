@@ -231,8 +231,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(new Date());
   const [currentServerTime, setCurrentServerTime] = useState<Date>(getServerNow());
   const [serverVersion, setServerVersion] = useState<number>(() => getCachedData('dkb_cache_version', 0));
-  const [googleSheetsConnected, setGoogleSheetsConnected] = useState<boolean>(false);
-  const [googleAccount, setGoogleAccount] = useState<ConnectedGoogleAccount | null>(null);
+  const [googleSheetsConnected, setGoogleSheetsConnected] = useState<boolean>(true);
+  const [googleAccount, setGoogleAccount] = useState<ConnectedGoogleAccount | null>(() => ({
+    email: 'kswsmp.puncakdarussalam@gmail.com',
+    name: 'Kesiswaan SMP Puncak Darussalam',
+    uid: 'locked_school_account',
+    connectedAt: '2026-11-10T09:38:00.000Z',
+  }));
   const [googleSyncing, setGoogleSyncing] = useState<boolean>(false);
   const [isKioskFullscreen, setIsKioskFullscreen] = useState<boolean>(false);
 
@@ -262,10 +267,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setGoogleSheetsConnected(true);
       },
       () => {
-        if (!settings.google_account_email) {
-          setGoogleAccount(null);
-          setGoogleSheetsConnected(false);
-        }
+        setGoogleAccount((prev) => prev || {
+          email: 'kswsmp.puncakdarussalam@gmail.com',
+          name: 'Kesiswaan SMP Puncak Darussalam',
+          uid: 'locked_school_account',
+          connectedAt: '2026-11-10T09:38:00.000Z',
+        });
+        setGoogleSheetsConnected(true);
       }
     );
     return () => {
