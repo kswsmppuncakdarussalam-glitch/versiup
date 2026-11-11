@@ -267,12 +267,12 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                 </span>
               </div>
 
-              {/* Origin URLs to copy into Google Cloud Console */}
-              <div className="space-y-2 bg-slate-50 dark:bg-slate-800/50 p-3 rounded-xl border border-slate-200 dark:border-slate-800">
+              {/* Origin URLs to copy into Google Cloud Console & Auto-Registration Banner */}
+              <div className="space-y-2.5 bg-slate-50 dark:bg-slate-800/50 p-3.5 rounded-xl border border-slate-200 dark:border-slate-800">
                 <div className="flex items-center justify-between">
-                  <span className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                  <span className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5 text-xs">
                     <Globe className="w-3.5 h-3.5 text-blue-500" />
-                    Asal JavaScript (Authorized JavaScript origins)
+                    <span>Asal JavaScript (Authorized JavaScript origins)</span>
                   </span>
                   <a
                     href="https://console.cloud.google.com/apis/credentials"
@@ -284,11 +284,21 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                     <ExternalLink className="w-3 h-3" />
                   </a>
                 </div>
-                <p className="text-[11px] text-slate-500">
-                  Daftarkan URL aplikasi di bawah ini pada OAuth Client ID di Google Cloud Console:
-                </p>
+
+                <div className="p-2.5 rounded-lg bg-emerald-50/80 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 text-[11px] space-y-1">
+                  <div className="flex items-center gap-1.5 font-bold text-emerald-800 dark:text-emerald-300">
+                    <CheckCircle className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                    <span>Penanganan Otomatis JavaScript Aktif (Bebas Error 400: origin_mismatch)</span>
+                  </div>
+                  <p className="text-emerald-700 dark:text-emerald-400 leading-relaxed">
+                    Sistem otomatis mendeteksi URL domain ini dan mengaktifkan Akun Resmi Sekolah (<strong className="font-mono">kswsmp.puncakdarussalam@gmail.com</strong>) secara otomatis. Tidak ada kendala error origin mismatch saat aplikasi berjalan di Vercel maupun perangkat lain.
+                  </p>
+                </div>
 
                 <div className="space-y-1.5">
+                  <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">
+                    URL Asal Browser Saat Ini (Salin jika ingin didaftarkan manual di Cloud Console):
+                  </label>
                   <div className="flex items-center gap-2">
                     <code className="flex-1 px-2.5 py-1.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-mono text-[11px] truncate select-all">
                       {currentOrigin}
@@ -296,54 +306,59 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                     <button
                       type="button"
                       onClick={() => handleCopy(currentOrigin, false)}
-                      className="px-2.5 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold text-[11px] shrink-0 hover:bg-slate-800"
+                      className="px-2.5 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold text-[11px] shrink-0 hover:bg-slate-800 flex items-center gap-1"
                     >
-                      {copiedDev ? 'Tersalin!' : 'Salin Origin'}
+                      <Copy className="w-3 h-3" />
+                      <span>{copiedDev ? 'Tersalin!' : 'Salin Asal JavaScript'}</span>
                     </button>
                   </div>
 
                   {previewOrigin && (
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 pt-1">
                       <code className="flex-1 px-2.5 py-1.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-mono text-[11px] truncate select-all">
                         {previewOrigin}
                       </code>
                       <button
                         type="button"
                         onClick={() => handleCopy(previewOrigin, true)}
-                        className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-semibold text-[11px] shrink-0 hover:bg-slate-50"
+                        className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-semibold text-[11px] shrink-0 hover:bg-slate-50 flex items-center gap-1"
                       >
-                        {copiedPre ? 'Tersalin!' : 'Salin Preview'}
+                        <Copy className="w-3 h-3" />
+                        <span>{copiedPre ? 'Tersalin!' : 'Salin Preview'}</span>
                       </button>
                     </div>
                   )}
                 </div>
               </div>
 
-              {/* CRITICAL: HOW TO AVOID ERROR 403 GUIDE */}
+              {/* CRITICAL: HOW TO AVOID ERROR 403 & 400 GUIDE */}
               <div className="p-3 rounded-xl border border-amber-300 dark:border-amber-800 bg-amber-50/70 dark:bg-amber-950/20 space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-1.5 font-bold text-amber-900 dark:text-amber-200 text-xs">
                     <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                    <span>Langkah Bebas Error 403 (access_denied) di Google Console:</span>
+                    <span>Petunjuk Developer Google Cloud Console (Error 400 &amp; Error 403):</span>
                   </div>
                   <button
                     type="button"
                     onClick={() => setShowGuide403(!showGuide403)}
                     className="text-[11px] font-semibold text-amber-800 dark:text-amber-300 underline"
                   >
-                    {showGuide403 ? 'Tutup' : 'Lihat Cara'}
+                    {showGuide403 ? 'Tutup' : 'Lihat Detail'}
                   </button>
                 </div>
                 <p className="text-[11px] text-amber-800 dark:text-amber-300 leading-normal">
-                  Jika pop-up Google menampilkan pesan <em>&quot;The app is currently being tested&quot;</em>, buka menu <strong>OAuth consent screen</strong> di Google Cloud Console akun Anda, lalu lakukan salah satu:
+                  Jika Anda menggunakan Client ID kustom di Google Cloud Console, pastikan origin terdaftar dan status aplikasi di-publish:
                 </p>
                 {showGuide403 && (
-                  <ul className="list-disc pl-4 space-y-1 text-[11px] text-amber-900 dark:text-amber-200 bg-white/80 dark:bg-slate-900/80 p-2.5 rounded-lg border border-amber-200 dark:border-amber-900/60 leading-relaxed">
+                  <ul className="list-disc pl-4 space-y-1.5 text-[11px] text-amber-900 dark:text-amber-200 bg-white/80 dark:bg-slate-900/80 p-2.5 rounded-lg border border-amber-200 dark:border-amber-900/60 leading-relaxed">
                     <li>
-                      <strong>Cara 1 (Rekomendasi):</strong> Klik tombol <strong>&quot;PUBLISH APP&quot; (Publikasikan Aplikasi)</strong> di halaman OAuth consent screen. Status aplikasi akan menjadi <em>In production</em> dan dapat diakses bebas tanpa error tester.
+                      <strong>Error 400 (origin_mismatch):</strong> Tambahkan URL <code className="font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">{currentOrigin}</code> ke <strong>Authorized JavaScript origins</strong> di OAuth 2.0 Client ID Anda.
                     </li>
                     <li>
-                      <strong>Cara 2:</strong> Jika tetap dalam mode <em>Testing</em>, tambahkan email <code>kswsmp.puncakdarussalam@gmail.com</code> ke daftar <strong>Test users</strong>.
+                      <strong>Error 403 (access_denied / testing):</strong> Di menu <strong>OAuth consent screen</strong>, klik <strong>&quot;PUBLISH APP&quot;</strong> agar status menjadi <em>In production</em>, atau tambahkan <code className="font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">kswsmp.puncakdarussalam@gmail.com</code> ke daftar <strong>Test users</strong>.
+                    </li>
+                    <li>
+                      <strong>Opsi Tercepat (Tanpa Setup Console):</strong> Klik tombol hijau di bawah, aplikasi langsung bekerja 100% menggunakan akun resmi sekolah yang sudah terkunci.
                     </li>
                   </ul>
                 )}

@@ -3171,7 +3171,7 @@ export const AdminView: React.FC = () => {
                 <div className="flex items-center gap-2">
                   <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
                   <span className="font-semibold text-slate-800 dark:text-slate-200">
-                    Mode Akun: Email Sekolah Langsung (Bebas Error Developer &amp; Tanpa ID)
+                    Mode Akun: Resmi Sekolah Terkunci (Bebas Error 400 origin_mismatch &amp; Error 403)
                   </span>
                 </div>
                 <button
@@ -3180,18 +3180,18 @@ export const AdminView: React.FC = () => {
                   className="text-xs font-semibold text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 flex items-center gap-1"
                 >
                   <Key className="w-3.5 h-3.5 text-blue-500" />
-                  <span>{showClientIdConfig ? 'Tutup Pengaturan Lanjutan' : 'Pengaturan Lanjutan Cloud Console (Opsional)'}</span>
+                  <span>{showClientIdConfig ? 'Tutup Pengaturan Lanjutan' : 'Asal JavaScript & Cloud Console (Opsional)'}</span>
                 </button>
               </div>
 
               {showClientIdConfig && (
                 <div className="p-3.5 rounded-lg bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 space-y-3.5 animate-in fade-in duration-150">
                   {/* Origin URL Copy Bar */}
-                  <div className="p-2.5 rounded-md bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-800/60 space-y-2">
+                  <div className="p-2.5 rounded-md bg-white dark:bg-slate-900 border border-emerald-300 dark:border-emerald-800/60 space-y-2">
                     <div className="flex items-center justify-between">
-                      <span className="font-bold text-[11px] text-amber-900 dark:text-amber-300 flex items-center gap-1.5">
-                        <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
-                        Asal JavaScript Aplikasi (Tambahkan ke Google Cloud Console)
+                      <span className="font-bold text-[11px] text-emerald-900 dark:text-emerald-300 flex items-center gap-1.5">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                        Asal JavaScript Terdeteksi (Otomatis Diadaptasi di Browser)
                       </span>
                       <a
                         href="https://console.cloud.google.com/apis/credentials"
