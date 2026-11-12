@@ -29,7 +29,7 @@ export const HomeroomTrendChart: React.FC<HomeroomTrendChartProps> = ({
 }) => {
   return (
     <div className="h-64 w-full">
-      <ResponsiveContainer width="100%" height="100%">
+      <ResponsiveContainer width="100%" height="100%" minWidth={0}>
         <LineChart data={data}>
           <XAxis dataKey="period" stroke="#94a3b8" fontSize={11} />
           <YAxis stroke="#94a3b8" fontSize={11} />

@@ -243,5 +243,10 @@ export async function parseStudentExcel(file: File, fallbackClassId: string = '1
 }
 
 export function downloadStudentTemplate() {
-  window.location.href = '/api/students?action=template';
+  const link = document.createElement('a');
+  link.href = '/api/students?action=template';
+  link.setAttribute('download', 'template_siswa.xlsx');
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
 }

@@ -1,3 +1,5 @@
+import React from 'react';
+
 /**
  * Time synchronization and clock offset calculation
  * Guarantees server-authoritative time on all devices
@@ -31,6 +33,20 @@ export function formatServerTime(date: Date = getServerNow()): string {
   const s = String(date.getSeconds()).padStart(2, '0');
   return `${h}:${m}:${s}`;
 }
+
+/**
+ * Isolated live ticking clock component to prevent parent view re-rendering
+ */
+export const LiveClockText: React.FC<{ className?: string }> = ({ className }) => {
+  const [timeStr, setTimeStr] = React.useState<string>(() => formatServerTime(getServerNow()));
+  React.useEffect(() => {
+    const timer = setInterval(() => {
+      setTimeStr(formatServerTime(getServerNow()));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+  return React.createElement('span', { className }, timeStr);
+};
 
 /**
  * Format date in Indonesian locale (e.g. "Jumat, 30 Oktober 2026")

@@ -26,7 +26,7 @@ export const StudentAffairsComparisonChart: React.FC<StudentAffairsComparisonCha
 }) => {
   return (
     <div className="h-72 w-full">
-      <ResponsiveContainer width="100%" height="100%">
+      <ResponsiveContainer width="100%" height="100%" minWidth={0}>
         <BarChart data={comparisonData}>
           <XAxis dataKey="name" stroke="#94a3b8" fontSize={11} />
           <YAxis stroke="#94a3b8" fontSize={11} />

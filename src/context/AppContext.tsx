@@ -125,7 +125,7 @@ interface AppContextType {
 }
 
 const defaultSettings: AppSettings = {
-  school_name: 'SMK BISA HEBAT NUSANTARA',
+  school_name: 'SMP Puncak Darussalam',
   logo_url: '',
   background_url: '',
   accent_color: '#0f172a',
@@ -348,11 +348,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [settings]
   );
 
-  // Clock Ticking effect (1 sec interval based on synced clock)
+  // Clock effect: updates at 10-second intervals to calculate active session & dates smoothly
+  // (Individual ticking clocks use isolated LiveClockText to avoid 60fps frame drops / stuttering)
   useEffect(() => {
+    setCurrentServerTime(getServerNow());
     const timer = setInterval(() => {
       setCurrentServerTime(getServerNow());
-    }, 1000);
+    }, 10000);
     return () => clearInterval(timer);
   }, []);
 
@@ -506,19 +508,48 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [session, showToast]);
 
-  // Delta Sync Call with Timeout & Safe Retry
-  const syncNow = useCallback(async () => {
+  // Two-Way Delta Sync with Timeout & Non-Stuttering Updates
+  const syncNow = useCallback(async (isManual = false, shouldBroadcast = true) => {
     if (isSyncingRef.current) return;
     isSyncingRef.current = true;
-    setSyncStatus('syncing');
+    if (isManual) {
+      setSyncStatus('syncing');
+    }
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s safe timeout
 
     try {
+      // 1. Flush offline queue via two-way sync POST if online
+      const isOnline = typeof navigator === 'undefined' || navigator.onLine;
+      if (isOnline) {
+        try {
+          const rawQ = typeof localStorage !== 'undefined' ? localStorage.getItem('dkb_offline_queue') : null;
+          if (rawQ) {
+            const queue = JSON.parse(rawQ);
+            if (Array.isArray(queue) && queue.length > 0) {
+              const pushRes = await fetch('/api/sync', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+                },
+                body: JSON.stringify({ mutations: queue }),
+              });
+              if (pushRes.ok) {
+                localStorage.removeItem('dkb_offline_queue');
+                showToast(`Sinkronisasi Dua Arah: ${queue.length} perubahan lokal berhasil disimpan ke database server.`, 'success');
+              }
+            }
+          }
+        } catch (flushErr) {
+          console.warn('Flush offline queue error:', flushErr);
+        }
+      }
+
+      // 2. Fetch server changes (always fetch clean full snapshot on first mount)
       let since = versionRef.current;
-      // Only force full snapshot (since=0) on the very first sync if local cache has no classes
-      if (!hasSyncedOnceRef.current && (classes.length === 0 || versionRef.current === 0)) {
+      if (!hasSyncedOnceRef.current) {
         since = 0;
       }
 
@@ -550,55 +581,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       if (data.googleSheetsConnected !== undefined) {
-        setGoogleSheetsConnected(data.googleSheetsConnected);
+        setGoogleSheetsConnected((prev) => (prev !== data.googleSheetsConnected ? data.googleSheetsConnected : prev));
       }
 
-      // Flush offline queue if back online
-      if (typeof navigator !== 'undefined' && navigator.onLine) {
-        try {
-          const rawQ = localStorage.getItem('dkb_offline_queue');
-          if (rawQ) {
-            const queue = JSON.parse(rawQ);
-            if (Array.isArray(queue) && queue.length > 0) {
-              const remaining: any[] = [];
-              let uploaded = 0;
-              for (const item of queue) {
-                try {
-                  const url = item.type === 'attendance' ? '/api/attendance' : item.type === 'out_of_class' ? '/api/out-of-class' : '/api/violations';
-                  const pushRes = await fetch(url, {
-                    method: 'POST',
-                    headers: {
-                      'Content-Type': 'application/json',
-                      ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-                    },
-                    body: JSON.stringify(item.payload),
-                  });
-                  if (pushRes.ok) {
-                    uploaded++;
-                  } else {
-                    remaining.push(item);
-                  }
-                } catch {
-                  remaining.push(item);
-                }
-              }
-              if (remaining.length > 0) {
-                localStorage.setItem('dkb_offline_queue', JSON.stringify(remaining));
-              } else {
-                localStorage.removeItem('dkb_offline_queue');
-              }
-              if (uploaded > 0) {
-                showToast(`Sinkronisasi Offline: ${uploaded} data presensi tersimpan berhasil disinkronkan ke server.`, 'success');
-              }
-            }
-          }
-        } catch (e) {
-          console.warn('Flush offline queue error:', e);
-        }
-      }
+      const hasVersionChanged = data.version !== versionRef.current;
 
       if (data.fullSnapshot && data.data) {
-        // Full Snapshot initialization or client caught up
+        // Full Snapshot initialization: Replace with fresh clean server data (purges old demo caches)
         setSettings(data.data.settings || defaultSettings);
         setClasses(data.data.classes || []);
         setSessions(data.data.sessions || []);
@@ -614,27 +603,33 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
         try {
           if (data.data.settings) localStorage.setItem('dkb_cache_settings', JSON.stringify(data.data.settings));
-          if (data.data.classes) localStorage.setItem('dkb_cache_classes', JSON.stringify(data.data.classes));
+          localStorage.setItem('dkb_cache_classes', JSON.stringify(data.data.classes || []));
           if (data.data.sessions) localStorage.setItem('dkb_cache_sessions', JSON.stringify(data.data.sessions));
-          if (data.data.students) localStorage.setItem('dkb_cache_students', JSON.stringify(data.data.students));
+          localStorage.setItem('dkb_cache_students', JSON.stringify(data.data.students || []));
           if (data.data.violation_types) localStorage.setItem('dkb_cache_violation_types', JSON.stringify(data.data.violation_types));
-          if (data.data.attendance) localStorage.setItem('dkb_cache_attendance', JSON.stringify(data.data.attendance));
-          if (data.data.out_of_class) localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(data.data.out_of_class));
-          if (data.data.violations) localStorage.setItem('dkb_cache_violations', JSON.stringify(data.data.violations));
-          if (data.data.leave_requests) localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(data.data.leave_requests));
+          localStorage.setItem('dkb_cache_attendance', JSON.stringify(data.data.attendance || []));
+          localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(data.data.out_of_class || []));
+          localStorage.setItem('dkb_cache_violations', JSON.stringify(data.data.violations || []));
+          localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(data.data.leave_requests || []));
           localStorage.setItem('dkb_cache_version', String(data.version));
         } catch {}
-      } else if (data.changes) {
+      } else if (data.changes && data.changes.length > 0) {
         applyDeltaChanges(data.changes);
       }
 
-      setServerVersion(data.version);
-      versionRef.current = data.version;
-      try {
-        localStorage.setItem('dkb_cache_version', String(data.version));
-      } catch {}
-      setSyncStatus('synced');
-      setLastSyncTime(new Date());
+      if (hasVersionChanged) {
+        setServerVersion(data.version);
+        versionRef.current = data.version;
+        try {
+          localStorage.setItem('dkb_cache_version', String(data.version));
+        } catch {}
+        setLastSyncTime(new Date());
+        if (shouldBroadcast) {
+          broadcastSync();
+        }
+      }
+
+      setSyncStatus((prev) => (prev !== 'synced' ? 'synced' : prev));
       setInitialLoadError(null);
     } catch (err: any) {
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
@@ -642,15 +637,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       } else {
         setSyncStatus('error');
       }
-      if (classes.length === 0) {
-        setInitialLoadError('Gagal memuat data dari server. Mode offline lokal tetap aktif.');
-      }
     } finally {
       clearTimeout(timeoutId);
       isSyncingRef.current = false;
       setIsInitialLoading(false);
     }
-  }, [session, applyDeltaChanges, classes.length]);
+  }, [session, applyDeltaChanges, showToast, broadcastSync]);
 
   // Initial Sync on Mount (Instant and non-blocking)
   useEffect(() => {
@@ -670,7 +662,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (syncChannel) {
       syncChannel.onmessage = (event) => {
         if (event.data === 'sync') {
-          syncNow();
+          syncNow(false, false);
         }
       };
     }
@@ -678,10 +670,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const setupInterval = () => {
       if (intervalId) clearInterval(intervalId);
       const isVisible = document.visibilityState === 'visible';
-      // Real-time 2.5s polling for active screens, 15s when tab in background
-      const delay = isVisible ? 2500 : 15000;
+      // Real-time 4s non-blocking polling for active screens, 20s when tab in background
+      const delay = isVisible ? 4000 : 20000;
       intervalId = setInterval(() => {
-        syncNow();
+        syncNow(false);
       }, delay);
     };
 

@@ -222,6 +222,110 @@ class StorageManager {
     }
   }
 
+  // --- TWO-WAY BIDIRECTIONAL SYNC ---
+  public async applyTwoWaySync(payload: {
+    classes?: SchoolClass[];
+    students?: Student[];
+    sessions?: AttendanceSession[];
+    attendance?: AttendanceRecord[];
+    out_of_class?: OutOfClassRecord[];
+    violations?: ViolationRecord[];
+    leave_requests?: LeaveRequest[];
+    settings?: Partial<AppSettings>;
+    mutations?: Array<{ type: string; action: string; payload: any }>;
+  }) {
+    return this.mutate((db) => {
+      const nowIso = new Date().toISOString();
+
+      if (Array.isArray(payload.classes)) {
+        db.classes = payload.classes;
+        this.recordChange(db, 'classes', 'bulk', 'update', db.classes);
+      }
+
+      if (Array.isArray(payload.students)) {
+        db.students = payload.students;
+        this.recordChange(db, 'students', 'bulk', 'update', db.students);
+      }
+
+      if (Array.isArray(payload.sessions)) {
+        db.sessions = payload.sessions;
+        this.recordChange(db, 'sessions', 'bulk', 'update', db.sessions);
+      }
+
+      if (Array.isArray(payload.attendance)) {
+        for (const att of payload.attendance) {
+          const idx = db.attendance.findIndex((a) => a.id === att.id);
+          if (idx >= 0) db.attendance[idx] = att;
+          else db.attendance.unshift(att);
+          this.recordChange(db, 'attendance', att.id, 'insert', att);
+        }
+      }
+
+      if (Array.isArray(payload.out_of_class)) {
+        for (const ooc of payload.out_of_class) {
+          const idx = db.out_of_class.findIndex((o) => o.id === ooc.id);
+          if (idx >= 0) db.out_of_class[idx] = ooc;
+          else db.out_of_class.unshift(ooc);
+          this.recordChange(db, 'out_of_class', ooc.id, 'insert', ooc);
+        }
+      }
+
+      if (Array.isArray(payload.violations)) {
+        for (const v of payload.violations) {
+          const idx = db.violations.findIndex((item) => item.id === v.id);
+          if (idx >= 0) db.violations[idx] = v;
+          else db.violations.unshift(v);
+          this.recordChange(db, 'violations', v.id, 'insert', v);
+        }
+      }
+
+      if (payload.settings) {
+        db.settings = { ...db.settings, ...payload.settings, updated_at: nowIso };
+        this.recordChange(db, 'settings', 'global', 'update', db.settings);
+      }
+
+      if (Array.isArray(payload.mutations)) {
+        for (const m of payload.mutations) {
+          if (m.type === 'attendance' && m.payload) {
+            const idx = db.attendance.findIndex((a) => a.id === m.payload.id);
+            if (idx >= 0) db.attendance[idx] = m.payload;
+            else db.attendance.unshift(m.payload);
+            this.recordChange(db, 'attendance', m.payload.id, 'insert', m.payload);
+          } else if (m.type === 'out_of_class' && m.payload) {
+            const idx = db.out_of_class.findIndex((o) => o.id === m.payload.id);
+            if (idx >= 0) db.out_of_class[idx] = m.payload;
+            else db.out_of_class.unshift(m.payload);
+            this.recordChange(db, 'out_of_class', m.payload.id, 'insert', m.payload);
+          } else if (m.type === 'violations' && m.payload) {
+            const idx = db.violations.findIndex((v) => v.id === m.payload.id);
+            if (idx >= 0) db.violations[idx] = m.payload;
+            else db.violations.unshift(m.payload);
+            this.recordChange(db, 'violations', m.payload.id, 'insert', m.payload);
+          }
+        }
+      }
+
+      const curVer = parseInt(db.meta['current_version'] || '1', 10);
+      return {
+        success: true,
+        version: curVer,
+        serverTime: nowIso,
+        data: {
+          settings: db.settings,
+          classes: db.classes,
+          sessions: db.sessions,
+          students: db.students,
+          violation_types: db.violation_types,
+          attendance: db.attendance,
+          out_of_class: db.out_of_class,
+          violations: db.violations,
+          leave_requests: db.leave_requests,
+          notification_settings: db.notification_settings,
+        },
+      };
+    });
+  }
+
   // --- SYNC & SNAPSHOT ---
   public async getSyncData(sinceVersion = 0) {
     const db = await this.loadDb();
@@ -1055,92 +1159,8 @@ class StorageManager {
           created_at: now,
           updated_at: now,
         },
-        {
-          id: 'user_homeroom_1',
-          role: 'homeroom',
-          name: 'Dra. Siti Aminah, M.Pd',
-          class_id: '10-RPL-1',
-          email: 'siti.aminah@sekolah.sch.id',
-          password_hash: bcrypt.hashSync('wali123', salt),
-          label: 'Wali Kelas X RPL 1',
-          token_version: 1,
-          is_active: true,
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          id: 'user_homeroom_2',
-          role: 'homeroom',
-          name: 'Budi Santoso, S.Kom',
-          class_id: '10-TKJ-1',
-          email: 'budi.santoso@sekolah.sch.id',
-          password_hash: bcrypt.hashSync('wali123', salt),
-          label: 'Wali Kelas X TKJ 1',
-          token_version: 1,
-          is_active: true,
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          id: 'user_homeroom_3',
-          role: 'homeroom',
-          name: 'Sri Rahayu, S.Pd',
-          class_id: '11-RPL-1',
-          email: 'sri.rahayu@sekolah.sch.id',
-          password_hash: bcrypt.hashSync('wali123', salt),
-          label: 'Wali Kelas XI RPL 1',
-          token_version: 1,
-          is_active: true,
-          created_at: now,
-          updated_at: now,
-        },
       ],
-      classes: [
-        {
-          id: '10-RPL-1',
-          name: 'X RPL 1',
-          grade: '10',
-          major: 'Rekayasa Perangkat Lunak',
-          homeroom_teacher_name: 'Dra. Siti Aminah, M.Pd',
-          homeroom_teacher_email: 'siti.aminah@sekolah.sch.id',
-          quota_limit: 2,
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          id: '10-TKJ-1',
-          name: 'X TKJ 1',
-          grade: '10',
-          major: 'Teknik Komputer & Jaringan',
-          homeroom_teacher_name: 'Budi Santoso, S.Kom',
-          homeroom_teacher_email: 'budi.santoso@sekolah.sch.id',
-          quota_limit: 2,
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          id: '11-RPL-1',
-          name: 'XI RPL 1',
-          grade: '11',
-          major: 'Rekayasa Perangkat Lunak',
-          homeroom_teacher_name: 'Sri Rahayu, S.Pd',
-          homeroom_teacher_email: 'sri.rahayu@sekolah.sch.id',
-          quota_limit: 2,
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          id: '12-RPL-1',
-          name: 'XII RPL 1',
-          grade: '12',
-          major: 'Rekayasa Perangkat Lunak',
-          homeroom_teacher_name: 'Ahmad Fauzi, M.T',
-          homeroom_teacher_email: 'ahmad.fauzi@sekolah.sch.id',
-          quota_limit: 2,
-          created_at: now,
-          updated_at: now,
-        },
-      ],
+      classes: [],
       sessions: [
         {
           id: 'sess_pagi',
@@ -1191,148 +1211,7 @@ class StorageManager {
           updated_at: now,
         },
       ],
-      students: [
-        {
-          nis: '20261001',
-          nisn: '0081234001',
-          name: 'Ahmad Rizki Pratama',
-          class_id: '10-RPL-1',
-          gender: 'L',
-          rfid_uid: 'RFID-8821901',
-          card_code: '20261001',
-          photo_url: '',
-          parent_name: 'Bambang Pratama',
-          parent_email: 'bambang.pratama@example.com',
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          nis: '20261002',
-          nisn: '0081234002',
-          name: 'Siti Nurhaliza Putri',
-          class_id: '10-RPL-1',
-          gender: 'P',
-          rfid_uid: 'RFID-8821902',
-          card_code: '20261002',
-          photo_url: '',
-          parent_name: 'Herman Syah',
-          parent_email: 'herman.syah@example.com',
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          nis: '20261003',
-          nisn: '0081234003',
-          name: 'Bima Satria Yudha',
-          class_id: '10-RPL-1',
-          gender: 'L',
-          rfid_uid: 'RFID-8821903',
-          card_code: '20261003',
-          photo_url: '',
-          parent_name: 'Agus Yudha',
-          parent_email: 'agus.yudha@example.com',
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          nis: '20261004',
-          nisn: '0081234004',
-          name: 'Dewi Lestari Anggraeni',
-          class_id: '10-RPL-1',
-          gender: 'P',
-          rfid_uid: 'RFID-8821904',
-          card_code: '20261004',
-          photo_url: '',
-          parent_name: 'Joko Anggraeni',
-          parent_email: 'joko.anggraeni@example.com',
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          nis: '20261005',
-          nisn: '0081234005',
-          name: 'Farhan Maulana Hakim',
-          class_id: '10-TKJ-1',
-          gender: 'L',
-          rfid_uid: 'RFID-8821905',
-          card_code: '20261005',
-          photo_url: '',
-          parent_name: 'Lukman Hakim',
-          parent_email: 'lukman.hakim@example.com',
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          nis: '20261006',
-          nisn: '0081234006',
-          name: 'Gita Rahmawati',
-          class_id: '10-TKJ-1',
-          gender: 'P',
-          rfid_uid: 'RFID-8821906',
-          card_code: '20261006',
-          photo_url: '',
-          parent_name: 'Surya Rahmawan',
-          parent_email: 'surya.r@example.com',
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          nis: '20261007',
-          nisn: '0081234007',
-          name: 'Hafiz Danial Akbar',
-          class_id: '10-TKJ-1',
-          gender: 'L',
-          rfid_uid: 'RFID-8821907',
-          card_code: '20261007',
-          photo_url: '',
-          parent_name: 'Danial Akbar',
-          parent_email: 'danial.akbar@example.com',
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          nis: '20261008',
-          nisn: '0081234008',
-          name: 'Indah Permatasari',
-          class_id: '11-RPL-1',
-          gender: 'P',
-          rfid_uid: 'RFID-8821908',
-          card_code: '20261008',
-          photo_url: '',
-          parent_name: 'Wahyu Permata',
-          parent_email: 'wahyu.permata@example.com',
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          nis: '20261009',
-          nisn: '0081234009',
-          name: 'Kevin Jonathan',
-          class_id: '11-RPL-1',
-          gender: 'L',
-          rfid_uid: 'RFID-8821909',
-          card_code: '20261009',
-          photo_url: '',
-          parent_name: 'Jonathan Lim',
-          parent_email: 'jonathan.lim@example.com',
-          created_at: now,
-          updated_at: now,
-        },
-        {
-          nis: '20261010',
-          nisn: '0081234010',
-          name: 'Laila Zahra Nur',
-          class_id: '12-RPL-1',
-          gender: 'P',
-          rfid_uid: 'RFID-8821910',
-          card_code: '20261010',
-          photo_url: '',
-          parent_name: 'Nur Hidayat',
-          parent_email: 'nur.hidayat@example.com',
-          created_at: now,
-          updated_at: now,
-        },
-      ],
+      students: [],
       violation_types: [
         {
           id: 'vt_1',
@@ -1472,7 +1351,7 @@ class StorageManager {
       out_of_class: [],
       violations: [],
       settings: {
-        school_name: 'SMK BISA HEBAT NUSANTARA',
+        school_name: 'SMP Puncak Darussalam',
         logo_url: '',
         background_url: '',
         accent_color: '#0f172a',

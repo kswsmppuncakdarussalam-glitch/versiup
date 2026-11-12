@@ -84,9 +84,16 @@ export default defineConfig(() => {
       }),
     ],
     resolve: {
+      dedupe: ['react', 'react-dom', 'react-is'],
       alias: {
         '@': path.resolve('.'),
+        react: path.resolve('./node_modules/react'),
+        'react-dom': path.resolve('./node_modules/react-dom'),
+        'react-is': path.resolve('./node_modules/react-is'),
       },
+    },
+    optimizeDeps: {
+      include: ['react', 'react-dom', 'react-is', 'recharts'],
     },
     server: {
       port: 3000,

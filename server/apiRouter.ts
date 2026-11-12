@@ -439,9 +439,24 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       return JsonResponse.badRequest('Aksi auth tidak dikenali.');
     }
 
-    // 3. SYNC: /api/sync?since=<version>
+    // 3. SYNC: /api/sync (Two-Way Database Synchronization: GET & POST)
     // Real-time multi-device synchronization: no-store / no-cache to avoid stale CDN responses
     if (pathname === '/api/sync') {
+      if (method === 'POST') {
+        const syncResult = await storage.applyTwoWaySync(req.body || {});
+        return JsonResponse.ok(
+          {
+            ...syncResult,
+            googleSheetsConnected: storage.isSheetsConnected(),
+          },
+          {
+            'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+          }
+        );
+      }
+
       const sinceVer = parseInt(query.since || '0', 10);
       const syncResult = await storage.getSyncData(sinceVer);
       return JsonResponse.ok(

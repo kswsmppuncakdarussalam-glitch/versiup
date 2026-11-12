@@ -15,9 +15,10 @@ import {
   CheckCircle,
   X,
   Volume2,
+  ChevronDown,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext.js';
-import { formatServerTime, formatIndonesianDate } from '../utils/time.js';
+import { formatServerTime, formatIndonesianDate, LiveClockText } from '../utils/time.js';
 import { AttendanceNotificationModal } from '../components/modals/AttendanceNotificationModal.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { Student, AttendanceRecord, AttendanceStatus } from '../types/index.js';
@@ -218,17 +219,17 @@ export const AttendanceView: React.FC = () => {
   // Recent attendance list
   const recentAttendance = todayAttendance.slice(0, 10);
 
-  // Filter students for manual modal autocomplete
+  // Filter students for manual modal autocomplete (instantly shows students)
   const filteredStudents = manualSearch.trim()
     ? students
         .filter(
           (s) =>
-            s.name.toLowerCase().includes(manualSearch.toLowerCase()) ||
-            s.nis.includes(manualSearch) ||
-            s.class_id.toLowerCase().includes(manualSearch.toLowerCase())
+            s.name.toLowerCase().includes(manualSearch.toLowerCase().trim()) ||
+            s.nis.toLowerCase().includes(manualSearch.toLowerCase().trim()) ||
+            s.class_id.toLowerCase().includes(manualSearch.toLowerCase().trim())
         )
-        .slice(0, 6)
-    : [];
+        .slice(0, 50)
+    : students.slice(0, 50);
 
   return (
     <div className="p-4 sm:p-6 space-y-6 max-w-7xl mx-auto">
@@ -246,9 +247,7 @@ export const AttendanceView: React.FC = () => {
             )}
             <div className="text-center md:text-left">
               <div className="flex items-center justify-center md:justify-start gap-2">
-                <span className="font-mono text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight">
-                  {formatServerTime(currentServerTime)}
-                </span>
+                <LiveClockText className="font-mono text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight" />
                 <span className="text-xs px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 font-mono">
                   WIB
                 </span>
@@ -429,7 +428,7 @@ export const AttendanceView: React.FC = () => {
               const sampleStudent = students[0];
               const testMsg = sampleStudent
                 ? `${sampleStudent.name}, kelas ${sampleStudent.class_id}, Hadir tepat waktu.`
-                : 'Budi Santoso, kelas 10 RPL 1, Hadir tepat waktu.';
+                : 'Uji coba suara presensi SMP Puncak Darussalam, hadir tepat waktu.';
               speak(testMsg);
               showToast(`Uji suara: "${testMsg}"`, 'info');
             }}
@@ -536,120 +535,213 @@ export const AttendanceView: React.FC = () => {
 
       {/* Manual Attendance Modal */}
       {showManualModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-xl">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
-              <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
-                Presensi Manual Siswa
-              </h3>
-              <button onClick={() => setShowManualModal(false)} className="text-slate-400 hover:text-slate-600">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-3 sm:p-4 animate-in fade-in duration-150">
+          <div className="w-full max-w-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800 shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-emerald-600 text-white flex items-center justify-center font-bold text-xs shadow-xs">
+                  <UserCheck className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                    Presensi Manual Siswa
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    Pilih siswa dan tentukan status kehadiran secara langsung
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowManualModal(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+              >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <form onSubmit={handleManualSubmit} className="mt-4 space-y-4 text-xs">
-              {/* Autocomplete Search */}
-              <div>
-                <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                  Cari Siswa (Ketik Nama / NIS / Kelas)
-                </label>
-                <div className="relative">
-                  <input
-                    type="text"
-                    value={manualSearch}
-                    onChange={(e) => {
-                      setManualSearch(e.target.value);
-                      setSelectedStudent(null);
-                    }}
-                    placeholder="Contoh: Ahmad, 20261001, atau RPL..."
-                    className="w-full px-3 py-2 text-xs rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none"
-                  />
-                  <Search className="w-4 h-4 text-slate-400 absolute right-3 top-2.5" />
-                </div>
+            <form onSubmit={handleManualSubmit} className="mt-4 space-y-4 text-xs overflow-y-auto pr-0.5">
+              {/* Selected Student Card with Dropdown Status Presensi on the Right */}
+              {selectedStudent ? (
+                <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/80 border border-emerald-300 dark:border-emerald-800/60 shadow-xs space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700 dark:text-emerald-400 flex items-center gap-1">
+                      <CheckCircle className="w-3.5 h-3.5 text-emerald-600" />
+                      Siswa Terpilih
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedStudent(null);
+                        setManualSearch('');
+                      }}
+                      className="text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1"
+                    >
+                      <Search className="w-3 h-3" />
+                      <span>Ganti / Cari Siswa Lain</span>
+                    </button>
+                  </div>
 
-                {filteredStudents.length > 0 && !selectedStudent && (
-                  <div className="mt-1 border border-slate-200 dark:border-slate-700 rounded bg-white dark:bg-slate-800 max-h-40 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-700">
-                    {filteredStudents.map((s) => (
-                      <div
-                        key={s.nis}
-                        onClick={() => {
-                          setSelectedStudent(s);
-                          setManualSearch(`${s.name} (${s.class_id})`);
-                        }}
-                        className="p-2 hover:bg-slate-50 dark:hover:bg-slate-700 cursor-pointer flex items-center justify-between"
-                      >
-                        <span className="font-semibold text-slate-900 dark:text-white">{s.name}</span>
-                        <span className="text-[10px] text-slate-400">{s.class_id} • NIS: {s.nis}</span>
+                  {/* Horizontal row: Student Name & Info on Left, Dropdown Status on Right */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-0.5">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-10 h-10 rounded-full bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 flex items-center justify-center font-bold text-sm shrink-0 shadow-xs">
+                        {selectedStudent.name.slice(0, 2).toUpperCase()}
                       </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+                      <div className="min-w-0">
+                        <p className="font-bold text-slate-900 dark:text-white text-sm truncate leading-snug">
+                          {selectedStudent.name}
+                        </p>
+                        <p className="text-[11px] text-slate-500">
+                          Kelas: <span className="font-semibold text-slate-700 dark:text-slate-300">{selectedStudent.class_id}</span> • NIS: <span className="font-mono font-medium">{selectedStudent.nis}</span>
+                        </p>
+                      </div>
+                    </div>
 
-              {selectedStudent && (
-                <div className="p-2.5 rounded bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-full bg-slate-200 dark:bg-slate-700 flex items-center justify-center font-bold">
-                    {selectedStudent.name.slice(0, 2).toUpperCase()}
+                    {/* Dropdown status presensi berada persis di samping kanan nama siswa */}
+                    <div className="flex items-center gap-2 shrink-0 self-start sm:self-center pl-1 sm:pl-0">
+                      <label htmlFor="manual-status-dropdown" className="text-xs font-bold text-slate-700 dark:text-slate-300 shrink-0">
+                        Status:
+                      </label>
+                      <div className="relative">
+                        <select
+                          id="manual-status-dropdown"
+                          value={manualStatus}
+                          onChange={(e) => setManualStatus(e.target.value as AttendanceStatus)}
+                          className={`pl-3 pr-8 py-2 rounded-lg font-bold text-xs border shadow-xs appearance-none cursor-pointer focus:outline-none focus:ring-2 transition-all ${
+                            manualStatus === 'Hadir'
+                              ? 'bg-emerald-50 text-emerald-800 border-emerald-300 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-700 focus:ring-emerald-500'
+                              : manualStatus === 'Terlambat'
+                              ? 'bg-amber-50 text-amber-800 border-amber-300 dark:bg-amber-950/60 dark:text-amber-300 dark:border-amber-700 focus:ring-amber-500'
+                              : manualStatus === 'Izin'
+                              ? 'bg-blue-50 text-blue-800 border-blue-300 dark:bg-blue-950/60 dark:text-blue-300 dark:border-blue-700 focus:ring-blue-500'
+                              : manualStatus === 'Sakit'
+                              ? 'bg-purple-50 text-purple-800 border-purple-300 dark:bg-purple-950/60 dark:text-purple-300 dark:border-purple-700 focus:ring-purple-500'
+                              : 'bg-rose-50 text-rose-800 border-rose-300 dark:bg-rose-950/60 dark:text-rose-300 dark:border-rose-700 focus:ring-rose-500'
+                          }`}
+                        >
+                          <option value="Hadir">🟢 Hadir</option>
+                          <option value="Terlambat">🟡 Terlambat</option>
+                          <option value="Izin">🔵 Izin</option>
+                          <option value="Sakit">🟣 Sakit</option>
+                          <option value="Alpha">🔴 Alpha</option>
+                        </select>
+                        <ChevronDown className="w-3.5 h-3.5 absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none text-slate-500" />
+                      </div>
+                    </div>
                   </div>
-                  <div>
-                    <p className="font-semibold text-slate-900 dark:text-white">{selectedStudent.name}</p>
-                    <p className="text-[10px] text-slate-500">Kelas: {selectedStudent.class_id} • NIS: {selectedStudent.nis}</p>
+                </div>
+              ) : (
+                /* Student Search & Immediate Student List */
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="block font-bold text-slate-700 dark:text-slate-300 text-xs">
+                      Pencarian Siswa (Ketik Nama / NIS / Kelas):
+                    </label>
+                    <span className="text-[10px] text-slate-400">
+                      {filteredStudents.length} siswa tersedia
+                    </span>
+                  </div>
+
+                  <div className="relative">
+                    <input
+                      type="text"
+                      autoFocus
+                      value={manualSearch}
+                      onChange={(e) => setManualSearch(e.target.value)}
+                      placeholder="Ketik nama siswa, NIS, atau kelas..."
+                      className="w-full pl-9 pr-8 py-2.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-emerald-500 transition-all font-medium"
+                    />
+                    <Search className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
+                    {manualSearch && (
+                      <button
+                        type="button"
+                        onClick={() => setManualSearch('')}
+                        className="p-1 rounded-full text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 absolute right-2.5 top-2.5"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Immediate List of Students (Always shown immediately) */}
+                  <div className="border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 max-h-56 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-700/60 shadow-inner">
+                    {filteredStudents.length > 0 ? (
+                      filteredStudents.map((s) => (
+                        <div
+                          key={s.nis}
+                          onClick={() => {
+                            setSelectedStudent(s);
+                            setManualSearch('');
+                          }}
+                          className="p-2.5 hover:bg-emerald-50/70 dark:hover:bg-slate-700/80 cursor-pointer flex items-center justify-between transition-colors group"
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 flex items-center justify-center font-bold text-xs shrink-0 group-hover:bg-emerald-600 group-hover:text-white transition-colors">
+                              {s.name.slice(0, 2).toUpperCase()}
+                            </div>
+                            <div className="min-w-0">
+                              <span className="font-semibold text-slate-900 dark:text-white text-xs block truncate group-hover:text-emerald-700 dark:group-hover:text-emerald-400">
+                                {s.name}
+                              </span>
+                              <span className="text-[10px] text-slate-400 block">
+                                Kelas: <strong className="font-semibold text-slate-600 dark:text-slate-300">{s.class_id}</strong> • NIS: <span className="font-mono">{s.nis}</span>
+                              </span>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            className="px-2.5 py-1 rounded-md text-[10px] font-bold bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 group-hover:bg-emerald-600 group-hover:text-white transition-colors shrink-0"
+                          >
+                            Pilih
+                          </button>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="p-4 text-center text-slate-400 text-xs">
+                        Tidak ada siswa yang cocok dengan "{manualSearch}".
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
 
-              {/* Status Selector */}
-              <div>
-                <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                  Status Presensi
-                </label>
-                <div className="grid grid-cols-3 sm:grid-cols-5 gap-1.5">
-                  {(['Hadir', 'Terlambat', 'Izin', 'Sakit', 'Alpha'] as AttendanceStatus[]).map((st) => (
-                    <button
-                      key={st}
-                      type="button"
-                      onClick={() => setManualStatus(st)}
-                      className={`py-1.5 px-2 rounded border text-xs font-semibold text-center transition-colors ${
-                        manualStatus === st
-                          ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-900 border-slate-900 dark:border-white'
-                          : 'border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-50'
-                      }`}
-                    >
-                      {st}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
               {/* Notes */}
               <div>
-                <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1">
-                  Catatan / Keterangan
+                <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1 text-xs">
+                  Catatan / Keterangan (Opsional):
                 </label>
                 <input
                   type="text"
                   value={manualNotes}
                   onChange={(e) => setManualNotes(e.target.value)}
-                  placeholder="Contoh: Mengikuti lomba, surat dokter, dll."
-                  className="w-full px-3 py-1.5 text-xs rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none"
+                  placeholder="Contoh: Mengikuti lomba dinas, dispensasi OSIS, surat dokter..."
+                  className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
                 />
               </div>
 
-              <div className="flex items-center justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowManualModal(false)}
-                  className="px-3 py-1.5 text-slate-600 hover:text-slate-800"
-                >
-                  Batal
-                </button>
-                <button
-                  type="submit"
-                  disabled={!selectedStudent}
-                  className="px-4 py-1.5 rounded font-semibold text-white bg-slate-900 hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 disabled:opacity-50"
-                >
-                  Simpan Presensi
-                </button>
+              {/* Footer Buttons */}
+              <div className="flex items-center justify-between pt-2 border-t border-slate-100 dark:border-slate-800 shrink-0">
+                <span className="text-[11px] text-slate-400">
+                  {selectedStudent ? 'Siswa terpilih siap disimpan' : 'Pilih siswa terlebih dahulu'}
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowManualModal(false)}
+                    className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-semibold"
+                  >
+                    Batal
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={!selectedStudent}
+                    className="px-4 py-1.5 rounded-lg font-bold text-xs text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-xs transition-colors flex items-center gap-1.5"
+                  >
+                    <CheckCircle className="w-3.5 h-3.5" />
+                    <span>Simpan Presensi</span>
+                  </button>
+                </div>
               </div>
             </form>
           </div>

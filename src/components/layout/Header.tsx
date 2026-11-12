@@ -12,7 +12,7 @@ import {
   User,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
-import { formatServerTime, formatIndonesianDate } from '../../utils/time.js';
+import { formatServerTime, formatIndonesianDate, LiveClockText } from '../../utils/time.js';
 import { PWAInstallButton } from '../pwa/PWAInstallButton.js';
 
 interface HeaderProps {
@@ -178,9 +178,7 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
           </span>
           <span className="hidden lg:inline text-slate-300 dark:text-slate-600">|</span>
           <Clock className="w-3.5 h-3.5 text-slate-500" />
-          <span className="font-mono font-semibold text-slate-900 dark:text-white">
-            {formatServerTime(currentServerTime)}
-          </span>
+          <LiveClockText className="font-mono font-semibold text-slate-900 dark:text-white" />
         </div>
 
         {/* Audio Mute/Unmute */}

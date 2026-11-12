@@ -45,7 +45,7 @@ export const DashboardAttendanceCharts: React.FC<DashboardAttendanceChartsProps>
         </div>
 
         <div className="h-60 w-full my-2">
-          <ResponsiveContainer width="100%" height="100%">
+          <ResponsiveContainer width="100%" height="100%" minWidth={0}>
             <PieChart>
               <Pie
                 data={pieData}
@@ -88,7 +88,7 @@ export const DashboardAttendanceCharts: React.FC<DashboardAttendanceChartsProps>
         </div>
 
         <div className="h-60 w-full my-2">
-          <ResponsiveContainer width="100%" height="100%">
+          <ResponsiveContainer width="100%" height="100%" minWidth={0}>
             <BarChart
               data={classAttendanceData}
               onClick={(e: any) => {
