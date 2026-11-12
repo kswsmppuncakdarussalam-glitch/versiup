@@ -189,43 +189,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     try {
       const saved = localStorage.getItem('dkb_session');
       if (!saved) return null;
-      const parsed = JSON.parse(saved);
-      // Ensure privileged roles always start locked on reload or startup
-      return {
-        ...parsed,
-        lockedMenuRole: undefined,
-        lockedMenuClassId: undefined,
-        lockedMenuExpiresAt: undefined,
-      };
+      return JSON.parse(saved);
     } catch {
       return null;
     }
   });
 
-  const [activeTab, setActiveTabState] = useState<ActiveTab>('dashboard');
-
-  // Auto-lock admin, wali kelas, and kesiswaan whenever switching between menus
-  const setActiveTab = useCallback((newTab: ActiveTab) => {
-    setActiveTabState((prevTab) => {
-      if (prevTab !== newTab) {
-        setSession((currentSession) => {
-          if (currentSession && currentSession.lockedMenuRole && currentSession.lockedMenuRole !== newTab) {
-            const updated: AuthSession = {
-              ...currentSession,
-              lockedMenuRole: undefined,
-              lockedMenuClassId: undefined,
-              lockedMenuExpiresAt: undefined,
-            };
-            try {
-              localStorage.setItem('dkb_session', JSON.stringify(updated));
-            } catch {}
-            return updated;
-          }
-          return currentSession;
-        });
+  const [activeTab, setActiveTabState] = useState<ActiveTab>(() => {
+    try {
+      const savedTab = localStorage.getItem('dkb_active_tab');
+      if (savedTab && ['dashboard', 'attendance', 'out_of_class', 'violations', 'homeroom', 'student_affairs', 'admin'].includes(savedTab)) {
+        return savedTab as ActiveTab;
       }
-      return newTab;
-    });
+    } catch {}
+    return 'attendance';
+  });
+
+  // Preserve activeTab in localStorage; only clear lock when user explicitly finishes via lockCurrentMenu / logout
+  const setActiveTab = useCallback((newTab: ActiveTab) => {
+    try {
+      localStorage.setItem('dkb_active_tab', newTab);
+    } catch {}
+    setActiveTabState(newTab);
   }, []);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'synced');
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(new Date());
@@ -443,28 +428,87 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }
           break;
 
-        case 'classes':
-          if (action === 'insert') {
-            setClasses((prev) => [...prev, data]);
+        case 'students':
+          if (entity_id === 'bulk' && Array.isArray(data)) {
+            setStudents(data);
+            try { localStorage.setItem('dkb_cache_students', JSON.stringify(data)); } catch {}
+          } else if (action === 'insert') {
+            setStudents((prev) => {
+              if (prev.some((s) => s.nis === entity_id)) return prev;
+              const next = [...prev, data];
+              try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
+              return next;
+            });
           } else if (action === 'update') {
-            setClasses((prev) => prev.map((c) => (c.id === entity_id ? data : c)));
+            setStudents((prev) => {
+              const next = prev.map((s) => (s.nis === entity_id ? data : s));
+              try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
+              return next;
+            });
           } else if (action === 'delete') {
-            setClasses((prev) => prev.filter((c) => c.id !== entity_id));
+            setStudents((prev) => {
+              const next = prev.filter((s) => s.nis !== entity_id);
+              try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
+              return next;
+            });
+          }
+          break;
+
+        case 'classes':
+          if (entity_id === 'bulk' && Array.isArray(data)) {
+            setClasses(data);
+            try { localStorage.setItem('dkb_cache_classes', JSON.stringify(data)); } catch {}
+          } else if (action === 'insert') {
+            setClasses((prev) => {
+              const next = [...prev, data];
+              try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
+              return next;
+            });
+          } else if (action === 'update') {
+            setClasses((prev) => {
+              const next = prev.map((c) => (c.id === entity_id ? data : c));
+              try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
+              return next;
+            });
+          } else if (action === 'delete') {
+            setClasses((prev) => {
+              const next = prev.filter((c) => c.id !== entity_id);
+              try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
+              return next;
+            });
           }
           break;
 
         case 'sessions':
-          if (action === 'insert') {
-            setSessions((prev) => [...prev, data]);
+          if (entity_id === 'bulk' && Array.isArray(data)) {
+            setSessions(data);
+            try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(data)); } catch {}
+          } else if (action === 'insert') {
+            setSessions((prev) => {
+              const next = [...prev, data];
+              try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
+              return next;
+            });
           } else if (action === 'update') {
-            setSessions((prev) => prev.map((s) => (s.id === entity_id ? data : s)));
+            setSessions((prev) => {
+              const next = prev.map((s) => (s.id === entity_id ? data : s));
+              try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
+              return next;
+            });
           } else if (action === 'delete') {
-            setSessions((prev) => prev.filter((s) => s.id !== entity_id));
+            setSessions((prev) => {
+              const next = prev.filter((s) => s.id !== entity_id);
+              try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
+              return next;
+            });
           }
           break;
 
         case 'violation_types':
-          if (action === 'insert') {
+          if (entity_id === 'bulk' && Array.isArray(data)) {
+            setViolationTypes(data);
+            try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(data)); } catch {}
+          } else if (action === 'insert') {
             setViolationTypes((prev) => [...prev, data]);
           } else if (action === 'update') {
             setViolationTypes((prev) => prev.map((vt) => (vt.id === entity_id ? data : vt)));
@@ -487,18 +531,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           break;
 
         case 'settings':
-          if (data) setSettings(data);
+          if (data) {
+            setSettings(data);
+            try {
+              localStorage.setItem('dkb_cache_settings', JSON.stringify(data));
+            } catch {}
+          }
           break;
 
         case 'notification_settings':
-          if (data) setNotificationSettings(data);
+          if (data) {
+            setNotificationSettings(data);
+            try {
+              localStorage.setItem('dkb_cache_notification_settings', JSON.stringify(data));
+            } catch {}
+          }
           break;
 
         case 'users':
           // If current user modified or invalidated
           if (session && session.userId === entity_id) {
-            if (action === 'delete' || (data && data.token_version > (session as any).tokenVersion)) {
-              showToast('Sesi Anda telah kedaluwarsa karena perubahan kata sandi.', 'error');
+            if (action === 'delete') {
+              showToast('Akun Anda telah dinonaktifkan.', 'error');
+              setSession(null);
+              localStorage.removeItem('dkb_session');
+            } else if (
+              data &&
+              typeof (session as any).tokenVersion === 'number' &&
+              data.token_version > (session as any).tokenVersion
+            ) {
+              showToast('Sesi Anda telah kedaluwarsa karena perubahan kata sandi di perangkat lain.', 'error');
               setSession(null);
               localStorage.removeItem('dkb_session');
             }
@@ -1148,7 +1210,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const updateSessionToken = (newToken: string) => {
     try {
       const base64Url = newToken.split('.')[1];
-      const payload = JSON.parse(atob(base64Url));
+      const payload = JSON.parse(decodeURIComponent(escape(atob(base64Url))));
       setSession((prev) => {
         if (!prev) return null;
         const updated: AuthSession = {
@@ -1157,6 +1219,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           userId: payload.userId || prev.userId,
           role: payload.role || prev.role,
           name: payload.name || prev.name,
+          tokenVersion: payload.tokenVersion || payload.token_version,
+          lockedMenuRole: prev.lockedMenuRole,
+          lockedMenuClassId: prev.lockedMenuClassId,
         };
         localStorage.setItem('dkb_session', JSON.stringify(updated));
         return updated;

@@ -56,6 +56,7 @@ export interface AuthSession {
   name: string;
   classId?: string;
   label?: string;
+  tokenVersion?: number;
   lockedMenuRole?: 'homeroom' | 'student_affairs' | 'admin';
   lockedMenuClassId?: string;
   lockedMenuExpiresAt?: number;

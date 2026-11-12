@@ -232,6 +232,7 @@ class StorageManager {
     violations?: ViolationRecord[];
     leave_requests?: LeaveRequest[];
     settings?: Partial<AppSettings>;
+    notification_settings?: Partial<NotificationSettings>;
     mutations?: Array<{ type: string; action: string; payload: any }>;
   }) {
     return this.mutate((db) => {
@@ -282,6 +283,11 @@ class StorageManager {
       if (payload.settings) {
         db.settings = { ...db.settings, ...payload.settings, updated_at: nowIso };
         this.recordChange(db, 'settings', 'global', 'update', db.settings);
+      }
+
+      if (payload.notification_settings) {
+        db.notification_settings = { ...db.notification_settings, ...payload.notification_settings, updated_at: nowIso };
+        this.recordChange(db, 'notification_settings', 'global', 'update', db.notification_settings);
       }
 
       if (Array.isArray(payload.mutations)) {
