@@ -799,19 +799,19 @@ export const AdminView: React.FC = () => {
             <span>
               {googleSyncing ? (
                 <>
-                  <strong>Menyinkronkan Otomatis:</strong> Memperbarui sesi, data siswa, kelas, presensi, izin, pelanggaran &amp; pengaturan ke Google Drive dan Google Sheets...
+                  <strong>Menyinkronkan Otomatis (Google OAuth 2.0):</strong> Memperbarui sesi, data siswa, kelas, presensi, izin, pelanggaran, ID Cloud &amp; pengaturan ke Database, Google Drive, dan Google Sheets...
                 </>
               ) : googleOAuthActive || serverDriveSyncActive ? (
                 <>
-                  <strong>Auto-Sync Drive &amp; Sheets Aktif:</strong> Setiap perubahan Sesi, Data Siswa, Kelas, Presensi, Izin, Pelanggaran &amp; Pengaturan otomatis tersinkron ke Database, Google Drive, dan Google Sheets tanpa klik manual.
+                  <strong>Google OAuth 2.0 &amp; Auto-Sync Drive/Sheets Aktif:</strong> Setiap perubahan Sesi, Data Siswa, Kelas, Presensi, Izin, Pelanggaran, Email &amp; ID Cloud otomatis tersinkron ke Database, Google Drive, dan Google Sheets tanpa klik manual.
                 </>
               ) : isCloudConfiguredInDb ? (
                 <>
-                  <strong>ID Cloud &amp; Multi-Perangkat Tersinkron:</strong> ID Cloud, akun sekolah, folder Drive &amp; Spreadsheet sudah tersimpan di database server dan langsung aktif di seluruh perangkat tanpa memasukkan ulang ID Cloud.
+                  <strong>ID Cloud &amp; Multi-Perangkat Tersinkron:</strong> ID Cloud Console, akun sekolah, folder Drive &amp; Spreadsheet sudah tersimpan otomatis di Database &amp; Google Sheet. Hubungkan OAuth 2.0 di tab ini agar perubahan langsung menulis ke Drive &amp; Sheets.
                 </>
               ) : (
                 <>
-                  <strong>Database Multi-Perangkat Aktif:</strong> Simpan ID Cloud di menu Basis Data Google Drive &amp; Sheets agar langsung tersinkron ke semua perangkat.
+                  <strong>Database Multi-Perangkat Aktif:</strong> Atur ID Cloud Console &amp; hubungkan Google OAuth 2.0 di menu Basis Data Google Drive &amp; Sheets agar setiap perubahan otomatis tersinkron ke Drive, Sheets &amp; seluruh perangkat.
                 </>
               )}
             </span>
@@ -827,7 +827,7 @@ export const AdminView: React.FC = () => {
                   : 'bg-amber-600 hover:bg-amber-700'
               }`}
             >
-              {isCloudConfiguredInDb ? 'Sinkron Drive dari Tab Ini' : 'Aktifkan Auto-Sync Drive (1x)'}
+              {isCloudConfiguredInDb ? 'Hubungkan OAuth 2.0 Tab Ini' : 'Hubungkan Google OAuth 2.0'}
             </button>
           )}
         </div>
@@ -2885,15 +2885,22 @@ export const AdminView: React.FC = () => {
       {/* SECTION 9: NOTIFIKASI EMAIL (Bagian 11) */}
       {activeSection === 'notifications' && (
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-4 text-xs">
-          <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 dark:border-slate-800 pb-3">
             <div>
-              <h2 className="text-sm font-semibold text-slate-900 dark:text-white">
-                Pengaturan Notifikasi Email ke Orang Tua
-              </h2>
-              <p className="text-slate-500">Kirim pemberitahuan otomatis ke email orang tua saat siswa terlambat atau melanggar.</p>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-sm font-semibold text-slate-900 dark:text-white">
+                  Pengaturan Notifikasi Email ke Orang Tua
+                </h2>
+                <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 text-[10px] font-semibold">
+                  Sinkron &amp; Aktif Otomatis
+                </span>
+              </div>
+              <p className="text-slate-500 mt-0.5">
+                Notifikasi email orang tua &amp; rekap mingguan berjalan otomatis serta langsung tersimpan ke database, Google Drive, dan Google Sheet tanpa klik sinkron manual.
+              </p>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 shrink-0">
               <input
                 type="checkbox"
                 id="email-toggle"
@@ -2904,7 +2911,7 @@ export const AdminView: React.FC = () => {
                 }}
                 className="w-4 h-4 rounded text-slate-900"
               />
-              <label htmlFor="email-toggle" className="font-semibold text-slate-800 dark:text-slate-200">
+              <label htmlFor="email-toggle" className="font-semibold text-slate-800 dark:text-slate-200 cursor-pointer">
                 Aktifkan Notifikasi Email
               </label>
             </div>
@@ -3150,7 +3157,7 @@ export const AdminView: React.FC = () => {
       {activeSection === 'sync_status' && (
         <div className="space-y-5 text-xs">
           {/* Main Google Integration Header Card */}
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-4">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-5">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-4">
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-lg bg-emerald-600 text-white flex items-center justify-center font-bold shadow-xs">
@@ -3158,39 +3165,35 @@ export const AdminView: React.FC = () => {
                 </div>
                 <div>
                   <h2 className="text-sm font-bold text-slate-900 dark:text-white flex flex-wrap items-center gap-2">
-                    Basis Data Google Drive &amp; Google Sheets
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${(googleOAuthActive || serverDriveSyncActive || isCloudConfiguredInDb) ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300' : googleSheetsConnected ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
+                    Basis Data Google Drive, Google Sheets &amp; OAuth 2.0
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${(googleOAuthActive || serverDriveSyncActive) ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300' : isCloudConfiguredInDb ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
                       {googleOAuthActive || serverDriveSyncActive
-                        ? 'Auto-Sync Drive & Sheets Real-Time Aktif'
+                        ? 'OAuth 2.0 & Auto-Sync Real-Time Aktif'
                         : isCloudConfiguredInDb
-                        ? 'ID Cloud Tersimpan & Multi-Perangkat Sinkron'
-                        : googleSheetsConnected
-                        ? 'Sesi OAuth Browser Perlu Diaktifkan 1x'
-                        : 'Penyimpanan Lokal Aktif'}
+                        ? 'ID Cloud Tersimpan - Klik OAuth 2.0 di Tab Ini'
+                        : 'Siap Dihubungkan via Google OAuth 2.0'}
                     </span>
                   </h2>
                   <p className="text-slate-500">
-                    Simpan ID Cloud Console 1x di perangkat ini — seluruh perangkat lain otomatis menerima ID Cloud, akun Google, folder Drive, serta Spreadsheet dan langsung tersinkron tanpa memasukkan ulang ID Cloud.
+                    Alur teratur 4 langkah: ID Cloud Console tersimpan di Aplikasi &amp; Google Sheet (<code>Pengaturan</code>), akun &amp; email terhubung lewat Google OAuth 2.0, lalu setiap perubahan otomatis tersinkron ke Database, Drive, Sheets, dan seluruh perangkat.
                   </p>
                 </div>
               </div>
 
-              {/* Action: Activate OAuth session or trigger sync */}
+              {/* Action: Activate OAuth 2.0 session or trigger sync */}
               <button
                 type="button"
                 disabled={googleSyncing}
                 onClick={() => syncGoogleSheetsNow()}
                 className={`flex items-center gap-2 px-3.5 py-2 rounded-lg font-semibold disabled:opacity-50 transition-colors shrink-0 ${
-                  googleOAuthActive || serverDriveSyncActive || isCloudConfiguredInDb
+                  googleOAuthActive || serverDriveSyncActive
                     ? 'border border-emerald-200 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:hover:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
                     : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs'
                 }`}
                 title={
                   googleOAuthActive || serverDriveSyncActive
-                    ? 'Sinkronisasi Drive & Sheets otomatis aktif pada setiap perubahan'
-                    : isCloudConfiguredInDb
-                    ? 'ID Cloud & tujuan Drive/Sheets sudah tersinkron otomatis antar perangkat. Klik untuk menulis pembaruan langsung dari tab browser ini.'
-                    : 'Klik 1x untuk mengaktifkan sesi OAuth Google di tab browser ini agar setiap perubahan otomatis tersinkron ke Drive & Sheets'
+                    ? 'OAuth 2.0 aktif — setiap perubahan otomatis tersinkron ke Drive & Sheets'
+                    : 'Masuk dengan Google OAuth 2.0 untuk mengaktifkan auto-sync Drive & Sheets di tab ini'
                 }
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${googleSyncing ? 'animate-spin' : ''}`} />
@@ -3198,151 +3201,39 @@ export const AdminView: React.FC = () => {
                   {googleSyncing
                     ? 'Menyinkronkan Drive & Sheets...'
                     : googleOAuthActive || serverDriveSyncActive
-                    ? 'Sinkronisasi Otomatis Aktif'
-                    : isCloudConfiguredInDb
-                    ? 'Sinkron Drive dari Tab Ini'
-                    : 'Aktifkan Auto-Sync Drive & Sheets'}
+                    ? 'OAuth 2.0 & Auto-Sync Aktif'
+                    : 'Hubungkan Google OAuth 2.0'}
                 </span>
               </button>
             </div>
 
-            {/* Google Account Connection Status */}
-            <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div className="flex items-center gap-3">
-                  {googleAccount?.photo || settings.google_account_photo ? (
-                    <img
-                      src={googleAccount?.photo || settings.google_account_photo}
-                      alt="Google Avatar"
-                       className="w-11 h-11 rounded-full border-2 border-white dark:border-slate-700 shadow-xs"
-                    />
-                  ) : (
-                    <div className="w-11 h-11 rounded-full bg-slate-200 dark:bg-slate-700 flex items-center justify-center font-bold text-slate-700 dark:text-slate-300 text-sm">
-                      {(googleAccount?.name || settings.google_account_name || 'G')[0]}
-                    </div>
-                  )}
-
-                  <div className="space-y-0.5">
-                    <div className="flex items-center gap-2">
-                      <span className="font-bold text-slate-900 dark:text-white text-sm">
-                        {googleAccount?.name || settings.google_account_name || 'Kesiswaan SMP Puncak Darussalam'}
-                      </span>
-                      <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-2.5 py-0.5 rounded-full border border-emerald-200 dark:border-emerald-800">
-                        <Check className="w-3 h-3 text-emerald-600" />
-                        Terkunci &amp; Terhubung
-                      </span>
-                    </div>
-                    <p className="text-slate-700 dark:text-slate-300 font-mono text-[11px] font-semibold flex items-center gap-1.5">
-                      <Lock className="w-3 h-3 text-emerald-600 shrink-0" />
-                      <span>{googleAccount?.email || settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}</span>
-                    </p>
-                    {settings.google_last_synced_at && (
-                      <p className="text-[10px] text-slate-400">
-                        Sinkron Drive &amp; Sheets terakhir: {new Date(settings.google_last_synced_at).toLocaleString('id-ID')}
-                      </p>
-                    )}
-                  </div>
-                </div>
-
-                {/* Account Connect / Change / Disconnect Buttons */}
-                <div className="flex flex-wrap items-center gap-2">
-                  {!googleSheetsConnected ? (
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        type="button"
-                        disabled={googleSyncing}
-                        onClick={() => connectGoogle(false, 'kswsmp.puncakdarussalam@gmail.com')}
-                        className="flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-xs transition-colors"
-                        title="Hubungkan otomatis akun kswsmp.puncakdarussalam@gmail.com ke Google Cloud Console"
-                      >
-                        <Zap className="w-3.5 h-3.5 text-amber-300" />
-                        <span>Otomatis ke Cloud Console (kswsmp.puncakdarussalam@gmail.com)</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        disabled={googleSyncing}
-                        onClick={() => setIsGoogleModalOpen(true)}
-                        className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-750 font-semibold text-slate-700 dark:text-slate-200 text-xs shadow-xs transition-colors"
-                      >
-                        <svg className="w-3.5 h-3.5 shrink-0" viewBox="0 0 48 48">
-                          <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
-                          <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
-                          <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
-                          <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
-                        </svg>
-                        <span>Opsi Google Lengkap</span>
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      <button
-                        type="button"
-                        disabled={googleSyncing}
-                        onClick={() => syncGoogleSheetsNow()}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 font-semibold transition-colors disabled:opacity-50"
-                        title="Sinkronisasi Drive & Sheets otomatis aktif setelah sesi diotorisasi"
-                      >
-                        <RefreshCw className={`w-3.5 h-3.5 ${googleSyncing ? 'animate-spin' : ''}`} />
-                        <span>{googleSyncing ? 'Menyinkronkan...' : googleOAuthActive ? 'Perbarui Drive & Sheets' : 'Aktifkan OAuth Drive & Sheets'}</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        disabled={googleSyncing}
-                        onClick={() => setIsGoogleModalOpen(true)}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-750 font-semibold transition-colors"
-                        title="Ganti email atau hubungkan dengan akun Google lain"
-                      >
-                        <RefreshCw className="w-3.5 h-3.5 text-blue-500" />
-                        <span>Ganti Email / Akun Lain</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        disabled={googleSyncing}
-                        onClick={() => {
-                          if (window.confirm('Apakah Anda yakin ingin memutuskan akun Google dari aplikasi?')) {
-                            disconnectGoogle();
-                          }
-                        }}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 dark:border-rose-900 bg-white dark:bg-slate-800 text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 font-semibold transition-colors"
-                        title="Putuskan sambungan akun Google"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>Putuskan Akun</span>
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Cloud Console Client ID & Origin Auto-Sync Card */}
-            <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs space-y-3">
+            {/* LANGKAH 1: ID GOOGLE CLOUD CONSOLE (Tersimpan di Aplikasi & Google Sheet) */}
+            <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs space-y-3">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                <div className="flex items-start gap-2.5">
+                  <span className="w-6 h-6 rounded-full bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-bold text-[11px] flex items-center justify-center shrink-0">
+                    1
+                  </span>
                   <div>
-                    <span className="font-semibold text-slate-800 dark:text-slate-200 block">
-                      ID Cloud Console Tersinkron Multi-Perangkat
+                    <span className="font-bold text-slate-900 dark:text-white flex flex-wrap items-center gap-2">
+                      ID Cloud Console (Google OAuth 2.0 Web Client ID)
+                      <span className="px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 text-[10px] font-semibold">
+                        Tersimpan di Aplikasi &amp; Sheet
+                      </span>
                     </span>
-                    <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400 break-all">
+                    <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400 break-all block mt-0.5">
                       {settings.google_client_id || customClientIdInput || 'Belum diatur'}
                     </span>
                   </div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
-                  <span className="px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 text-[10px] font-semibold">
-                    Otomatis Aktif di Semua Perangkat
-                  </span>
                   <button
                     type="button"
                     onClick={() => setShowClientIdConfig(!showClientIdConfig)}
-                    className="px-2.5 py-1 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 hover:bg-slate-100 dark:bg-slate-800 dark:hover:bg-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-1"
+                    className="px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 hover:bg-slate-100 dark:bg-slate-800 dark:hover:bg-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-1"
                   >
                     <Key className="w-3.5 h-3.5 text-blue-500" />
-                    <span>{showClientIdConfig ? 'Tutup Editor ID Cloud' : 'Ubah / Simpan ID Cloud'}</span>
+                    <span>{showClientIdConfig ? 'Tutup Editor ID Cloud' : 'Atur / Lihat ID Cloud'}</span>
                   </button>
                 </div>
               </div>
@@ -3350,17 +3241,17 @@ export const AdminView: React.FC = () => {
               {showClientIdConfig && (
                 <div className="p-3.5 rounded-lg bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 space-y-3.5 animate-in fade-in duration-150">
                   {/* Origin URL Copy Bar */}
-                  <div className="p-2.5 rounded-md bg-white dark:bg-slate-900 border border-emerald-300 dark:border-emerald-800/60 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="font-bold text-[11px] text-emerald-900 dark:text-emerald-300 flex items-center gap-1.5">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                        Asal JavaScript Terdeteksi (Otomatis Diadaptasi di Browser)
+                  <div className="p-2.5 rounded-md bg-white dark:bg-slate-900 border border-blue-200 dark:border-blue-800/60 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-bold text-[11px] text-slate-900 dark:text-white flex items-center gap-1.5">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                        URL Asal JavaScript untuk Google Cloud Console (Authorized JavaScript origins)
                       </span>
                       <a
                         href="https://console.cloud.google.com/apis/credentials"
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1"
+                        className="text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1 shrink-0"
                       >
                         <ExternalLink className="w-3 h-3" />
                         <span>Buka Credentials Console</span>
@@ -3376,7 +3267,7 @@ export const AdminView: React.FC = () => {
                           const orig = typeof window !== 'undefined' ? window.location.origin : '';
                           if (orig) {
                             await navigator.clipboard.writeText(orig);
-                            showToast('Asal JavaScript disalin! Tempelkan di Authorized JavaScript origins.', 'success');
+                            showToast('Origin URL disalin! Pastikan terdaftar di Authorized JavaScript origins pada Google Cloud Console.', 'success');
                           }
                         }}
                         className="flex items-center gap-1 px-3 py-1.5 rounded bg-slate-900 text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 text-xs font-semibold shrink-0"
@@ -3393,7 +3284,9 @@ export const AdminView: React.FC = () => {
                         OAuth 2.0 Web Client ID (dari console.cloud.google.com):
                       </label>
                       <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
-                        {clientIdAutoStatus === 'saving' ? 'Menyimpan otomatis...' : 'Tersimpan otomatis ke database & semua perangkat'}
+                        {clientIdAutoStatus === 'saving'
+                          ? 'Menyimpan otomatis...'
+                          : 'Tersimpan otomatis di Aplikasi, Google Sheet (Pengaturan) & semua perangkat'}
                       </span>
                     </div>
                     <input
@@ -3421,14 +3314,14 @@ export const AdminView: React.FC = () => {
                           setClientIdAutoStatus('saved');
                         }
                       }}
-                      placeholder="contoh: 1049823447787-xxxx.apps.googleusercontent.com"
+                      placeholder="contoh: 1050818791896-xxxx.apps.googleusercontent.com"
                       className="w-full px-3 py-1.5 text-xs font-mono bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-800 dark:text-slate-100 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                     />
                   </div>
 
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                     <p className="text-[11px] text-slate-500">
-                      Cukup simpan ID Cloud 1x. Tanpa memasukkan ulang ID Cloud, perangkat lain otomatis tersinkron lewat database.
+                      Cukup simpan ID Cloud 1x — otomatis tersinkron ke seluruh perangkat dan tercatat di lembar <code>Pengaturan</code> Google Sheet tanpa mengetik ulang.
                     </p>
                     <div className="flex flex-wrap items-center gap-2 shrink-0">
                       <button
@@ -3488,7 +3381,7 @@ export const AdminView: React.FC = () => {
                         className="px-3.5 py-1.5 text-[11px] font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg shadow-xs disabled:opacity-50 flex items-center gap-1.5"
                       >
                         <RefreshCw className={`w-3 h-3 ${googleSyncing ? 'animate-spin' : ''}`} />
-                        <span>Simpan ID Cloud &amp; Langsung Sinkronkan</span>
+                        <span>Simpan ID Cloud &amp; Hubungkan OAuth 2.0</span>
                       </button>
                     </div>
                   </div>
@@ -3496,119 +3389,259 @@ export const AdminView: React.FC = () => {
               )}
             </div>
 
-            {/* Folder & Spreadsheet Automated Status Cards */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
-              {/* Card 1: Google Drive Folder */}
-              <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <div className="p-2 rounded-lg bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
-                      <Folder className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <h3 className="font-bold text-slate-900 dark:text-white">Folder Google Drive</h3>
-                      <p className="text-[11px] text-slate-500">Folder Khusus Aplikasi Sekolah</p>
-                    </div>
-                  </div>
-                  <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-blue-100 text-blue-800 dark:bg-blue-950/50 dark:text-blue-300">
-                    Otomatis Dibuat
-                  </span>
-                </div>
-
-                <div className="space-y-1.5 bg-white dark:bg-slate-900 p-3 rounded-lg border border-slate-200 dark:border-slate-800 font-mono text-[11px]">
-                  <div className="text-slate-500 text-[10px] font-sans">Nama Folder:</div>
-                  <div className="font-bold text-slate-800 dark:text-slate-200">
-                    DISIPLIN KITA BISA - Database Sekolah
-                  </div>
-                  <div className="text-slate-500 text-[10px] font-sans pt-1">ID Folder:</div>
-                  <div className="truncate text-slate-600 dark:text-slate-400">
-                    {settings.google_drive_folder_id || '(Dibuat otomatis saat akun Google terhubung)'}
-                  </div>
-                </div>
-
-                {settings.google_drive_folder_url ? (
-                  <a
-                    href={settings.google_drive_folder_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center justify-center gap-1.5 w-full py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white font-semibold transition-colors"
-                  >
-                    <span>Buka Folder di Google Drive</span>
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </a>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={!googleSheetsConnected || googleSyncing}
-                    onClick={() => syncGoogleSheetsNow()}
-                    className="inline-flex items-center justify-center gap-1.5 w-full py-2 rounded-lg bg-slate-200 dark:bg-slate-800 text-slate-500 font-semibold cursor-not-allowed"
-                  >
-                    <span>Folder Akan Terbentuk Saat Terhubung</span>
-                  </button>
-                )}
+            {/* LANGKAH 2: AKUN GOOGLE & AUTENTIKASI OAUTH 2.0 + EMAIL OTOMATIS */}
+            <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 space-y-3">
+              <div className="flex items-center gap-2 text-xs font-bold text-slate-900 dark:text-white">
+                <span className="w-6 h-6 rounded-full bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-bold text-[11px] flex items-center justify-center shrink-0">
+                  2
+                </span>
+                <span>Akun Google OAuth 2.0 &amp; Sinkronisasi Email Otomatis</span>
               </div>
 
-              {/* Card 2: Google Spreadsheet */}
-              <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <div className="p-2 rounded-lg bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
-                      <FileSpreadsheet className="w-4 h-4" />
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  {googleAccount?.photo || settings.google_account_photo ? (
+                    <img
+                      src={googleAccount?.photo || settings.google_account_photo}
+                      alt="Google Avatar"
+                      className="w-11 h-11 rounded-full border-2 border-white dark:border-slate-700 shadow-xs"
+                    />
+                  ) : (
+                    <div className="w-11 h-11 rounded-full bg-slate-200 dark:bg-slate-700 flex items-center justify-center font-bold text-slate-700 dark:text-slate-300 text-sm">
+                      {(googleAccount?.name || settings.google_account_name || 'G')[0]}
                     </div>
-                    <div>
-                      <h3 className="font-bold text-slate-900 dark:text-white">Google Spreadsheet</h3>
-                      <p className="text-[11px] text-slate-500">File Database Multi-Tabel</p>
-                    </div>
-                  </div>
-                  <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300">
-                    9 Lembar Kerja
-                  </span>
-                </div>
+                  )}
 
-                <div className="space-y-1.5 bg-white dark:bg-slate-900 p-3 rounded-lg border border-slate-200 dark:border-slate-800 font-mono text-[11px]">
-                  <div className="text-slate-500 text-[10px] font-sans">Nama Spreadsheet:</div>
-                  <div className="font-bold text-slate-800 dark:text-slate-200">
-                    Database Presensi & Kedisiplinan - DISIPLIN KITA BISA
-                  </div>
-                  <div className="text-slate-500 text-[10px] font-sans pt-1">Lembar Kerja (Sheets):</div>
-                  <div className="flex flex-wrap gap-1 font-sans text-[10px]">
-                    {['Siswa', 'Kelas', 'Sesi_Presensi', 'Presensi', 'Izin_Keluar', 'Pelanggaran', 'Izin_Tidak_Masuk', 'Jenis_Pelanggaran', 'Pengaturan'].map((sh) => (
-                      <span key={sh} className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
-                        {sh}
+                  <div className="space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-bold text-slate-900 dark:text-white text-sm">
+                        {googleAccount?.name || settings.google_account_name || 'Kesiswaan SMP Puncak Darussalam'}
                       </span>
-                    ))}
+                      <span className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2.5 py-0.5 rounded-full border ${
+                        googleOAuthActive
+                          ? 'text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800'
+                          : 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-800'
+                      }`}>
+                        <Check className="w-3 h-3" />
+                        {googleOAuthActive ? 'OAuth 2.0 Terhubung' : 'Email Tersimpan (Aktifkan OAuth 2.0)'}
+                      </span>
+                    </div>
+                    <p className="text-slate-700 dark:text-slate-300 font-mono text-[11px] font-semibold flex items-center gap-1.5">
+                      <Mail className="w-3 h-3 text-emerald-600 shrink-0" />
+                      <span>{googleAccount?.email || settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}</span>
+                    </p>
+                    <p className="text-[10px] text-slate-500">
+                      Email akun Google &amp; notifikasi orang tua aktif otomatis saat OAuth 2.0 terhubung tanpa klik sinkronisasi manual.
+                    </p>
+                    {settings.google_last_synced_at && (
+                      <p className="text-[10px] text-slate-400">
+                        Sinkron Drive &amp; Sheets terakhir: {new Date(settings.google_last_synced_at).toLocaleString('id-ID')}
+                      </p>
+                    )}
                   </div>
                 </div>
 
-                {settings.google_sheet_url ? (
-                  <a
-                    href={settings.google_sheet_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline-flex items-center justify-center gap-1.5 w-full py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold transition-colors"
-                  >
-                    <span>Buka Database di Google Sheets</span>
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </a>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={!googleSheetsConnected || googleSyncing}
-                    onClick={() => syncGoogleSheetsNow()}
-                    className="inline-flex items-center justify-center gap-1.5 w-full py-2 rounded-lg bg-slate-200 dark:bg-slate-800 text-slate-500 font-semibold cursor-not-allowed"
-                  >
-                    <span>Spreadsheet Akan Terbentuk Saat Terhubung</span>
-                  </button>
-                )}
+                {/* Account Connect / Change / Disconnect Buttons */}
+                <div className="flex flex-wrap items-center gap-2">
+                  {!googleSheetsConnected ? (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={googleSyncing}
+                        onClick={() => connectGoogle(false, settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com')}
+                        className="flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-xs transition-colors disabled:opacity-50"
+                        title="Login dengan Google OAuth 2.0 untuk sinkronisasi otomatis Drive, Sheets, dan Email"
+                      >
+                        <Zap className="w-3.5 h-3.5 text-amber-300" />
+                        <span>Hubungkan via Google OAuth 2.0</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={googleSyncing}
+                        onClick={() => setIsGoogleModalOpen(true)}
+                        className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-750 font-semibold text-slate-700 dark:text-slate-200 text-xs shadow-xs transition-colors"
+                      >
+                        <svg className="w-3.5 h-3.5 shrink-0" viewBox="0 0 48 48">
+                          <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+                          <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+                          <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+                          <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+                        </svg>
+                        <span>Opsi Google Lengkap</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        disabled={googleSyncing}
+                        onClick={() => syncGoogleSheetsNow()}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 font-semibold transition-colors disabled:opacity-50"
+                        title="Sinkronisasi Drive & Sheets otomatis aktif setelah sesi OAuth 2.0 diotorisasi"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${googleSyncing ? 'animate-spin' : ''}`} />
+                        <span>{googleSyncing ? 'Menyinkronkan...' : googleOAuthActive ? 'Perbarui Drive & Sheets' : 'Aktifkan Sesi OAuth 2.0'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={googleSyncing}
+                        onClick={() => setIsGoogleModalOpen(true)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-750 font-semibold transition-colors"
+                        title="Ganti atau autentikasi ulang akun Google via OAuth 2.0"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5 text-blue-500" />
+                        <span>Ganti Akun (OAuth 2.0)</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={googleSyncing}
+                        onClick={() => {
+                          if (window.confirm('Apakah Anda yakin ingin memutuskan akun Google dari aplikasi?')) {
+                            disconnectGoogle();
+                          }
+                        }}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-rose-200 dark:border-rose-900 bg-white dark:bg-slate-800 text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 font-semibold transition-colors"
+                        title="Putuskan sambungan akun Google"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>Putuskan Akun</span>
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
             </div>
 
-            {/* Quick Inline Manual Drive/Sheet Link Toggle */}
+            {/* LANGKAH 3: FOLDER GOOGLE DRIVE & GOOGLE SPREADSHEET (Otomatis Tersinkron) */}
+            <div className="space-y-3 pt-1">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-xs font-bold text-slate-900 dark:text-white">
+                  <span className="w-6 h-6 rounded-full bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-bold text-[11px] flex items-center justify-center shrink-0">
+                    3
+                  </span>
+                  <span>Folder Google Drive &amp; Google Spreadsheet (Auto-Sync Setiap Perubahan)</span>
+                </div>
+                <span className="text-[10px] font-semibold text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-200 dark:border-emerald-800">
+                  Mencatat ID Cloud di Sheet Pengaturan
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {/* Card 1: Google Drive Folder */}
+                <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div className="p-2 rounded-lg bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
+                        <Folder className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-slate-900 dark:text-white">Folder Google Drive</h3>
+                        <p className="text-[11px] text-slate-500">Folder Khusus Aplikasi Sekolah</p>
+                      </div>
+                    </div>
+                    <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-blue-100 text-blue-800 dark:bg-blue-950/50 dark:text-blue-300">
+                      Otomatis Dibuat
+                    </span>
+                  </div>
+
+                  <div className="space-y-1.5 bg-white dark:bg-slate-900 p-3 rounded-lg border border-slate-200 dark:border-slate-800 font-mono text-[11px]">
+                    <div className="text-slate-500 text-[10px] font-sans">Nama Folder:</div>
+                    <div className="font-bold text-slate-800 dark:text-slate-200">
+                      DISIPLIN KITA BISA - Database Sekolah
+                    </div>
+                    <div className="text-slate-500 text-[10px] font-sans pt-1">ID Folder:</div>
+                    <div className="truncate text-slate-600 dark:text-slate-400">
+                      {settings.google_drive_folder_id || '(Dibuat otomatis saat akun Google terhubung via OAuth 2.0)'}
+                    </div>
+                  </div>
+
+                  {settings.google_drive_folder_url ? (
+                    <a
+                      href={settings.google_drive_folder_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center justify-center gap-1.5 w-full py-2 rounded-lg bg-slate-900 hover:bg-slate-800 text-white dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-white font-semibold transition-colors"
+                    >
+                      <span>Buka Folder di Google Drive</span>
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={!googleSheetsConnected || googleSyncing}
+                      onClick={() => syncGoogleSheetsNow()}
+                      className="inline-flex items-center justify-center gap-1.5 w-full py-2 rounded-lg bg-slate-200 dark:bg-slate-800 text-slate-500 font-semibold cursor-not-allowed"
+                    >
+                      <span>Folder Akan Terbentuk Saat OAuth 2.0 Terhubung</span>
+                    </button>
+                  )}
+                </div>
+
+                {/* Card 2: Google Spreadsheet */}
+                <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div className="p-2 rounded-lg bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
+                        <FileSpreadsheet className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-slate-900 dark:text-white">Google Spreadsheet</h3>
+                        <p className="text-[11px] text-slate-500">File Database Multi-Tabel + ID Cloud</p>
+                      </div>
+                    </div>
+                    <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300">
+                      9 Lembar Kerja
+                    </span>
+                  </div>
+
+                  <div className="space-y-1.5 bg-white dark:bg-slate-900 p-3 rounded-lg border border-slate-200 dark:border-slate-800 font-mono text-[11px]">
+                    <div className="text-slate-500 text-[10px] font-sans">Nama Spreadsheet:</div>
+                    <div className="font-bold text-slate-800 dark:text-slate-200">
+                      Database Presensi &amp; Kedisiplinan - DISIPLIN KITA BISA
+                    </div>
+                    <div className="text-slate-500 text-[10px] font-sans pt-1">Lembar Kerja (Sheets):</div>
+                    <div className="flex flex-wrap gap-1 font-sans text-[10px]">
+                      {['Siswa', 'Kelas', 'Sesi_Presensi', 'Presensi', 'Izin_Keluar', 'Pelanggaran', 'Izin_Tidak_Masuk', 'Jenis_Pelanggaran', 'Pengaturan'].map((sh) => (
+                        <span key={sh} className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
+                          {sh}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+
+                  {settings.google_sheet_url ? (
+                    <a
+                      href={settings.google_sheet_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center justify-center gap-1.5 w-full py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold transition-colors"
+                    >
+                      <span>Buka Database di Google Sheets</span>
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={!googleSheetsConnected || googleSyncing}
+                      onClick={() => syncGoogleSheetsNow()}
+                      className="inline-flex items-center justify-center gap-1.5 w-full py-2 rounded-lg bg-slate-200 dark:bg-slate-800 text-slate-500 font-semibold cursor-not-allowed"
+                    >
+                      <span>Spreadsheet Akan Terbentuk Saat OAuth 2.0 Terhubung</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Optional Target Spreadsheet/Folder ID Editor */}
             <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs space-y-2">
               <div className="flex items-center justify-between">
                 <span className="font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
                   <FileSpreadsheet className="w-3.5 h-3.5 text-blue-500" />
-                  Tautkan Link / ID Spreadsheet &amp; Folder Manual (Tanpa OAuth)
+                  Atur Target ID Spreadsheet / Folder Drive (Opsional)
                 </span>
                 <button
                   type="button"
@@ -3618,7 +3651,7 @@ export const AdminView: React.FC = () => {
                   }}
                   className="font-bold text-[11px] text-blue-600 dark:text-blue-400 hover:underline"
                 >
-                  {isEditingDriveIds ? 'Tutup Formulir' : 'Buka Formulir Tautan Manual'}
+                  {isEditingDriveIds ? 'Tutup Formulir' : 'Ubah Target ID'}
                 </button>
               </div>
 
@@ -3691,16 +3724,18 @@ export const AdminView: React.FC = () => {
             </div>
           </div>
 
-          {/* Architecture & Multi-device Real-Time Sync Details */}
+          {/* LANGKAH 4: Architecture & Multi-device Real-Time Sync Details */}
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-3">
               <div>
                 <h3 className="font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-                  Sinkronisasi Multi-Perangkat Otomatis Real-Time (Aktif di Semua Perangkat)
+                  <span className="w-6 h-6 rounded-full bg-emerald-600 text-white font-bold text-[11px] flex items-center justify-center shrink-0">
+                    4
+                  </span>
+                  <span>Sinkronisasi Multi-Perangkat Otomatis Real-Time (Aktif di Semua Perangkat)</span>
                 </h3>
                 <p className="text-slate-500 text-[11px] mt-0.5">
-                  Berjalan otomatis setiap 2.5 detik dan seketika antar-tab tanpa perlu klik tombol sinkronisasi. Setiap perubahan siswa, kelas, sesi, presensi, izin keluar, pelanggaran, dan pengaturan langsung tersinkron ke seluruh perangkat.
+                  Berjalan otomatis setiap 2.5 detik dan seketika antar-tab tanpa perlu klik tombol sinkronisasi. Setiap perubahan siswa, kelas, sesi, presensi, izin keluar, pelanggaran, ID Cloud, email &amp; pengaturan langsung tersinkron ke seluruh perangkat.
                 </p>
               </div>
 

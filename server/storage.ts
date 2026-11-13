@@ -1613,7 +1613,7 @@ class StorageManager {
         updated_at: now,
       },
       notification_settings: {
-        email_enabled: false,
+        email_enabled: true,
         trigger_late: true,
         trigger_alpha: true,
         trigger_leave: true,

@@ -85,7 +85,7 @@ export const getAccessToken = async (): Promise<string | null> => {
 };
 
 export const hasValidGoogleToken = (): boolean => {
-  if (!inMemoryAccessToken || inMemoryAccessToken === 'locked_token_bypass') {
+  if (!inMemoryAccessToken) {
     return false;
   }
   if (inMemoryTokenExpiresAt > 0 && Date.now() >= inMemoryTokenExpiresAt - 60000) {
@@ -96,7 +96,7 @@ export const hasValidGoogleToken = (): boolean => {
 
 export const setInMemoryToken = (token: string | null, expiresInSeconds?: number) => {
   inMemoryAccessToken = token;
-  if (!token || token === 'locked_token_bypass') {
+  if (!token) {
     inMemoryTokenExpiresAt = 0;
   } else {
     const ttl = typeof expiresInSeconds === 'number' && expiresInSeconds > 120 ? expiresInSeconds : 3500;
@@ -165,9 +165,8 @@ export const isKnownCloudConsoleOrigin = (): boolean => {
 };
 
 /**
- * Request Google OAuth token via Google Identity Services (GIS)
- * Uses Google Cloud Console OAuth 2.0 Web Client directly
- * Automatically adapts and recovers if origin_mismatch occurs on Vercel or external domains.
+ * Request Google OAuth 2.0 token via Google Identity Services (GIS)
+ * Strictly uses Google Cloud Console OAuth 2.0 Web Client without bypasses.
  */
 export const requestGoogleIdentityToken = async (
   promptSelectAccount: boolean = true,
@@ -177,52 +176,22 @@ export const requestGoogleIdentityToken = async (
   accessToken: string;
   accountInfo: ConnectedGoogleAccount;
   cancelled?: boolean;
-  autoAdapted?: boolean;
-  originMismatchRecovered?: boolean;
 }> => {
   const curOrig = typeof window !== 'undefined' ? window.location.origin : '';
   const effectiveHint = loginHint || 'kswsmp.puncakdarussalam@gmail.com';
-  const hasCustomClient = Boolean(customClientId && customClientId.trim());
   const clientId = (customClientId && customClientId.trim()) || getGoogleClientId();
 
   if (!clientId) {
-    throw new Error('Client ID OAuth Google Cloud Console tidak ditemukan. Masukkan Client ID pada Pengaturan Admin.');
-  }
-
-  // Automatic origin adapter: If deployed on Vercel or custom domain with default client ID,
-  // Google will block with Error 400 origin_mismatch.
-  // Instead of opening a doomed popup that confuses the user, automatically link the locked school account!
-  if (!hasCustomClient && !isKnownCloudConsoleOrigin() && !promptSelectAccount) {
-    console.info(`[Auto-Origin Adapter]: Origin ${curOrig} detected on external domain. Auto-linking official account ${effectiveHint} to prevent Error 400 origin_mismatch.`);
-    return {
-      accessToken: 'locked_token_bypass',
-      accountInfo: {
-        email: effectiveHint,
-        name: 'Kesiswaan SMP Puncak Darussalam',
-        uid: 'locked_school_account',
-        connectedAt: new Date().toISOString(),
-      },
-      cancelled: false,
-      autoAdapted: true,
-    };
+    throw new Error('ID Cloud Console (OAuth 2.0 Web Client ID) belum diisi. Simpan ID Cloud di menu Admin terlebih dahulu.');
   }
 
   await ensureGisLoaded();
 
   const google = (window as any).google;
   if (!google?.accounts?.oauth2) {
-    // If GIS fails to load, gracefully fallback to locked school account
-    return {
-      accessToken: 'locked_token_bypass',
-      accountInfo: {
-        email: effectiveHint,
-        name: 'Kesiswaan SMP Puncak Darussalam',
-        uid: 'locked_school_account',
-        connectedAt: new Date().toISOString(),
-      },
-      cancelled: false,
-      autoAdapted: true,
-    };
+    throw new Error(
+      'Layanan Google OAuth 2.0 (Google Identity Services) gagal dimuat. Periksa koneksi internet atau muat ulang halaman.'
+    );
   }
 
   return new Promise((resolve, reject) => {
@@ -234,7 +203,6 @@ export const requestGoogleIdentityToken = async (
         hint: effectiveHint,
         callback: async (tokenResponse: any) => {
           if (tokenResponse.error) {
-            // User closed popup or cancelled
             if (
               tokenResponse.error === 'popup_closed_by_user' ||
               tokenResponse.error === 'cancelled' ||
@@ -246,59 +214,54 @@ export const requestGoogleIdentityToken = async (
             const desc = tokenResponse.error_description || tokenResponse.error || '';
             const isOriginErr =
               tokenResponse.error === 'origin_mismatch' ||
-              (typeof desc === 'string' && (desc.includes('origin_mismatch') || desc.includes('origin') || desc.includes('redirect_uri_mismatch') || desc.includes('400')));
+              (typeof desc === 'string' &&
+                (desc.includes('origin_mismatch') ||
+                  desc.includes('redirect_uri_mismatch') ||
+                  desc.includes('origin')));
 
-            // AUTOMATIC ORIGIN MISMATCH RECOVERY:
-            // If origin_mismatch occurs, auto-resolve with the locked official school account instead of breaking!
             if (isOriginErr) {
-              console.warn(`[Auto-Origin Recovery]: Caught ${desc} on ${curOrig}. Automatically activating locked school account.`);
-              return resolve({
-                accessToken: 'locked_token_bypass',
-                accountInfo: {
-                  email: effectiveHint,
-                  name: 'Kesiswaan SMP Puncak Darussalam',
-                  uid: 'locked_school_account',
-                  connectedAt: new Date().toISOString(),
-                },
-                cancelled: false,
-                originMismatchRecovered: true,
-              });
+              return reject(
+                new Error(
+                  `OAuth 2.0 origin_mismatch (400): URL asal "${curOrig}" belum terdaftar pada Authorized JavaScript origins di Google Cloud Console untuk Client ID ini.`
+                )
+              );
             }
 
-            if (tokenResponse.error === 'access_denied' || (typeof desc === 'string' && (desc.includes('403') || desc.includes('access_denied')))) {
-              return resolve({
-                accessToken: 'locked_token_bypass',
-                accountInfo: {
-                  email: effectiveHint,
-                  name: 'Kesiswaan SMP Puncak Darussalam',
-                  uid: 'locked_school_account',
-                  connectedAt: new Date().toISOString(),
-                },
-                cancelled: false,
-                autoAdapted: true,
-              });
+            if (
+              tokenResponse.error === 'access_denied' ||
+              (typeof desc === 'string' && (desc.includes('403') || desc.includes('access_denied')))
+            ) {
+              return reject(
+                new Error(
+                  `OAuth 2.0 access_denied (403): Akses ditolak atau aplikasi masih mode Testing di OAuth Consent Screen. Tambahkan ${effectiveHint} ke Test Users atau Publish App di Google Cloud Console.`
+                )
+              );
             }
 
             if (tokenResponse.error === 'popup_blocked_by_browser' || tokenResponse.error_subtype === 'popup_blocked') {
-              return reject(new Error('Popup Google diblokir peramban. Harap izinkan pop-up (jendela sembulan) untuk situs ini, atau buka aplikasi di tab baru.'));
+              return reject(
+                new Error(
+                  'Popup OAuth 2.0 Google diblokir peramban. Harap izinkan pop-up untuk situs ini atau buka aplikasi di Tab Baru.'
+                )
+              );
             }
 
-            return reject(new Error(desc || 'Otentikasi Google Cloud Console gagal.'));
+            return reject(new Error(desc || 'Otentikasi OAuth 2.0 Google Cloud Console gagal.'));
           }
 
           const token = tokenResponse.access_token;
           if (!token) {
-            return reject(new Error('Gagal menerima Access Token dari Google.'));
+            return reject(new Error('Gagal menerima Access Token OAuth 2.0 dari Google.'));
           }
 
           setInMemoryToken(token, Number(tokenResponse.expires_in) || 3500);
 
-          // Bridge to Firebase Auth safely without domain restrictions or blocking errors
+          // Bridge to Firebase Auth safely without blocking OAuth 2.0 token usage
           try {
             const credential = GoogleAuthProvider.credential(null, token);
             await signInWithCredential(firebaseAuth, credential);
           } catch {
-            // Silently ignore any Firebase Auth domain issues since Google Identity Services is our primary provider
+            // Firebase Auth optional domain sync; GIS OAuth 2.0 token handles Drive & Sheets directly
           }
 
           try {
@@ -331,29 +294,25 @@ export const requestGoogleIdentityToken = async (
           if (err?.type === 'popup_closed' || err?.type === 'user_cancel') {
             resolve({ accessToken: '', accountInfo: null as any, cancelled: true });
           } else if (err?.type === 'popup_blocked') {
-            reject(new Error('Popup Google diblokir peramban. Harap izinkan pop-up untuk situs ini, atau buka di tab baru.'));
+            reject(
+              new Error(
+                'Popup OAuth 2.0 Google diblokir peramban. Harap izinkan pop-up untuk situs ini atau buka aplikasi di Tab Baru.'
+              )
+            );
           } else {
             const msg = err?.message || err?.type || '';
             const isOriginErr =
               typeof msg === 'string' &&
-              (msg.includes('origin_mismatch') || msg.includes('origin') || msg.includes('400') || msg.includes('redirect_uri_mismatch'));
+              (msg.includes('origin_mismatch') || msg.includes('redirect_uri_mismatch') || msg.includes('origin'));
 
-            // AUTOMATIC ORIGIN MISMATCH RECOVERY in error_callback:
-            if (isOriginErr || msg.includes('403') || msg.includes('access_denied')) {
-              console.warn(`[Auto-Origin Recovery in error_callback]: ${msg} on ${curOrig}. Activating locked school account.`);
-              resolve({
-                accessToken: 'locked_token_bypass',
-                accountInfo: {
-                  email: effectiveHint,
-                  name: 'Kesiswaan SMP Puncak Darussalam',
-                  uid: 'locked_school_account',
-                  connectedAt: new Date().toISOString(),
-                },
-                cancelled: false,
-                originMismatchRecovered: true,
-              });
+            if (isOriginErr) {
+              reject(
+                new Error(
+                  `OAuth 2.0 origin_mismatch (400): Daftarkan "${curOrig}" pada Authorized JavaScript origins di Google Cloud Console.`
+                )
+              );
             } else {
-              reject(new Error(msg || 'Gagal memproses otentikasi Google Cloud Console.'));
+              reject(new Error(msg || 'Gagal memproses otentikasi Google OAuth 2.0.'));
             }
           }
         },
@@ -364,19 +323,7 @@ export const requestGoogleIdentityToken = async (
         hint: effectiveHint,
       });
     } catch (err: any) {
-      // If error occurs immediately during requestAccessToken (e.g. invalid origin synchronously checked)
-      console.warn('[Auto-Origin Catch in requestAccessToken]:', err);
-      resolve({
-        accessToken: 'locked_token_bypass',
-        accountInfo: {
-          email: effectiveHint,
-          name: 'Kesiswaan SMP Puncak Darussalam',
-          uid: 'locked_school_account',
-          connectedAt: new Date().toISOString(),
-        },
-        cancelled: false,
-        originMismatchRecovered: true,
-      });
+      reject(new Error(err?.message || 'Gagal memulai permintaan otentikasi Google OAuth 2.0.'));
     }
   });
 };
@@ -438,8 +385,8 @@ const SPREADSHEET_NAME = 'Database Presensi & Kedisiplinan - DISIPLIN KITA BISA'
 export const getOrCreateDriveFolder = async (
   accessToken: string
 ): Promise<{ folderId: string; folderUrl: string }> => {
-  if (!accessToken || accessToken === 'locked_token_bypass') {
-    const errObj: any = new Error('Token OAuth Google belum aktif untuk mengakses Google Drive.');
+  if (!accessToken) {
+    const errObj: any = new Error('Token OAuth 2.0 Google belum aktif untuk mengakses Google Drive.');
     errObj.statusCode = 401;
     throw errObj;
   }
@@ -507,8 +454,8 @@ export const getOrCreateSpreadsheet = async (
   accessToken: string,
   folderId?: string
 ): Promise<{ spreadsheetId: string; spreadsheetUrl: string; isNew: boolean }> => {
-  if (!accessToken || accessToken === 'locked_token_bypass') {
-    const errObj: any = new Error('Token OAuth Google belum aktif untuk mengakses Google Sheets.');
+  if (!accessToken) {
+    const errObj: any = new Error('Token OAuth 2.0 Google belum aktif untuk mengakses Google Sheets.');
     errObj.statusCode = 401;
     throw errObj;
   }
@@ -674,8 +621,8 @@ export const syncDriveBackupFile = async (
   existingFileId: string | undefined,
   data: SyncDataPayload
 ): Promise<{ fileId: string; fileUrl: string }> => {
-  if (!accessToken || accessToken === 'locked_token_bypass') {
-    const errObj: any = new Error('Token OAuth Google belum aktif untuk menulis cadangan Google Drive.');
+  if (!accessToken) {
+    const errObj: any = new Error('Token OAuth 2.0 Google belum aktif untuk menulis cadangan Google Drive.');
     errObj.statusCode = 401;
     throw errObj;
   }
@@ -832,8 +779,8 @@ export const syncAllDataToGoogleSheets = async (
   spreadsheetId: string,
   data: SyncDataPayload
 ): Promise<{ success: boolean; rowsUpdated: number }> => {
-  if (!accessToken || accessToken === 'locked_token_bypass' || !spreadsheetId || spreadsheetId === 'spreadsheet_kesiswaan_puncak_darussalam') {
-    const errObj: any = new Error('Token OAuth atau ID Google Spreadsheet belum aktif.');
+  if (!accessToken || !spreadsheetId || spreadsheetId === 'spreadsheet_kesiswaan_puncak_darussalam') {
+    const errObj: any = new Error('Token OAuth 2.0 atau ID Google Spreadsheet belum aktif.');
     errObj.statusCode = 401;
     throw errObj;
   }
@@ -1043,11 +990,18 @@ export const syncAllDataToGoogleSheets = async (
     ]),
   ];
 
-  // 9. Format Pengaturan & Status
+  // 9. Format Pengaturan & Status (menyimpan ID Cloud Console + Folder + Spreadsheet + Email di Sheet)
+  const resolvedClientId = getGoogleClientId(data.settings.google_client_id);
+  const emailNotifActive =
+    data.settings.toggle_email_notifications !== false && data.notificationSettings?.email_enabled !== false;
   const pengaturanRows = [
     ['Parameter Sistem', 'Nilai Saat Ini', 'Keterangan'],
+    ['ID Cloud Console (Client ID)', resolvedClientId, 'OAuth 2.0 Web Client ID tersimpan otomatis di aplikasi & sheet'],
     ['Nama Sekolah', data.settings.school_name, 'Nama identitas resmi sekolah'],
-    ['Email Google Terhubung', data.settings.google_account_email || '-', 'Akun Google Drive & Sheets sekolah'],
+    ['Email Google Terhubung (OAuth 2.0)', data.settings.google_account_email || '-', 'Akun Google Drive & Sheets sekolah'],
+    ['Nama Akun Google', data.settings.google_account_name || '-', 'Nama profil akun Google OAuth 2.0'],
+    ['ID Folder Google Drive', data.settings.google_drive_folder_id || '-', 'Folder penyimpanan otomatis database JSON'],
+    ['ID Google Spreadsheet', spreadsheetId, 'ID Google Spreadsheet database 9 lembar kerja'],
     ['Total Siswa Terdaftar', data.students.length, 'Jumlah siswa aktif & terdaftar'],
     ['Total Kelas', data.classes.length, 'Jumlah rombel kelas'],
     ['Total Sesi Presensi', data.sessions.length, 'Jumlah sesi jadwal presensi'],
@@ -1055,9 +1009,16 @@ export const syncAllDataToGoogleSheets = async (
     ['Total Catatan Presensi', data.attendance.length, 'Presensi tercatat di sistem'],
     ['Total Izin Keluar', data.outOfClass.length, 'Izin keluar kelas tercatat'],
     ['Total Pelanggaran & Prestasi', data.violations.length, 'Catatan kedisiplinan'],
-    ['Notifikasi Email Orang Tua', data.notificationSettings?.email_enabled ? 'Aktif' : 'Nonaktif', 'Pengiriman pemberitahuan otomatis'],
+    ['Notifikasi Email Orang Tua', emailNotifActive ? 'Aktif (Otomatis)' : 'Nonaktif', 'Pengiriman pemberitahuan otomatis tanpa klik manual'],
+    [
+      'Rekap Mingguan Wali Kelas',
+      data.notificationSettings?.weekly_recap_enabled !== false
+        ? `Aktif (Hari ${data.notificationSettings?.weekly_recap_day ?? 5}, Jam ${data.notificationSettings?.weekly_recap_time || '15:00'})`
+        : 'Nonaktif',
+      'Pengiriman otomatis ke wali kelas per sesi',
+    ],
     ['Sinkron Terakhir', new Date().toLocaleString('id-ID'), 'Waktu sinkronisasi cloud otomatis real-time'],
-    ['Mode Database', 'Google Drive & Sheets Otomatis Real-Time', 'Sinkronisasi otomatis setiap perubahan data'],
+    ['Mode Database', 'Google OAuth 2.0 + Drive & Sheets Otomatis Real-Time', 'Sinkronisasi otomatis setiap perubahan data'],
   ];
 
   // Clear existing ranges then batch write
@@ -1161,21 +1122,34 @@ export const syncAllDataToDriveAndSheets = async (
     spreadsheetUrl = sheet.spreadsheetUrl;
   }
 
-  const runBoth = async (targetFolderId: string, targetSheetId: string, targetBackupId?: string) => {
+  const runBoth = async (targetFolderId: string, targetFolderUrl: string, targetSheetId: string, targetSheetUrl: string, targetBackupId?: string) => {
+    const enrichedPayload: SyncDataPayload = {
+      ...payload,
+      settings: {
+        ...payload.settings,
+        google_client_id: getGoogleClientId(payload.settings.google_client_id),
+        google_drive_folder_id: targetFolderId,
+        google_drive_folder_url: targetFolderUrl,
+        google_sheet_id: targetSheetId,
+        google_sheet_url: targetSheetUrl,
+      },
+    };
     const [sheetsResult, driveResult] = await Promise.all([
-      syncAllDataToGoogleSheets(accessToken, targetSheetId, payload),
-      syncDriveBackupFile(accessToken, targetFolderId, targetBackupId, payload),
+      syncAllDataToGoogleSheets(accessToken, targetSheetId, enrichedPayload),
+      syncDriveBackupFile(accessToken, targetFolderId, targetBackupId, enrichedPayload),
     ]);
     return { sheetsResult, driveResult };
   };
 
   try {
-    const { sheetsResult, driveResult } = await runBoth(folderId, spreadsheetId, backupFileId);
+    const resolvedFolderUrl = folderUrl || `https://drive.google.com/drive/folders/${folderId}`;
+    const resolvedSheetUrl = spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+    const { sheetsResult, driveResult } = await runBoth(folderId, resolvedFolderUrl, spreadsheetId, resolvedSheetUrl, backupFileId);
     return {
       folderId,
-      folderUrl: folderUrl || `https://drive.google.com/drive/folders/${folderId}`,
+      folderUrl: resolvedFolderUrl,
       spreadsheetId,
-      spreadsheetUrl: spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+      spreadsheetUrl: resolvedSheetUrl,
       backupFileId: driveResult.fileId,
       backupFileUrl: driveResult.fileUrl,
       rowsUpdated: sheetsResult.rowsUpdated,
@@ -1191,7 +1165,7 @@ export const syncAllDataToDriveAndSheets = async (
     ) {
       const folder = await getOrCreateDriveFolder(accessToken);
       const sheet = await getOrCreateSpreadsheet(accessToken, folder.folderId);
-      const { sheetsResult, driveResult } = await runBoth(folder.folderId, sheet.spreadsheetId, undefined);
+      const { sheetsResult, driveResult } = await runBoth(folder.folderId, folder.folderUrl, sheet.spreadsheetId, sheet.spreadsheetUrl, undefined);
       return {
         folderId: folder.folderId,
         folderUrl: folder.folderUrl,

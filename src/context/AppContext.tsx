@@ -159,7 +159,7 @@ const defaultSettings: AppSettings = {
 };
 
 const defaultNotificationSettings: NotificationSettings = {
-  email_enabled: false,
+  email_enabled: true,
   trigger_late: true,
   trigger_alpha: true,
   trigger_leave: true,
@@ -223,7 +223,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [googleAccount, setGoogleAccount] = useState<ConnectedGoogleAccount | null>(() => ({
     email: 'kswsmp.puncakdarussalam@gmail.com',
     name: 'Kesiswaan SMP Puncak Darussalam',
-    uid: 'locked_school_account',
+    uid: 'saved_google_account',
     connectedAt: '2026-11-10T09:38:00.000Z',
   }));
   const [googleSyncing, setGoogleSyncing] = useState<boolean>(false);
@@ -258,12 +258,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       },
       () => {
         setGoogleAccount((prev) => prev || {
-          email: 'kswsmp.puncakdarussalam@gmail.com',
-          name: 'Kesiswaan SMP Puncak Darussalam',
-          uid: 'locked_school_account',
-          connectedAt: '2026-11-10T09:38:00.000Z',
+          email: settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com',
+          name: settings.google_account_name || 'Kesiswaan SMP Puncak Darussalam',
+          uid: 'saved_google_account',
+          connectedAt: settings.google_last_synced_at || '2026-11-10T09:38:00.000Z',
         });
-        setGoogleSheetsConnected(true);
+        setGoogleSheetsConnected(Boolean(settings.google_account_email || hasValidGoogleToken()));
       }
     );
     return () => {
@@ -1392,7 +1392,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     notificationSettings,
   ]);
 
-  // Google Workspace Integration Actions
+  // Google Workspace Integration Actions (Strict Google OAuth 2.0)
   const connectGoogle = async (promptSelect: boolean = true, emailHint?: string, overrideClientId?: string) => {
     try {
       setGoogleSyncing(true);
@@ -1402,42 +1402,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         overrideClientId !== undefined
           ? overrideClientId.trim()
           : (latestSettings.google_client_id || '').trim();
-      showToast(`Membuka OAuth 2.0 Cloud Console untuk ${targetHint}...`, 'info');
+      showToast(`Membuka Google OAuth 2.0 untuk ${targetHint}...`, 'info');
       const res = await signInWithGoogle(promptSelect, targetClientId, targetHint);
       if (res.cancelled || !res.accessToken) {
-        showToast('Pemilihan akun Google dibatalkan.', 'info');
+        showToast('Otorisasi Google OAuth 2.0 dibatalkan.', 'info');
         return { success: false };
       }
       const { accessToken, accountInfo } = res;
       setGoogleAccount(accountInfo);
       setGoogleSheetsConnected(true);
-
-      if (accessToken === 'locked_token_bypass') {
-        setGoogleOAuthActive(false);
-        await updateSettings(
-          {
-            google_account_email: accountInfo.email,
-            google_account_name: accountInfo.name,
-            google_account_photo: accountInfo.photo,
-          },
-          { silent: true }
-        );
-        showToast(
-          `Akun ${accountInfo.email} tertaut. Untuk auto-sync langsung ke Google Drive & Sheets pada domain ini (${typeof window !== 'undefined' ? window.location.origin : ''}), daftarkan URL origin di Google Cloud Console.`,
-          'info'
-        );
-        return { success: true };
-      }
-
       setGoogleOAuthActive(hasValidGoogleToken());
-      showToast(`Menghubungkan & menyinkronkan Drive + Sheets (${accountInfo.email})...`, 'info');
+      showToast(`OAuth 2.0 terverifikasi (${accountInfo.email}). Menyinkronkan Drive + Sheets + Email...`, 'info');
 
+      const resolvedClientId = targetClientId || latestSettings.google_client_id || '';
+      const nextNotifSettings: NotificationSettings = {
+        ...notificationSettings,
+        email_enabled: true,
+        weekly_recap_enabled: notificationSettings.weekly_recap_enabled ?? true,
+      };
       const nextSettingsSnapshot: AppSettings = {
         ...settingsRef.current,
-        ...(targetClientId ? { google_client_id: targetClientId } : {}),
+        ...(resolvedClientId ? { google_client_id: resolvedClientId } : {}),
         google_account_email: accountInfo.email,
         google_account_name: accountInfo.name,
         google_account_photo: accountInfo.photo,
+        toggle_email_notifications: true,
       };
 
       const sigBeforeSync = driveSheetSignature;
@@ -1451,13 +1440,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         leaveRequests,
         violationTypes,
         settings: nextSettingsSnapshot,
-        notificationSettings,
+        notificationSettings: nextNotifSettings,
       });
 
       const nowIso = new Date().toISOString();
       lastAutoSheetSigRef.current = sigBeforeSync;
       await updateSettings(
         {
+          ...(resolvedClientId ? { google_client_id: resolvedClientId } : {}),
           google_account_email: accountInfo.email,
           google_account_name: accountInfo.name,
           google_account_photo: accountInfo.photo,
@@ -1468,19 +1458,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           google_sheet_id: syncRes.spreadsheetId,
           google_sheet_url: syncRes.spreadsheetUrl,
           google_last_synced_at: nowIso,
+          toggle_email_notifications: true,
         },
         { silent: true }
       );
 
+      if (!notificationSettings.email_enabled) {
+        await updateNotificationSettings({ email_enabled: true }, { silent: true });
+      }
+
       showToast(
-        `Akun Google (${accountInfo.email}) terhubung! Google Drive & Sheets otomatis tersinkron (${syncRes.rowsUpdated} baris data).`,
+        `OAuth 2.0 (${accountInfo.email}) terhubung! ID Cloud, Email & Drive/Sheets otomatis tersinkron (${syncRes.rowsUpdated} baris).`,
         'success'
       );
       return { success: true };
     } catch (err: any) {
-      console.error('[Google Connect Error]:', err);
+      console.error('[Google OAuth 2.0 Connect Error]:', err);
       setGoogleOAuthActive(hasValidGoogleToken());
-      showToast(err.message || 'Gagal menghubungkan Akun Google', 'error');
+      showToast(err.message || 'Gagal menghubungkan Akun Google OAuth 2.0', 'error');
       return { success: false, error: err.message };
     } finally {
       setGoogleSyncing(false);
@@ -1538,7 +1533,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         google_last_synced_at: nowIso,
       });
 
-      showToast(`Email ${cleanEmail} berhasil ditautkan sebagai akun resmi sekolah!`, 'success');
+      showToast(`Email ${cleanEmail} berhasil ditautkan & disinkronkan otomatis!`, 'success');
       return { success: true };
     } catch (err: any) {
       showToast(err.message || 'Gagal menautkan email', 'error');
@@ -1556,29 +1551,40 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         overrideClientId !== undefined
           ? overrideClientId.trim()
           : (latestSettings.google_client_id || '').trim();
+      let oauthAccountInfo: ConnectedGoogleAccount | null = null;
       if (!token) {
-        showToast(`Meminta otorisasi OAuth Google untuk ${targetHint}...`, 'info');
+        showToast(`Meminta otorisasi OAuth 2.0 Google untuk ${targetHint}...`, 'info');
         const res = await signInWithGoogle(false, targetClientId, targetHint);
         if (res.cancelled || !res.accessToken) {
-          showToast('Otorisasi Google diperlukan untuk sinkronisasi otomatis ke Drive & Sheets.', 'info');
+          showToast('Otorisasi Google OAuth 2.0 diperlukan untuk sinkronisasi ke Drive & Sheets.', 'info');
           return { success: false };
         }
-        if (res.accessToken === 'locked_token_bypass') {
-          setGoogleOAuthActive(false);
-          showToast(
-            `Origin ${typeof window !== 'undefined' ? window.location.origin : ''} belum terdaftar di Google Cloud Console Client ID. Daftarkan origin tersebut agar browser bisa menulis ke Drive & Sheets.`,
-            'error'
-          );
-          return { success: false, error: 'origin_mismatch' };
-        }
         token = res.accessToken;
+        oauthAccountInfo = res.accountInfo;
         setGoogleAccount(res.accountInfo);
         setGoogleSheetsConnected(true);
         setGoogleOAuthActive(hasValidGoogleToken());
       }
 
-      showToast('Menyinkronkan seluruh data (Sesi, Siswa, Kelas, Presensi) ke Google Drive & Sheets...', 'info');
+      showToast('Menyinkronkan seluruh data (ID Cloud, Sesi, Siswa, Kelas, Presensi) ke Drive & Sheets...', 'info');
       const sigBeforeSync = driveSheetSignature;
+      const nextSettingsForSync: AppSettings = {
+        ...settingsRef.current,
+        ...(targetClientId ? { google_client_id: targetClientId } : {}),
+        ...(oauthAccountInfo
+          ? {
+              google_account_email: oauthAccountInfo.email,
+              google_account_name: oauthAccountInfo.name,
+              google_account_photo: oauthAccountInfo.photo,
+            }
+          : {}),
+        toggle_email_notifications: true,
+      };
+      const nextNotifForSync: NotificationSettings = {
+        ...notificationSettings,
+        email_enabled: true,
+      };
+
       const syncRes = await syncAllDataToDriveAndSheets(token, {
         students,
         classes,
@@ -1588,14 +1594,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         violations,
         leaveRequests,
         violationTypes,
-        settings: settingsRef.current,
-        notificationSettings,
+        settings: nextSettingsForSync,
+        notificationSettings: nextNotifForSync,
       });
 
       const nowIso = new Date().toISOString();
       lastAutoSheetSigRef.current = sigBeforeSync;
       await updateSettings(
         {
+          ...(targetClientId ? { google_client_id: targetClientId } : {}),
+          ...(oauthAccountInfo
+            ? {
+                google_account_email: oauthAccountInfo.email,
+                google_account_name: oauthAccountInfo.name,
+                google_account_photo: oauthAccountInfo.photo,
+              }
+            : {}),
           google_drive_folder_id: syncRes.folderId,
           google_drive_folder_url: syncRes.folderUrl,
           google_drive_backup_file_id: syncRes.backupFileId,
@@ -1603,12 +1617,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           google_sheet_id: syncRes.spreadsheetId,
           google_sheet_url: syncRes.spreadsheetUrl,
           google_last_synced_at: nowIso,
+          toggle_email_notifications: true,
         },
         { silent: true }
       );
+      if (!notificationSettings.email_enabled) {
+        await updateNotificationSettings({ email_enabled: true }, { silent: true });
+      }
       setGoogleOAuthActive(hasValidGoogleToken());
       showToast(
-        `Auto-Sync Google Drive & Sheets aktif & tersinkron (${syncRes.rowsUpdated} baris data).`,
+        `OAuth 2.0 & Auto-Sync Google Drive + Sheets aktif (${syncRes.rowsUpdated} baris tersinkron).`,
         'success'
       );
       return { success: true, rowsUpdated: syncRes.rowsUpdated };
@@ -2795,6 +2813,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         console.warn('[Auto Drive & Sheets Sync]:', err);
         if (err?.statusCode === 401) {
           setGoogleOAuthActive(false);
+          showToast('Sesi OAuth 2.0 Google berakhir. Klik tombol OAuth 2.0 di header untuk melanjutkan auto-sync.', 'info');
         }
       } finally {
         isAutoSheetSyncingRef.current = false;

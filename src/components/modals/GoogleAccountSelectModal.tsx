@@ -39,13 +39,13 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
   isLoading,
   currentEmail,
 }) => {
-  const { settings, updateSettings, showToast, linkEmailDirectly } = useApp();
+  const { settings, updateSettings, showToast } = useApp();
 
   const officialEmail = 'kswsmp.puncakdarussalam@gmail.com';
   const officialName = 'Kesiswaan SMP Puncak Darussalam';
 
-  // Tabs: 'oauth' (Google Cloud Console automated) vs 'manual_sheet' (direct link/ID) vs 'email' (basic email link)
-  const [activeTab, setActiveTab] = useState<'oauth' | 'manual_sheet' | 'email'>('oauth');
+  // Tabs: 'oauth' (Google OAuth 2.0 Cloud Console) vs 'manual_sheet' (existing spreadsheet/folder ID)
+  const [activeTab, setActiveTab] = useState<'oauth' | 'manual_sheet'>('oauth');
 
   // OAuth states
   const [currentOrigin, setCurrentOrigin] = useState('');
@@ -59,11 +59,6 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
   const [manualSheetInput, setManualSheetInput] = useState('');
   const [manualFolderInput, setManualFolderInput] = useState('');
   const [isSavingManual, setIsSavingManual] = useState(false);
-
-  // Email link inputs
-  const [emailInput, setEmailInput] = useState(officialEmail);
-  const [nameInput, setNameInput] = useState(officialName);
-  const [isSubmittingEmail, setIsSubmittingEmail] = useState(false);
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -85,10 +80,8 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
       setCustomIdInput(getGoogleClientId(settings.google_client_id));
       setManualSheetInput(settings.google_sheet_url || settings.google_sheet_id || '');
       setManualFolderInput(settings.google_drive_folder_url || settings.google_drive_folder_id || '');
-      setEmailInput(settings.google_account_email || officialEmail);
-      setNameInput(settings.google_account_name || officialName);
     }
-  }, [isOpen, settings.google_client_id, settings.google_sheet_url, settings.google_sheet_id, settings.google_drive_folder_url, settings.google_drive_folder_id, settings.google_account_email, settings.google_account_name]);
+  }, [isOpen, settings.google_client_id, settings.google_sheet_url, settings.google_sheet_id, settings.google_drive_folder_url, settings.google_drive_folder_id]);
 
   useEffect(() => {
     return () => {
@@ -168,28 +161,17 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
         google_sheet_url: sheetUrl,
         google_drive_folder_id: folderId,
         google_drive_folder_url: folderUrl,
-        google_account_email: emailInput.trim() || officialEmail,
-        google_account_name: nameInput.trim() || officialName,
+        google_account_email: settings.google_account_email || officialEmail,
+        google_account_name: settings.google_account_name || officialName,
         google_last_synced_at: new Date().toISOString(),
       });
 
-      showToast('Google Spreadsheet & Drive berhasil ditautkan ke sistem!', 'success');
+      showToast('ID Spreadsheet & Folder Drive tersimpan. Hubungkan Google OAuth 2.0 untuk mulai menulis data otomatis.', 'success');
       onClose();
     } catch (err: any) {
       showToast(err.message || 'Gagal menyimpan tautan spreadsheet', 'error');
     } finally {
       setIsSavingManual(false);
-    }
-  };
-
-  const handleDirectEmailConnect = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsSubmittingEmail(true);
-    try {
-      await linkEmailDirectly(emailInput.trim(), nameInput.trim());
-      onClose();
-    } finally {
-      setIsSubmittingEmail(false);
     }
   };
 
@@ -217,7 +199,7 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
           <button
             type="button"
             onClick={onClose}
-            disabled={isLoading || isSavingManual || isSubmittingEmail}
+            disabled={isLoading || isSavingManual}
             className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
           >
             <X className="w-4 h-4" />
@@ -236,7 +218,7 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
             }`}
           >
             <Sparkles className="w-3.5 h-3.5 text-amber-500" />
-            <span>1. Otomatisasi Cloud Console (Drive + Sheets)</span>
+            <span>1. Google OAuth 2.0 (Drive + Sheets + Email)</span>
           </button>
 
           <button
@@ -249,20 +231,7 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
             }`}
           >
             <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-500" />
-            <span>2. Tautkan Link / ID Spreadsheet</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setActiveTab('email')}
-            className={`flex items-center gap-1.5 px-3 py-2 border-b-2 transition-all shrink-0 ${
-              activeTab === 'email'
-                ? 'border-slate-800 text-slate-900 dark:text-white bg-white dark:bg-slate-900 rounded-t-lg'
-                : 'border-transparent text-slate-500 hover:text-slate-900 dark:hover:text-slate-200'
-            }`}
-          >
-            <Mail className="w-3.5 h-3.5 text-slate-500" />
-            <span>3. Email Sekolah</span>
+            <span>2. Tautkan ID Spreadsheet / Folder</span>
           </button>
         </div>
 
@@ -315,16 +284,16 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                 <div className="p-2.5 rounded-lg bg-emerald-50/80 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 text-[11px] space-y-1">
                   <div className="flex items-center gap-1.5 font-bold text-emerald-800 dark:text-emerald-300">
                     <CheckCircle className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                    <span>Penanganan Otomatis JavaScript Aktif (Bebas Error 400: origin_mismatch)</span>
+                    <span>Autentikasi Resmi Google OAuth 2.0 &amp; Sinkron Email Otomatis</span>
                   </div>
                   <p className="text-emerald-700 dark:text-emerald-400 leading-relaxed">
-                    Sistem otomatis mendeteksi URL domain ini dan mengaktifkan Akun Resmi Sekolah (<strong className="font-mono">kswsmp.puncakdarussalam@gmail.com</strong>) secara otomatis. Tidak ada kendala error origin mismatch saat aplikasi berjalan di Vercel maupun perangkat lain.
+                    Pastikan URL asal di bawah ini terdaftar pada <strong>Authorized JavaScript origins</strong> di Google Cloud Console. Setelah terhubung via OAuth 2.0, akun email sekolah &amp; ID Cloud tersimpan otomatis di aplikasi, database, serta tab <strong>Pengaturan</strong> Google Sheets.
                   </p>
                 </div>
 
                 <div className="space-y-1.5">
                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block">
-                    URL Asal Browser Saat Ini (Salin jika ingin didaftarkan manual di Cloud Console):
+                    URL Asal Browser Saat Ini (Daftarkan di Authorized JavaScript origins):
                   </label>
                   <div className="flex items-center gap-2">
                     <code className="flex-1 px-2.5 py-1.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-mono text-[11px] truncate select-all">
@@ -363,7 +332,7 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-1.5 font-bold text-amber-900 dark:text-amber-200 text-xs">
                     <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                    <span>Petunjuk Developer Google Cloud Console (Error 400 &amp; Error 403):</span>
+                    <span>Panduan Google Cloud Console OAuth 2.0 (Error 400 &amp; 403):</span>
                   </div>
                   <button
                     type="button"
@@ -374,7 +343,7 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                   </button>
                 </div>
                 <p className="text-[11px] text-amber-800 dark:text-amber-300 leading-normal">
-                  Jika Anda menggunakan Client ID kustom di Google Cloud Console, pastikan origin terdaftar dan status aplikasi di-publish:
+                  Pastikan origin domain aktif (Vercel / AI Studio) sudah didaftarkan di OAuth 2.0 Client ID Anda:
                 </p>
                 {showGuide403 && (
                   <ul className="list-disc pl-4 space-y-1.5 text-[11px] text-amber-900 dark:text-amber-200 bg-white/80 dark:bg-slate-900/80 p-2.5 rounded-lg border border-amber-200 dark:border-amber-900/60 leading-relaxed">
@@ -383,9 +352,6 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                     </li>
                     <li>
                       <strong>Error 403 (access_denied / testing):</strong> Di menu <strong>OAuth consent screen</strong>, klik <strong>&quot;PUBLISH APP&quot;</strong> agar status menjadi <em>In production</em>, atau tambahkan <code className="font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">kswsmp.puncakdarussalam@gmail.com</code> ke daftar <strong>Test users</strong>.
-                    </li>
-                    <li>
-                      <strong>Opsi Tercepat (Tanpa Setup Console):</strong> Klik tombol hijau di bawah, aplikasi langsung bekerja 100% menggunakan akun resmi sekolah yang sudah terkunci.
                     </li>
                   </ul>
                 )}
@@ -400,7 +366,7 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                   <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
                     {clientIdSavedIndicator === 'saving'
                       ? 'Menyimpan otomatis...'
-                      : 'Tersimpan di DB & sinkron multi-perangkat'}
+                      : 'Tersimpan di Aplikasi & Sheet'}
                   </span>
                 </div>
                 <div className="flex flex-col sm:flex-row gap-2">
@@ -425,14 +391,14 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                   </button>
                 </div>
                 <p className="text-[10px] text-slate-500">
-                  Setelah ID Cloud disimpan ke database, perangkat lain langsung tersinkron otomatis tanpa memasukkan ulang ID Cloud.
+                  Setelah tersimpan, perangkat lain otomatis menerima ID Cloud tanpa mengetik ulang, dan ditulis ke sheet <strong>Pengaturan</strong>.
                 </p>
               </div>
 
               {/* Iframe notice if inside preview */}
               {isIframe && (
                 <div className="p-2.5 rounded-lg bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800 text-sky-900 dark:text-sky-300 flex items-center justify-between text-[11px]">
-                  <span>Jika pop-up login terhalang peramban, buka aplikasi di Tab Baru:</span>
+                  <span>Jika pop-up OAuth 2.0 terhalang peramban, buka aplikasi di Tab Baru:</span>
                   <a
                     href={window.location.href}
                     target="_blank"
@@ -463,7 +429,7 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                   {isLoading ? (
                     <>
                       <RefreshCw className="w-4 h-4 animate-spin" />
-                      <span>Menghubungkan &amp; Menyinkronkan Drive + Sheet...</span>
+                      <span>Menghubungkan Google OAuth 2.0...</span>
                     </>
                   ) : (
                     <>
@@ -473,7 +439,7 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                         <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
                         <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
                       </svg>
-                      <span>Simpan ID Cloud &amp; Langsung Sinkronkan Drive + Sheets</span>
+                      <span>Simpan ID Cloud &amp; Hubungkan Google OAuth 2.0</span>
                       <ArrowRight className="w-4 h-4" />
                     </>
                   )}
@@ -482,16 +448,16 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
             </div>
           )}
 
-          {/* TAB 2: MANUAL SPREADSHEET LINKING (ZERO OAUTH / INSTANT LINK) */}
+          {/* TAB 2: EXISTING SPREADSHEET / FOLDER LINKING */}
           {activeTab === 'manual_sheet' && (
             <form onSubmit={handleSaveManualSheet} className="space-y-3.5">
               <div className="p-3.5 rounded-xl border border-blue-200 dark:border-blue-900 bg-blue-50/70 dark:bg-blue-950/20 space-y-1.5">
                 <div className="flex items-center gap-2 text-blue-900 dark:text-blue-300 font-bold">
                   <FileSpreadsheet className="w-4 h-4 text-blue-600 shrink-0" />
-                  <span>Tautkan Spreadsheet atau Folder Drive yang Sudah Anda Buat</span>
+                  <span>Tautkan Spreadsheet atau Folder Drive yang Sudah Ada</span>
                 </div>
                 <p className="text-[11px] text-blue-800 dark:text-blue-300 leading-relaxed">
-                  Jika Anda sudah membuat file spreadsheet atau folder di Google Drive Anda (atau ingin menautkan sheet tertentu), tempelkan link atau ID di bawah ini. Aplikasi akan langsung mengarahkan sinkronisasi ke berkas tersebut.
+                  Jika Anda ingin mengarahkan sinkronisasi ke file Google Spreadsheet atau folder Drive tertentu yang sudah ada, masukkan link atau ID-nya di bawah. Penulisan otomatis tetap menggunakan sesi Google OAuth 2.0.
                 </p>
               </div>
 
@@ -542,55 +508,6 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                     <span>Simpan &amp; Tautkan Spreadsheet Ini</span>
                   </>
                 )}
-              </button>
-            </form>
-          )}
-
-          {/* TAB 3: BASIC EMAIL LINKING */}
-          {activeTab === 'email' && (
-            <form onSubmit={handleDirectEmailConnect} className="space-y-3.5">
-              <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40 space-y-2">
-                <span className="font-bold text-slate-800 dark:text-slate-200 block text-xs">
-                  Atur Identitas Akun Email Sekolah
-                </span>
-                <p className="text-[11px] text-slate-500 leading-relaxed">
-                  Menetapkan akun resmi sekolah untuk menerima notifikasi keterlambatan/pelanggaran siswa dan laporan rekap mingguan sesi wali kelas.
-                </p>
-
-                <div className="space-y-2 pt-1">
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                      Alamat Email:
-                    </label>
-                    <input
-                      type="email"
-                      required
-                      value={emailInput}
-                      onChange={(e) => setEmailInput(e.target.value)}
-                      className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-mono text-xs"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                      Nama Pengelola:
-                    </label>
-                    <input
-                      type="text"
-                      value={nameInput}
-                      onChange={(e) => setNameInput(e.target.value)}
-                      className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white text-xs"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              <button
-                type="submit"
-                disabled={isSubmittingEmail}
-                className="w-full py-2.5 px-4 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs shadow-md transition-all flex items-center justify-center gap-2"
-              >
-                {isSubmittingEmail ? 'Menyimpan...' : 'Perbarui Email Sekolah'}
               </button>
             </form>
           )}

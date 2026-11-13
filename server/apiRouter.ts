@@ -773,7 +773,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         const studentVios = allVios.filter((v) => v.student_id === student.nis);
         const totalPoints = studentVios.reduce((acc, curr) => acc + (curr.category === 'prestasi' ? -curr.points : curr.points), 0);
 
-        // Notify parent
+        // Notify parent automatically for violation & warning threshold if crossed
         notificationService.notifyParent({
           student,
           triggerType: 'pelanggaran',
@@ -781,6 +781,18 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           violationName: vtype.name,
           points: record.points,
         }).catch(console.error);
+
+        const notifSettings = await storage.getNotificationSettings();
+        const threshold = notifSettings?.warning_threshold_points ?? 25;
+        if (totalPoints >= threshold && vtype.category !== 'prestasi') {
+          notificationService.notifyParent({
+            student,
+            triggerType: 'ambang_peringatan',
+            status: `Poin Pelanggaran Mencapai Ambang Batas SP (${totalPoints} poin)`,
+            violationName: vtype.name,
+            points: totalPoints,
+          }).catch(console.error);
+        }
 
         return JsonResponse.ok({
           success: true,
@@ -1093,6 +1105,20 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         if (rejectionReason) existing.rejection_reason = rejectionReason;
 
         const saved = await storage.saveLeaveRequest(existing);
+
+        if (status === 'approved') {
+          const students = await storage.getStudents();
+          const student = students.find((s) => s.nis === existing.student_id);
+          if (student) {
+            notificationService.notifyParent({
+              student,
+              triggerType: 'izin_sakit',
+              status: `Izin / Sakit Disetujui (${existing.type}: ${existing.start_date} s/d ${existing.end_date})`,
+              customDetails: existing.reason,
+            }).catch(console.error);
+          }
+        }
+
         return JsonResponse.ok({ success: true, request: saved });
       }
     }

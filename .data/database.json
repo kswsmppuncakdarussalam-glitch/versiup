@@ -1,9 +1,9 @@
 {
   "meta": {
-    "current_version": "36",
+    "current_version": "37",
     "app_name": "DISIPLIN KITA BISA",
     "initialized_at": "2026-11-07T04:32:01.864Z",
-    "last_updated_at": "2026-11-13T13:00:14.864Z"
+    "last_updated_at": "2026-11-13T17:04:54.852Z"
   },
   "users": [
     {
@@ -292,7 +292,7 @@
     "google_drive_backup_file_url": "https://drive.google.com/file/d/13hTFsckpHofyz0vaRyh5aCFcsV9lzAC5/view?usp=drivesdk"
   },
   "notification_settings": {
-    "email_enabled": false,
+    "email_enabled": true,
     "trigger_late": true,
     "trigger_alpha": true,
     "trigger_leave": true,
@@ -305,7 +305,8 @@
     "weekly_recap_enabled": true,
     "weekly_recap_day": 5,
     "weekly_recap_time": "15:00",
-    "updated_at": "2026-11-07T04:32:01.864Z"
+    "updated_at": "2026-11-13T17:04:54.852Z",
+    "weekly_recap_last_sent": "2026-11-13T17:04:54.852Z"
   },
   "notification_log": [],
   "audit_log": [],
@@ -612,6 +613,31 @@
         "google_sheet_url": "https://docs.google.com/spreadsheets/d/14MkgrDI6iFV4J8b5rS_LkUZrHtYX_zzuGJUihjKdxU4/edit?usp=drivesdk",
         "google_drive_backup_file_id": "13hTFsckpHofyz0vaRyh5aCFcsV9lzAC5",
         "google_drive_backup_file_url": "https://drive.google.com/file/d/13hTFsckpHofyz0vaRyh5aCFcsV9lzAC5/view?usp=drivesdk"
+      }
+    },
+    {
+      "id": "chg_1794589494852_piaey",
+      "version": 37,
+      "entity": "notification_settings",
+      "entity_id": "global",
+      "action": "update",
+      "changed_at": "2026-11-13T17:04:54.852Z",
+      "data": {
+        "email_enabled": false,
+        "trigger_late": true,
+        "trigger_alpha": true,
+        "trigger_leave": true,
+        "trigger_violation": true,
+        "trigger_warning_threshold": true,
+        "trigger_overdue_out_of_class": true,
+        "warning_threshold_points": 25,
+        "subject_template": "Pemberitahuan Kedisiplinan Siswa: {nama_siswa} ({kelas})",
+        "body_template": "Yth. Orang Tua / Wali dari {nama_siswa},\n\nKami menginformasikan bahwa pada tanggal {tanggal} pukul {jam}, putra/putri Anda tercatat: {status}.\nDetail: {pelanggaran} (Poin: {poin}, Menit Keterlambatan: {menit_terlambat_kembali}).\n\nMohon perhatian dan bimbingannya.\n\nHormat kami,\n{nama_sekolah}",
+        "weekly_recap_enabled": true,
+        "weekly_recap_day": 5,
+        "weekly_recap_time": "15:00",
+        "updated_at": "2026-11-13T17:04:54.852Z",
+        "weekly_recap_last_sent": "2026-11-13T17:04:54.852Z"
       }
     }
   ]
