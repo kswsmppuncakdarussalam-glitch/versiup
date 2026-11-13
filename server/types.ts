@@ -186,6 +186,8 @@ export interface AppSettings {
   google_account_photo?: string;
   google_drive_folder_id?: string;
   google_drive_folder_url?: string;
+  google_drive_backup_file_id?: string;
+  google_drive_backup_file_url?: string;
   google_sheet_id?: string;
   google_sheet_url?: string;
   google_last_synced_at?: string;

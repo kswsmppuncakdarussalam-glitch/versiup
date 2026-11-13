@@ -103,6 +103,8 @@ export const AdminView: React.FC = () => {
     googleSheetsConnected,
     googleAccount,
     googleSyncing,
+    googleOAuthActive,
+    serverDriveSyncActive,
     connectGoogle,
     disconnectGoogle,
     syncGoogleSheetsNow,
@@ -627,11 +629,6 @@ export const AdminView: React.FC = () => {
     } else {
       showToast(`Impor sukses! ${studentsToSave.length} data siswa berhasil disimpan.`, 'success');
     }
-
-    // Auto-sync to Google Sheets if connected
-    if (googleSheetsConnected && settings.google_sheet_id) {
-      syncGoogleSheetsNow().catch(() => {});
-    }
   };
 
   // Student filtering & bulk deletion handlers
@@ -674,9 +671,6 @@ export const AdminView: React.FC = () => {
       const ok = await deleteStudents(Array.from(selectedStudentNis));
       if (ok) {
         setSelectedStudentNis(new Set());
-        if (googleSheetsConnected && settings.google_sheet_id) {
-          syncGoogleSheetsNow().catch(() => {});
-        }
       }
     } finally {
       setIsDeletingBulk(false);
@@ -690,9 +684,6 @@ export const AdminView: React.FC = () => {
       if (ok) {
         setIsClearAllModalOpen(false);
         setSelectedStudentNis(new Set());
-        if (googleSheetsConnected && settings.google_sheet_id) {
-          syncGoogleSheetsNow().catch(() => {});
-        }
       }
     } finally {
       setIsDeletingBulk(false);
@@ -781,6 +772,50 @@ export const AdminView: React.FC = () => {
               {label}
             </button>
           ))}
+        </div>
+
+        {/* Live Auto-Sync Google Drive & Sheets Strip */}
+        <div
+          className={`mt-3 px-3 py-2 rounded-lg border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
+            googleSyncing
+              ? 'bg-sky-50 dark:bg-sky-950/30 border-sky-200 dark:border-sky-800 text-sky-800 dark:text-sky-200'
+              : googleOAuthActive || serverDriveSyncActive
+              ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200'
+              : 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800 text-amber-900 dark:text-amber-200'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {googleSyncing ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+            ) : (
+              <Database className="w-3.5 h-3.5 shrink-0" />
+            )}
+            <span>
+              {googleSyncing ? (
+                <>
+                  <strong>Menyinkronkan Otomatis:</strong> Memperbarui sesi, data siswa, kelas, presensi, izin, pelanggaran &amp; pengaturan ke Google Drive dan Google Sheets...
+                </>
+              ) : googleOAuthActive || serverDriveSyncActive ? (
+                <>
+                  <strong>Auto-Sync Drive &amp; Sheets Aktif:</strong> Setiap perubahan Sesi, Data Siswa, Kelas, Presensi, Izin, Pelanggaran &amp; Pengaturan otomatis tersinkron ke Database, Google Drive, dan Google Sheets tanpa klik manual.
+                </>
+              ) : (
+                <>
+                  <strong>Database Multi-Perangkat Aktif:</strong> Semua perubahan langsung tersimpan di server. Klik tombol di samping 1x untuk mengaktifkan Auto-Sync langsung ke Google Drive &amp; Google Sheets pada sesi tab ini.
+                </>
+              )}
+            </span>
+          </div>
+          {!(googleOAuthActive || serverDriveSyncActive) && (
+            <button
+              type="button"
+              disabled={googleSyncing}
+              onClick={() => syncGoogleSheetsNow()}
+              className="px-3 py-1 rounded bg-amber-600 hover:bg-amber-700 text-white font-semibold whitespace-nowrap shrink-0 disabled:opacity-50 transition-colors"
+            >
+              Aktifkan Auto-Sync Drive (1x)
+            </button>
+          )}
         </div>
       </div>
 
@@ -999,10 +1034,7 @@ export const AdminView: React.FC = () => {
                               type="button"
                               onClick={async () => {
                                 if (window.confirm(`Yakin ingin menghapus nama dan data siswa "${s.name}" (NIS: ${s.nis})?`)) {
-                                  const ok = await deleteStudent(s.nis);
-                                  if (ok && googleSheetsConnected && settings.google_sheet_id) {
-                                    syncGoogleSheetsNow().catch(() => {});
-                                  }
+                                  await deleteStudent(s.nis);
                                 }
                               }}
                               className="p-1 text-slate-400 hover:text-rose-600"
@@ -3111,28 +3143,46 @@ export const AdminView: React.FC = () => {
                   <Database className="w-5 h-5" />
                 </div>
                 <div>
-                  <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                    Basis Data Google Drive & Google Sheets
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${googleSheetsConnected ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
-                      {googleSheetsConnected ? 'Sinkronisasi Otomatis Aktif' : 'Penyimpanan Lokal Aktif'}
+                  <h2 className="text-sm font-bold text-slate-900 dark:text-white flex flex-wrap items-center gap-2">
+                    Basis Data Google Drive &amp; Google Sheets
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${(googleOAuthActive || serverDriveSyncActive) ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300' : googleSheetsConnected ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
+                      {googleOAuthActive || serverDriveSyncActive
+                        ? 'Auto-Sync Drive & Sheets Real-Time Aktif'
+                        : googleSheetsConnected
+                        ? 'Sesi OAuth Browser Perlu Diaktifkan 1x'
+                        : 'Penyimpanan Lokal Aktif'}
                     </span>
                   </h2>
                   <p className="text-slate-500">
-                    Setiap perubahan data dan pengaturan otomatis tersimpan ke database dan disinkronkan ke Google Sheets secara real-time tanpa perlu klik sinkronisasi manual.
+                    Setiap perubahan data dan pengaturan otomatis tersimpan ke database server serta langsung disinkronkan ke Google Drive (Folder + Backup JSON) dan Google Sheets (9 Lembar Kerja) tanpa klik manual.
                   </p>
                 </div>
               </div>
 
-              {/* Action: Optional manual sync trigger */}
+              {/* Action: Activate OAuth session or trigger sync */}
               <button
                 type="button"
                 disabled={googleSyncing}
                 onClick={() => syncGoogleSheetsNow()}
-                className="flex items-center gap-2 px-3.5 py-2 rounded-lg border border-emerald-200 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:hover:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 font-semibold disabled:opacity-50 transition-colors shrink-0"
-                title="Sinkronisasi berjalan otomatis di latar belakang; klik jika ingin paksa sinkron ulang sekarang"
+                className={`flex items-center gap-2 px-3.5 py-2 rounded-lg font-semibold disabled:opacity-50 transition-colors shrink-0 ${
+                  googleOAuthActive || serverDriveSyncActive
+                    ? 'border border-emerald-200 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:hover:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
+                    : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs'
+                }`}
+                title={
+                  googleOAuthActive || serverDriveSyncActive
+                    ? 'Sinkronisasi Drive & Sheets otomatis aktif pada setiap perubahan'
+                    : 'Klik 1x untuk mengaktifkan sesi OAuth Google di tab browser ini agar setiap perubahan otomatis tersinkron ke Drive & Sheets'
+                }
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${googleSyncing ? 'animate-spin' : ''}`} />
-                <span>{googleSyncing ? 'Menyinkronkan...' : 'Sinkron Ulang Manual (Opsional)'}</span>
+                <span>
+                  {googleSyncing
+                    ? 'Menyinkronkan Drive & Sheets...'
+                    : googleOAuthActive || serverDriveSyncActive
+                    ? 'Sinkronisasi Otomatis Aktif'
+                    : 'Aktifkan Auto-Sync Drive & Sheets'}
+                </span>
               </button>
             </div>
 
@@ -3168,7 +3218,7 @@ export const AdminView: React.FC = () => {
                     </p>
                     {settings.google_last_synced_at && (
                       <p className="text-[10px] text-slate-400">
-                        Sinkron terakhir: {new Date(settings.google_last_synced_at).toLocaleString('id-ID')}
+                        Sinkron Drive &amp; Sheets terakhir: {new Date(settings.google_last_synced_at).toLocaleString('id-ID')}
                       </p>
                     )}
                   </div>
@@ -3211,10 +3261,10 @@ export const AdminView: React.FC = () => {
                         disabled={googleSyncing}
                         onClick={() => syncGoogleSheetsNow()}
                         className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 font-semibold transition-colors disabled:opacity-50"
-                        title="Sinkronisasi otomatis selalu aktif; klik untuk paksa sinkron ulang Google Sheets"
+                        title="Sinkronisasi Drive & Sheets otomatis aktif setelah sesi diotorisasi"
                       >
                         <RefreshCw className={`w-3.5 h-3.5 ${googleSyncing ? 'animate-spin' : ''}`} />
-                        <span>{googleSyncing ? 'Menyinkronkan...' : 'Sinkron Ulang Sheets'}</span>
+                        <span>{googleSyncing ? 'Menyinkronkan...' : googleOAuthActive ? 'Perbarui Drive & Sheets' : 'Aktifkan OAuth Drive & Sheets'}</span>
                       </button>
 
                       <button
@@ -3450,7 +3500,7 @@ export const AdminView: React.FC = () => {
                     </div>
                   </div>
                   <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300">
-                    7 Lembar Kerja
+                    9 Lembar Kerja
                   </span>
                 </div>
 
@@ -3461,7 +3511,7 @@ export const AdminView: React.FC = () => {
                   </div>
                   <div className="text-slate-500 text-[10px] font-sans pt-1">Lembar Kerja (Sheets):</div>
                   <div className="flex flex-wrap gap-1 font-sans text-[10px]">
-                    {['Siswa', 'Kelas', 'Sesi_Presensi', 'Presensi', 'Izin_Keluar', 'Pelanggaran', 'Pengaturan'].map((sh) => (
+                    {['Siswa', 'Kelas', 'Sesi_Presensi', 'Presensi', 'Izin_Keluar', 'Pelanggaran', 'Izin_Tidak_Masuk', 'Jenis_Pelanggaran', 'Pengaturan'].map((sh) => (
                       <span key={sh} className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
                         {sh}
                       </span>
@@ -3926,15 +3976,25 @@ export const AdminView: React.FC = () => {
             <div className="grid grid-cols-2 gap-2">
               <div>
                 <label className="block text-slate-500 mb-1">Kelas *</label>
-                <select
-                  value={editingStudent.class_id || classes[0]?.id}
-                  onChange={(e) => setEditingStudent({ ...editingStudent, class_id: e.target.value })}
-                  className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
-                >
-                  {classes.map((c) => (
-                    <option key={c.id} value={c.id}>{c.name}</option>
-                  ))}
-                </select>
+                {classes.length > 0 ? (
+                  <select
+                    value={editingStudent.class_id || classes[0]?.id || ''}
+                    onChange={(e) => setEditingStudent({ ...editingStudent, class_id: e.target.value })}
+                    className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
+                  >
+                    {classes.map((c) => (
+                      <option key={c.id} value={c.id}>{c.name}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="text"
+                    value={editingStudent.class_id || ''}
+                    onChange={(e) => setEditingStudent({ ...editingStudent, class_id: e.target.value })}
+                    placeholder="Contoh: 7A"
+                    className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
+                  />
+                )}
               </div>
 
               <div>
@@ -3996,9 +4056,6 @@ export const AdminView: React.FC = () => {
                     if (window.confirm(`Hapus siswa ${editingStudent.name} (${editingStudent.nis})? Tindakan ini tidak dapat dibatalkan.`)) {
                       await deleteStudent(editingStudent.nis!);
                       setEditingStudent(null);
-                      if (googleSheetsConnected && settings.google_sheet_id) {
-                        syncGoogleSheetsNow().catch(() => {});
-                      }
                     }
                   }}
                   className="px-2.5 py-1.5 rounded text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 font-semibold flex items-center gap-1.5 transition-colors text-xs"
@@ -4021,11 +4078,20 @@ export const AdminView: React.FC = () => {
                 <button
                   type="button"
                   onClick={async () => {
-                    if (!editingStudent.nis || !editingStudent.name) {
-                      showToast('NIS dan Nama wajib diisi.', 'error');
+                    const trimmedNis = (editingStudent.nis || '').trim();
+                    const trimmedName = (editingStudent.name || '').trim();
+                    const resolvedClassId = (editingStudent.class_id || classes[0]?.id || '').trim();
+                    if (!trimmedNis || !trimmedName || !resolvedClassId) {
+                      showToast('NIS, Nama Lengkap, dan Kelas wajib diisi.', 'error');
                       return;
                     }
-                    await saveStudent(editingStudent as Student);
+                    await saveStudent({
+                      ...(editingStudent as Student),
+                      nis: trimmedNis,
+                      name: trimmedName,
+                      class_id: resolvedClassId,
+                      card_code: (editingStudent.card_code || '').trim() || trimmedNis,
+                    });
                     setEditingStudent(null);
                   }}
                   className="px-4 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold transition-colors"

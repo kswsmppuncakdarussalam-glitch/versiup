@@ -24,9 +24,7 @@ import {
   initGoogleAuth,
   signInWithGoogle,
   disconnectGoogleAccount,
-  getOrCreateDriveFolder,
-  getOrCreateSpreadsheet,
-  syncAllDataToGoogleSheets,
+  syncAllDataToDriveAndSheets,
   getAccessToken,
   hasValidGoogleToken,
   setCustomGoogleClientId,
@@ -55,6 +53,8 @@ interface AppContextType {
   // Google Workspace & Email Integration
   googleAccount: ConnectedGoogleAccount | null;
   googleSyncing: boolean;
+  googleOAuthActive: boolean;
+  serverDriveSyncActive: boolean;
   connectGoogle: (promptSelect?: boolean, emailHint?: string) => Promise<{ success: boolean; error?: string }>;
   disconnectGoogle: () => Promise<void>;
   linkEmailDirectly: (email: string, name?: string) => Promise<{ success: boolean; error?: string }>;
@@ -227,6 +227,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     connectedAt: '2026-11-10T09:38:00.000Z',
   }));
   const [googleSyncing, setGoogleSyncing] = useState<boolean>(false);
+  const [googleOAuthActive, setGoogleOAuthActive] = useState<boolean>(() => hasValidGoogleToken());
+  const [serverDriveSyncActive, setServerDriveSyncActive] = useState<boolean>(false);
   const [isKioskFullscreen, setIsKioskFullscreen] = useState<boolean>(false);
 
   // Core Data States with Instant Offline Persistence
@@ -299,8 +301,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [initialLoadError, setInitialLoadError] = useState<string | null>(null);
   const [hasSyncedOnce, setHasSyncedOnce] = useState(false);
   const [localDataNonce, setLocalDataNonce] = useState(0);
+  const [autoSheetSyncTick, setAutoSheetSyncTick] = useState(0);
   const hasSyncedOnceRef = useRef(false);
   const isAutoSheetSyncingRef = useRef(false);
+  const pendingAutoSheetSyncRef = useRef(false);
   const lastAutoSheetSigRef = useRef('');
 
   const isSyncingRef = useRef(false);
@@ -712,8 +716,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setServerClockOffset(data.serverTime);
       }
 
-      if (data.googleSheetsConnected !== undefined) {
-        setGoogleSheetsConnected((prev) => (prev !== data.googleSheetsConnected ? data.googleSheetsConnected : prev));
+      if (data.serverDriveSyncActive !== undefined) {
+        setServerDriveSyncActive((prev) => (prev !== data.serverDriveSyncActive ? data.serverDriveSyncActive : prev));
       }
 
       const hasVersionChanged = data.version !== versionRef.current;
@@ -722,6 +726,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         // Full Snapshot initialization: Replace with fresh clean server data (purges old demo caches)
         const nextSettings = data.data.settings || defaultSettings;
         setSettings(nextSettings);
+        setGoogleSheetsConnected(Boolean(nextSettings.google_account_email || hasValidGoogleToken() || data.serverDriveSyncActive));
         if (nextSettings.google_client_id && nextSettings.google_client_id.trim()) {
           setCustomGoogleClientId(nextSettings.google_client_id.trim());
         }
@@ -1327,6 +1332,42 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
+  // Content-aware signature for automatic Google Drive & Google Sheets sync
+  // Excludes timestamps & sync metadata so saving google_last_synced_at never causes a sync loop
+  const driveSheetSignature = React.useMemo(() => {
+    const {
+      google_last_synced_at: _ls,
+      updated_at: _ua,
+      google_drive_backup_file_id: _bfi,
+      google_drive_backup_file_url: _bfu,
+      ...coreSettings
+    } = settings;
+    const { updated_at: _nua, ...coreNotif } = notificationSettings;
+    return JSON.stringify({
+      students,
+      classes,
+      sessions,
+      violationTypes,
+      attendance,
+      outOfClass,
+      violations,
+      leaveRequests,
+      coreSettings,
+      coreNotif,
+    });
+  }, [
+    students,
+    classes,
+    sessions,
+    violationTypes,
+    attendance,
+    outOfClass,
+    violations,
+    leaveRequests,
+    settings,
+    notificationSettings,
+  ]);
+
   // Google Workspace Integration Actions
   const connectGoogle = async (promptSelect: boolean = true, emailHint?: string) => {
     try {
@@ -1342,45 +1383,73 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setGoogleAccount(accountInfo);
       setGoogleSheetsConnected(true);
 
-      showToast(`Menghubungkan akun Google ${accountInfo.email}...`, 'info');
+      if (accessToken === 'locked_token_bypass') {
+        setGoogleOAuthActive(false);
+        await updateSettings(
+          {
+            google_account_email: accountInfo.email,
+            google_account_name: accountInfo.name,
+            google_account_photo: accountInfo.photo,
+          },
+          { silent: true }
+        );
+        showToast(
+          `Akun ${accountInfo.email} tertaut. Untuk auto-sync langsung ke Google Drive & Sheets pada domain ini (${typeof window !== 'undefined' ? window.location.origin : ''}), daftarkan URL origin di Google Cloud Console.`,
+          'info'
+        );
+        return { success: true };
+      }
 
-      // 1. Automatically find or create dedicated folder in Google Drive for THIS account
-      const folder = await getOrCreateDriveFolder(accessToken);
+      setGoogleOAuthActive(hasValidGoogleToken());
+      showToast(`Menghubungkan & menyinkronkan Drive + Sheets (${accountInfo.email})...`, 'info');
 
-      // 2. Automatically find or create dedicated Spreadsheet inside folder for THIS account
-      const sheet = await getOrCreateSpreadsheet(accessToken, folder.folderId);
-
-      // 3. Save IDs and URLs to app settings with the active email (database follows email)
-      const nowIso = new Date().toISOString();
-      await updateSettings({
+      const nextSettingsSnapshot: AppSettings = {
+        ...settings,
         google_account_email: accountInfo.email,
         google_account_name: accountInfo.name,
         google_account_photo: accountInfo.photo,
-        google_drive_folder_id: folder.folderId,
-        google_drive_folder_url: folder.folderUrl,
-        google_sheet_id: sheet.spreadsheetId,
-        google_sheet_url: sheet.spreadsheetUrl,
-        google_last_synced_at: nowIso,
-      });
+      };
 
-      // 4. Initial sync of all data into Google Sheets
-      const syncRes = await syncAllDataToGoogleSheets(accessToken, sheet.spreadsheetId, {
+      const sigBeforeSync = driveSheetSignature;
+      const syncRes = await syncAllDataToDriveAndSheets(accessToken, {
         students,
         classes,
         sessions,
         attendance,
         outOfClass,
         violations,
-        settings,
+        leaveRequests,
+        violationTypes,
+        settings: nextSettingsSnapshot,
+        notificationSettings,
       });
 
+      const nowIso = new Date().toISOString();
+      lastAutoSheetSigRef.current = sigBeforeSync;
+      await updateSettings(
+        {
+          google_account_email: accountInfo.email,
+          google_account_name: accountInfo.name,
+          google_account_photo: accountInfo.photo,
+          google_drive_folder_id: syncRes.folderId,
+          google_drive_folder_url: syncRes.folderUrl,
+          google_drive_backup_file_id: syncRes.backupFileId,
+          google_drive_backup_file_url: syncRes.backupFileUrl,
+          google_sheet_id: syncRes.spreadsheetId,
+          google_sheet_url: syncRes.spreadsheetUrl,
+          google_last_synced_at: nowIso,
+        },
+        { silent: true }
+      );
+
       showToast(
-        `Akun Google (${accountInfo.email}) terhubung! Database spreadsheet otomatis aktif (${syncRes.rowsUpdated} baris data disinkronkan).`,
+        `Akun Google (${accountInfo.email}) terhubung! Google Drive & Sheets otomatis tersinkron (${syncRes.rowsUpdated} baris data).`,
         'success'
       );
       return { success: true };
     } catch (err: any) {
       console.error('[Google Connect Error]:', err);
+      setGoogleOAuthActive(hasValidGoogleToken());
       showToast(err.message || 'Gagal menghubungkan Akun Google', 'error');
       return { success: false, error: err.message };
     } finally {
@@ -1393,12 +1462,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       await disconnectGoogleAccount();
       setGoogleAccount(null);
       setGoogleSheetsConnected(false);
+      setGoogleOAuthActive(false);
+      lastAutoSheetSigRef.current = '';
       await updateSettings({
         google_account_email: '',
         google_account_name: '',
         google_account_photo: '',
         google_drive_folder_id: '',
         google_drive_folder_url: '',
+        google_drive_backup_file_id: '',
+        google_drive_backup_file_url: '',
         google_sheet_id: '',
         google_sheet_url: '',
         google_last_synced_at: '',
@@ -1452,82 +1525,62 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         showToast(`Meminta otorisasi OAuth Google untuk ${targetHint}...`, 'info');
         const res = await signInWithGoogle(false, settings.google_client_id, targetHint);
         if (res.cancelled || !res.accessToken) {
-          showToast('Otorisasi Google diperlukan untuk sinkronisasi data cloud.', 'info');
+          showToast('Otorisasi Google diperlukan untuk sinkronisasi otomatis ke Drive & Sheets.', 'info');
           return { success: false };
+        }
+        if (res.accessToken === 'locked_token_bypass') {
+          setGoogleOAuthActive(false);
+          showToast(
+            `Origin ${typeof window !== 'undefined' ? window.location.origin : ''} belum terdaftar di Google Cloud Console Client ID. Daftarkan origin tersebut agar browser bisa menulis ke Drive & Sheets.`,
+            'error'
+          );
+          return { success: false, error: 'origin_mismatch' };
         }
         token = res.accessToken;
         setGoogleAccount(res.accountInfo);
         setGoogleSheetsConnected(true);
+        setGoogleOAuthActive(hasValidGoogleToken());
       }
 
-      let sheetId = settings.google_sheet_id;
-      if (!sheetId) {
-        const folder = await getOrCreateDriveFolder(token);
-        const sheet = await getOrCreateSpreadsheet(token, folder.folderId);
-        sheetId = sheet.spreadsheetId;
-        await updateSettings({
-          google_drive_folder_id: folder.folderId,
-          google_drive_folder_url: folder.folderUrl,
-          google_sheet_id: sheet.spreadsheetId,
-          google_sheet_url: sheet.spreadsheetUrl,
-        });
-      }
-
-      showToast('Mengirim seluruh data ke Google Sheets...', 'info');
-      let syncRes;
-      try {
-        syncRes = await syncAllDataToGoogleSheets(token, sheetId, {
-          students,
-          classes,
-          sessions,
-          attendance,
-          outOfClass,
-          violations,
-          settings,
-        });
-      } catch (syncErr: any) {
-        // Self-heal: If permission denied (403/404) due to email change or sheet deleted, create in active user's Drive!
-        if (
-          syncErr?.statusCode === 403 ||
-          syncErr?.statusCode === 404 ||
-          syncErr?.message?.includes('403') ||
-          syncErr?.message?.includes('404') ||
-          syncErr?.message?.includes('permission')
-        ) {
-          showToast('Menyesuaikan database dengan akun Google aktif...', 'info');
-          const folder = await getOrCreateDriveFolder(token);
-          const sheet = await getOrCreateSpreadsheet(token, folder.folderId);
-          sheetId = sheet.spreadsheetId;
-          await updateSettings({
-            google_drive_folder_id: folder.folderId,
-            google_drive_folder_url: folder.folderUrl,
-            google_sheet_id: sheet.spreadsheetId,
-            google_sheet_url: sheet.spreadsheetUrl,
-          });
-          syncRes = await syncAllDataToGoogleSheets(token, sheetId, {
-            students,
-            classes,
-            sessions,
-            attendance,
-            outOfClass,
-            violations,
-            settings,
-          });
-        } else {
-          throw syncErr;
-        }
-      }
+      showToast('Menyinkronkan seluruh data (Sesi, Siswa, Kelas, Presensi) ke Google Drive & Sheets...', 'info');
+      const sigBeforeSync = driveSheetSignature;
+      const syncRes = await syncAllDataToDriveAndSheets(token, {
+        students,
+        classes,
+        sessions,
+        attendance,
+        outOfClass,
+        violations,
+        leaveRequests,
+        violationTypes,
+        settings,
+        notificationSettings,
+      });
 
       const nowIso = new Date().toISOString();
-      await updateSettings({ google_last_synced_at: nowIso }, { silent: true });
+      lastAutoSheetSigRef.current = sigBeforeSync;
+      await updateSettings(
+        {
+          google_drive_folder_id: syncRes.folderId,
+          google_drive_folder_url: syncRes.folderUrl,
+          google_drive_backup_file_id: syncRes.backupFileId,
+          google_drive_backup_file_url: syncRes.backupFileUrl,
+          google_sheet_id: syncRes.spreadsheetId,
+          google_sheet_url: syncRes.spreadsheetUrl,
+          google_last_synced_at: nowIso,
+        },
+        { silent: true }
+      );
+      setGoogleOAuthActive(hasValidGoogleToken());
       showToast(
-        `Sinkronisasi Google Sheets sukses! ${syncRes.rowsUpdated} baris data berhasil diperbarui.`,
+        `Auto-Sync Google Drive & Sheets aktif & tersinkron (${syncRes.rowsUpdated} baris data).`,
         'success'
       );
       return { success: true, rowsUpdated: syncRes.rowsUpdated };
     } catch (err: any) {
       console.error('[Google Sync Error]:', err);
-      showToast(err.message || 'Gagal sinkronisasi data ke Google Sheets', 'error');
+      setGoogleOAuthActive(hasValidGoogleToken());
+      showToast(err.message || 'Gagal sinkronisasi data ke Google Drive & Sheets', 'error');
       return { success: false, error: err.message };
     } finally {
       setGoogleSyncing(false);
@@ -1736,7 +1789,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return true;
       }
       const synced = await pushTwoWayMutation('attendance', 'update', { id, updates: { ...updates, audit_reason: reason } });
-      if (synced) syncNow(false, true);
+      if (synced) {
+        showToast('Presensi berhasil disinkronkan ke database.', 'success');
+        syncNow(false, true);
+      }
       return synced;
     } catch {
       enqueueOfflineMutation('attendance', 'update', { id, updates: { ...updates, audit_reason: reason } });
@@ -1767,7 +1823,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return true;
       }
       const synced = await pushTwoWayMutation('attendance', 'delete', { id });
-      if (synced) syncNow(false, true);
+      if (synced) {
+        showToast('Presensi berhasil dihapus & disinkronkan ke database.', 'success');
+        syncNow(false, true);
+      }
       return synced;
     } catch {
       enqueueOfflineMutation('attendance', 'delete', { id });
@@ -2078,7 +2137,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return true;
       }
       const synced = await pushTwoWayMutation('students', 'delete', { nis });
-      if (synced) syncNow(false, true);
+      if (synced) {
+        showToast('Siswa berhasil dihapus & disinkronkan.', 'success');
+        syncNow(false, true);
+      }
       return synced;
     } catch {
       enqueueOfflineMutation('students', 'delete', { nis });
@@ -2110,7 +2172,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return true;
       }
       const synced = await pushTwoWayMutation('students', 'delete_many', { nisses });
-      if (synced) syncNow(false, true);
+      if (synced) {
+        showToast(`${nisses.length} data siswa berhasil dihapus & disinkronkan.`, 'success');
+        syncNow(false, true);
+      }
       return synced;
     } catch {
       enqueueOfflineMutation('students', 'delete_many', { nisses });
@@ -2138,7 +2203,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return true;
       }
       const synced = await pushTwoWayMutation('students', 'clear_all', {});
-      if (synced) syncNow(false, true);
+      if (synced) {
+        showToast('Semua data siswa berhasil dihapus dan disinkronkan.', 'success');
+        syncNow(false, true);
+      }
       return synced;
     } catch {
       enqueueOfflineMutation('students', 'clear_all', {});
@@ -2174,7 +2242,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return { success: true, added: data.added, updated: data.updated };
       }
       const synced = await pushTwoWayMutation('students', 'batch_import', { students: newStudents });
-      if (synced) syncNow(false, true);
+      if (synced) {
+        showToast(`Impor selesai: ${newStudents.length} siswa berhasil disinkronkan.`, 'success');
+        syncNow(false, true);
+      }
       return { success: synced, added: synced ? newStudents.length : 0, updated: 0 };
     } catch {
       enqueueOfflineMutation('students', 'batch_import', { students: newStudents });
@@ -2270,10 +2341,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return true;
       }
       const synced = await pushTwoWayMutation('sessions', 'upsert', sess);
-      if (synced) syncNow(false, true);
+      if (synced) {
+        showToast('Sesi presensi berhasil disimpan & disinkronkan.', 'success');
+        syncNow(false, true);
+      }
       return synced;
     } catch {
       enqueueOfflineMutation('sessions', 'upsert', sess);
+      showToast('Perubahan sesi disimpan lokal & akan otomatis sinkron saat online.', 'info');
       return false;
     }
   };
@@ -2331,7 +2406,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return true;
       }
       const synced = await pushTwoWayMutation('violation_types', 'upsert', vt);
-      if (synced) syncNow(false, true);
+      if (synced) {
+        showToast('Jenis pelanggaran berhasil disimpan & disinkronkan.', 'success');
+        syncNow(false, true);
+      }
       return synced;
     } catch {
       enqueueOfflineMutation('violation_types', 'upsert', vt);
@@ -2362,7 +2440,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return true;
       }
       const synced = await pushTwoWayMutation('violation_types', 'delete', { id });
-      if (synced) syncNow(false, true);
+      if (synced) {
+        showToast('Jenis pelanggaran berhasil dihapus & disinkronkan.', 'success');
+        syncNow(false, true);
+      }
       return synced;
     } catch {
       enqueueOfflineMutation('violation_types', 'delete', { id });
@@ -2383,10 +2464,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (updates.google_client_id !== undefined) {
         setCustomGoogleClientId(updates.google_client_id || '');
       }
-      // Do not re-trigger background Sheets auto-sync for pure sync-timestamp updates
+      // Do not re-trigger background Drive/Sheets auto-sync for pure sync-metadata updates
+      const syncMetaKeys = new Set([
+        'google_last_synced_at',
+        'google_drive_backup_file_id',
+        'google_drive_backup_file_url',
+      ]);
       const updatedKeys = Object.keys(updates);
       const isPureSyncStamp =
-        updatedKeys.length === 1 && updatedKeys[0] === 'google_last_synced_at';
+        updatedKeys.length > 0 && updatedKeys.every((k) => syncMetaKeys.has(k));
       if (!isPureSyncStamp) {
         setLocalDataNonce((n) => n + 1);
       }
@@ -2557,7 +2643,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         status,
         rejection_reason: rejectionReason,
       });
-      if (synced) syncNow(false, true);
+      if (synced) {
+        showToast(`Status izin berhasil disinkronkan ke database.`, 'success');
+        syncNow(false, true);
+      }
       return synced;
     } catch {
       enqueueOfflineMutation('leave_requests', 'update', { id, status, rejection_reason: rejectionReason });
@@ -2584,87 +2673,124 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [hasSyncedOnce, settings.google_client_id, updateSettings]);
 
-  // Automatic Background Google Sheets Sync (1.5s debounced whenever data/settings change while OAuth token is active)
-  useEffect(() => {
-    if (!hasSyncedOnce || !hasValidGoogleToken()) return;
-    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
-
-    const sig = JSON.stringify({
-      v: serverVersion,
-      n: localDataNonce,
-      s: students.length,
-      c: classes.length,
-      se: sessions.length,
-      a: attendance.length,
-      o: outOfClass.length,
-      vi: violations.length,
-      sn: settings.school_name,
-      gc: settings.google_client_id,
-      gs: settings.google_sheet_id,
-    });
-
-    if (sig === lastAutoSheetSigRef.current || isAutoSheetSyncingRef.current) {
-      return;
-    }
-
-    const timer = setTimeout(async () => {
-      if (isAutoSheetSyncingRef.current || !hasValidGoogleToken()) return;
-      isAutoSheetSyncingRef.current = true;
-      try {
-        const token = await getAccessToken();
-        if (!token) return;
-
-        let sheetId = settings.google_sheet_id;
-        if (!sheetId) {
-          const folder = await getOrCreateDriveFolder(token);
-          const sheet = await getOrCreateSpreadsheet(token, folder.folderId);
-          sheetId = sheet.spreadsheetId;
-          await updateSettings(
-            {
-              google_drive_folder_id: folder.folderId,
-              google_drive_folder_url: folder.folderUrl,
-              google_sheet_id: sheet.spreadsheetId,
-              google_sheet_url: sheet.spreadsheetUrl,
-            },
-            { silent: true }
-          );
-        }
-
-        if (sheetId) {
-          await syncAllDataToGoogleSheets(token, sheetId, {
-            students,
-            classes,
-            sessions,
-            attendance,
-            outOfClass,
-            violations,
-            settings,
-          });
-          lastAutoSheetSigRef.current = sig;
-          await updateSettings(
-            { google_last_synced_at: new Date().toISOString() },
-            { silent: true }
-          );
-        }
-      } catch (err) {
-        console.warn('[Auto Google Sheets Sync]:', err);
-      } finally {
-        isAutoSheetSyncingRef.current = false;
-      }
-    }, 1500);
-
-    return () => clearTimeout(timer);
-  }, [
-    hasSyncedOnce,
-    serverVersion,
-    localDataNonce,
+  const latestDrivePayloadRef = useRef({
+    driveSheetSignature,
     students,
     classes,
     sessions,
     attendance,
     outOfClass,
     violations,
+    leaveRequests,
+    violationTypes,
     settings,
+    notificationSettings,
+  });
+  latestDrivePayloadRef.current = {
+    driveSheetSignature,
+    students,
+    classes,
+    sessions,
+    attendance,
+    outOfClass,
+    violations,
+    leaveRequests,
+    violationTypes,
+    settings,
+    notificationSettings,
+  };
+
+  // Automatic Real-Time Background Google Drive & Google Sheets Sync
+  // Triggers automatically (~450ms debounced) on EVERY local or cross-device data/setting change,
+  // and queues follow-up syncs if additional mutations arrive while a sync request is in flight.
+  useEffect(() => {
+    if (!hasSyncedOnce || !hasValidGoogleToken()) return;
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+
+    if (driveSheetSignature === lastAutoSheetSigRef.current) {
+      return;
+    }
+
+    if (isAutoSheetSyncingRef.current) {
+      pendingAutoSheetSyncRef.current = true;
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      if (!hasValidGoogleToken()) return;
+      if (isAutoSheetSyncingRef.current) {
+        pendingAutoSheetSyncRef.current = true;
+        return;
+      }
+      const snap = latestDrivePayloadRef.current;
+      if (snap.driveSheetSignature === lastAutoSheetSigRef.current) return;
+
+      isAutoSheetSyncingRef.current = true;
+      setGoogleSyncing(true);
+      try {
+        const token = await getAccessToken();
+        if (!token) {
+          setGoogleOAuthActive(false);
+          return;
+        }
+
+        const capturedSig = snap.driveSheetSignature;
+        const syncRes = await syncAllDataToDriveAndSheets(token, {
+          students: snap.students,
+          classes: snap.classes,
+          sessions: snap.sessions,
+          attendance: snap.attendance,
+          outOfClass: snap.outOfClass,
+          violations: snap.violations,
+          leaveRequests: snap.leaveRequests,
+          violationTypes: snap.violationTypes,
+          settings: snap.settings,
+          notificationSettings: snap.notificationSettings,
+        });
+
+        lastAutoSheetSigRef.current = capturedSig;
+        const metaUpdates: Partial<AppSettings> = {
+          google_last_synced_at: new Date().toISOString(),
+        };
+        if (syncRes.folderId && syncRes.folderId !== snap.settings.google_drive_folder_id) {
+          metaUpdates.google_drive_folder_id = syncRes.folderId;
+          metaUpdates.google_drive_folder_url = syncRes.folderUrl;
+        }
+        if (syncRes.spreadsheetId && syncRes.spreadsheetId !== snap.settings.google_sheet_id) {
+          metaUpdates.google_sheet_id = syncRes.spreadsheetId;
+          metaUpdates.google_sheet_url = syncRes.spreadsheetUrl;
+        }
+        if (syncRes.backupFileId && syncRes.backupFileId !== snap.settings.google_drive_backup_file_id) {
+          metaUpdates.google_drive_backup_file_id = syncRes.backupFileId;
+          metaUpdates.google_drive_backup_file_url = syncRes.backupFileUrl;
+        }
+
+        await updateSettings(metaUpdates, { silent: true });
+      } catch (err: any) {
+        console.warn('[Auto Drive & Sheets Sync]:', err);
+        if (err?.statusCode === 401) {
+          setGoogleOAuthActive(false);
+        }
+      } finally {
+        isAutoSheetSyncingRef.current = false;
+        setGoogleSyncing(false);
+        const latestSig = latestDrivePayloadRef.current.driveSheetSignature;
+        if (
+          hasValidGoogleToken() &&
+          (pendingAutoSheetSyncRef.current || latestSig !== lastAutoSheetSigRef.current)
+        ) {
+          pendingAutoSheetSyncRef.current = false;
+          setAutoSheetSyncTick((t) => t + 1);
+        }
+      }
+    }, 450);
+
+    return () => clearTimeout(timer);
+  }, [
+    hasSyncedOnce,
+    googleOAuthActive,
+    autoSheetSyncTick,
+    driveSheetSignature,
     updateSettings,
   ]);
 
@@ -2698,6 +2824,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         googleSheetsConnected,
         googleAccount,
         googleSyncing,
+        googleOAuthActive,
+        serverDriveSyncActive,
         connectGoogle,
         disconnectGoogle,
         linkEmailDirectly,

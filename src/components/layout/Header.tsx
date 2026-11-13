@@ -10,6 +10,7 @@ import {
   Database,
   Calendar,
   User,
+  RefreshCw,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
 import { formatServerTime, formatIndonesianDate, LiveClockText } from '../../utils/time.js';
@@ -30,10 +31,16 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
     settings,
     updateSettings,
     googleSheetsConnected,
+    googleOAuthActive,
+    serverDriveSyncActive,
+    googleSyncing,
+    syncGoogleSheetsNow,
     syncStatus,
     syncNow,
     serverVersion,
   } = useApp();
+
+  const isAutoDriveActive = googleOAuthActive || serverDriveSyncActive;
 
   const isLockedMenuOpen = Boolean(session?.lockedMenuRole);
 
@@ -161,14 +168,38 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
           </span>
         </button>
 
-        {/* Google Sheets Connection Pill (Bagian 1 & 13) */}
-        <div
-          title="Akun Resmi Sekolah kswsmp.puncakdarussalam@gmail.com Terhubung & Terkunci Permanen"
-          className="hidden md:flex items-center gap-1.5 px-2 py-1 rounded text-[11px] border bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800"
-        >
-          <Database className="w-3 h-3" />
-          <span>Cloud Google Aktif</span>
-        </div>
+        {/* Google Drive & Sheets Auto-Sync Status Pill */}
+        {googleSyncing ? (
+          <div
+            title="Sedang menyinkronkan data ke Google Drive & Google Sheets secara otomatis..."
+            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-sky-50 dark:bg-sky-950/30 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800"
+          >
+            <RefreshCw className="w-3 h-3 animate-spin" />
+            <span>Sinkron Drive & Sheets...</span>
+          </div>
+        ) : isAutoDriveActive ? (
+          <div
+            title={`Auto-Sync Google Drive & Google Sheets Aktif (${settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}). Setiap perubahan langsung tersinkron otomatis.`}
+            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800"
+          >
+            <Database className="w-3 h-3" />
+            <span>Auto-Sync Drive & Sheets</span>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => syncGoogleSheetsNow()}
+            title={
+              googleSheetsConnected
+                ? 'Klik 1x untuk mengaktifkan sesi OAuth Google di tab browser ini agar setiap perubahan otomatis tersinkron ke Drive & Sheets'
+                : 'Klik untuk menghubungkan & mengaktifkan Auto-Sync Google Drive & Sheets'
+            }
+            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/30 dark:hover:bg-amber-950/50 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800 transition-colors"
+          >
+            <Database className="w-3 h-3" />
+            <span>Aktifkan Auto-Sync Drive</span>
+          </button>
+        )}
 
         {/* Date & Server Authoritative Clock */}
         <div className="flex items-center gap-2 px-2.5 py-1 rounded bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 text-xs">

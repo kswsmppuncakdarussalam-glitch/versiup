@@ -16,7 +16,10 @@ import {
   AttendanceRecord,
   OutOfClassRecord,
   ViolationRecord,
+  ViolationType,
+  LeaveRequest,
   AppSettings,
+  NotificationSettings,
 } from '../types/index.js';
 
 // Required Google Workspace scopes
@@ -65,6 +68,7 @@ export const firebaseAuth = getAuth(app);
 
 // In-memory token cache (Do NOT store in localStorage/sessionStorage!)
 let inMemoryAccessToken: string | null = null;
+let inMemoryTokenExpiresAt = 0;
 let isSigningIn = false;
 
 export interface ConnectedGoogleAccount {
@@ -76,15 +80,28 @@ export interface ConnectedGoogleAccount {
 }
 
 export const getAccessToken = async (): Promise<string | null> => {
+  if (!hasValidGoogleToken()) return null;
   return inMemoryAccessToken;
 };
 
 export const hasValidGoogleToken = (): boolean => {
-  return Boolean(inMemoryAccessToken);
+  if (!inMemoryAccessToken || inMemoryAccessToken === 'locked_token_bypass') {
+    return false;
+  }
+  if (inMemoryTokenExpiresAt > 0 && Date.now() >= inMemoryTokenExpiresAt - 60000) {
+    return false;
+  }
+  return true;
 };
 
-export const setInMemoryToken = (token: string | null) => {
+export const setInMemoryToken = (token: string | null, expiresInSeconds?: number) => {
   inMemoryAccessToken = token;
+  if (!token || token === 'locked_token_bypass') {
+    inMemoryTokenExpiresAt = 0;
+  } else {
+    const ttl = typeof expiresInSeconds === 'number' && expiresInSeconds > 120 ? expiresInSeconds : 3500;
+    inMemoryTokenExpiresAt = Date.now() + ttl * 1000;
+  }
 };
 
 export const initGoogleAuth = (
@@ -92,12 +109,12 @@ export const initGoogleAuth = (
   onFailure?: () => void
 ) => {
   return onAuthStateChanged(firebaseAuth, async (user: User | null) => {
-    if (user && inMemoryAccessToken) {
+    if (user && hasValidGoogleToken() && inMemoryAccessToken) {
       if (onSuccess) onSuccess(user, inMemoryAccessToken);
     } else if (user && !inMemoryAccessToken) {
-      // User is authenticated in Firebase Auth, mark active
       if (onSuccess) onSuccess(user, '');
-    } else if (!user && !inMemoryAccessToken) {
+    } else if (!user && !isSigningIn && !inMemoryAccessToken) {
+      inMemoryTokenExpiresAt = 0;
       if (onFailure) onFailure();
     }
   });
@@ -274,7 +291,7 @@ export const requestGoogleIdentityToken = async (
             return reject(new Error('Gagal menerima Access Token dari Google.'));
           }
 
-          inMemoryAccessToken = token;
+          setInMemoryToken(token, Number(tokenResponse.expires_in) || 3500);
 
           // Bridge to Firebase Auth safely without domain restrictions or blocking errors
           try {
@@ -405,7 +422,7 @@ export const disconnectGoogleAccount = async () => {
   } catch (e) {
     console.warn('[Firebase signOut warning]:', e);
   }
-  inMemoryAccessToken = null;
+  setInMemoryToken(null);
 };
 
 // ==========================================
@@ -421,29 +438,26 @@ const SPREADSHEET_NAME = 'Database Presensi & Kedisiplinan - DISIPLIN KITA BISA'
 export const getOrCreateDriveFolder = async (
   accessToken: string
 ): Promise<{ folderId: string; folderUrl: string }> => {
-  // If running in auto-adapted locked mode, return standard school folder without throwing 401
   if (!accessToken || accessToken === 'locked_token_bypass') {
-    return {
-      folderId: 'folder_kesiswaan_puncak_darussalam',
-      folderUrl: 'https://drive.google.com/drive/u/0/my-drive',
-    };
+    const errObj: any = new Error('Token OAuth Google belum aktif untuk mengakses Google Drive.');
+    errObj.statusCode = 401;
+    throw errObj;
   }
 
   // 1. Search existing folder
   const query = encodeURIComponent(`name='${FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
   const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,webViewLink)`, {
     headers: { Authorization: `Bearer ${accessToken}` },
-  }).catch(() => null);
+  });
 
-  if (!searchRes || !searchRes.ok) {
-    if (searchRes?.status === 401) {
+  if (!searchRes.ok) {
+    if (searchRes.status === 401) {
       setInMemoryToken(null);
     }
-    // Graceful fallback to avoid halting application
-    return {
-      folderId: 'folder_kesiswaan_puncak_darussalam',
-      folderUrl: 'https://drive.google.com/drive/u/0/my-drive',
-    };
+    const err = await searchRes.json().catch(() => ({}));
+    const errObj: any = new Error(err.error?.message || `Gagal mengakses Google Drive (${searchRes.status}).`);
+    errObj.statusCode = searchRes.status;
+    throw errObj;
   }
 
   const searchData = await searchRes.json();
@@ -467,13 +481,16 @@ export const getOrCreateDriveFolder = async (
       mimeType: 'application/vnd.google-apps.folder',
       description: 'Folder basis data otomatis DISIPLIN KITA BISA (Presensi, Siswa, Rekapitulasi)',
     }),
-  }).catch(() => null);
+  });
 
-  if (!createRes || !createRes.ok) {
-    return {
-      folderId: 'folder_kesiswaan_puncak_darussalam',
-      folderUrl: 'https://drive.google.com/drive/u/0/my-drive',
-    };
+  if (!createRes.ok) {
+    if (createRes.status === 401) {
+      setInMemoryToken(null);
+    }
+    const err = await createRes.json().catch(() => ({}));
+    const errObj: any = new Error(err.error?.message || `Gagal membuat folder Google Drive (${createRes.status}).`);
+    errObj.statusCode = createRes.status;
+    throw errObj;
   }
 
   const newFolder = await createRes.json();
@@ -490,13 +507,10 @@ export const getOrCreateSpreadsheet = async (
   accessToken: string,
   folderId?: string
 ): Promise<{ spreadsheetId: string; spreadsheetUrl: string; isNew: boolean }> => {
-  // If running in auto-adapted locked mode, return standard school spreadsheet without throwing 401
   if (!accessToken || accessToken === 'locked_token_bypass') {
-    return {
-      spreadsheetId: 'spreadsheet_kesiswaan_puncak_darussalam',
-      spreadsheetUrl: 'https://docs.google.com/spreadsheets/u/0/',
-      isNew: false,
-    };
+    const errObj: any = new Error('Token OAuth Google belum aktif untuk mengakses Google Sheets.');
+    errObj.statusCode = 401;
+    throw errObj;
   }
   // 1. Search existing spreadsheet (scoped to folder first, then global)
   const baseQuery = `name='${SPREADSHEET_NAME}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`;
@@ -508,6 +522,13 @@ export const getOrCreateSpreadsheet = async (
         headers: { Authorization: `Bearer ${accessToken}` },
       }
     );
+
+    if (scopedRes.status === 401) {
+      setInMemoryToken(null);
+      const errObj: any = new Error('Sesi OAuth Google berakhir (401).');
+      errObj.statusCode = 401;
+      throw errObj;
+    }
 
     if (scopedRes.ok) {
       const scopedData = await scopedRes.json();
@@ -529,6 +550,13 @@ export const getOrCreateSpreadsheet = async (
       headers: { Authorization: `Bearer ${accessToken}` },
     }
   );
+
+  if (searchRes.status === 401) {
+    setInMemoryToken(null);
+    const errObj: any = new Error('Sesi OAuth Google berakhir (401).');
+    errObj.statusCode = 401;
+    throw errObj;
+  }
 
   if (searchRes.ok) {
     const searchData = await searchRes.json();
@@ -554,7 +582,17 @@ export const getOrCreateSpreadsheet = async (
   }
 
   // 2. Create spreadsheet with default sheets
-  const sheetTitles = ['Siswa', 'Kelas', 'Sesi_Presensi', 'Presensi', 'Izin_Keluar', 'Pelanggaran', 'Pengaturan'];
+  const sheetTitles = [
+    'Siswa',
+    'Kelas',
+    'Sesi_Presensi',
+    'Presensi',
+    'Izin_Keluar',
+    'Pelanggaran',
+    'Izin_Tidak_Masuk',
+    'Jenis_Pelanggaran',
+    'Pengaturan',
+  ];
   const createSheetRes = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
     method: 'POST',
     headers: {
@@ -577,8 +615,13 @@ export const getOrCreateSpreadsheet = async (
   });
 
   if (!createSheetRes.ok) {
+    if (createSheetRes.status === 401) {
+      setInMemoryToken(null);
+    }
     const err = await createSheetRes.json().catch(() => ({}));
-    throw new Error(err.error?.message || `Gagal membuat spreadsheet Google (${createSheetRes.status})`);
+    const errorObj: any = new Error(err.error?.message || `Gagal membuat spreadsheet Google (${createSheetRes.status})`);
+    errorObj.statusCode = createSheetRes.status;
+    throw errorObj;
   }
 
   const sheetData = await createSheetRes.json();
@@ -586,7 +629,7 @@ export const getOrCreateSpreadsheet = async (
   const spreadsheetUrl = sheetData.spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
 
   // 3. If folderId provided, move spreadsheet into folder
-  if (folderId) {
+  if (folderId && folderId !== 'folder_kesiswaan_puncak_darussalam') {
     try {
       await fetch(
         `https://www.googleapis.com/drive/v3/files/${spreadsheetId}?addParents=${folderId}&fields=id,parents`,
@@ -614,8 +657,172 @@ export interface SyncDataPayload {
   attendance: AttendanceRecord[];
   outOfClass: OutOfClassRecord[];
   violations: ViolationRecord[];
+  leaveRequests?: LeaveRequest[];
+  violationTypes?: ViolationType[];
   settings: AppSettings;
+  notificationSettings?: NotificationSettings;
 }
+
+const DRIVE_BACKUP_FILENAME = 'DISIPLIN_KITA_BISA_Database_Realtime.json';
+
+/**
+ * Create or update a real-time JSON database snapshot inside the dedicated Google Drive folder
+ */
+export const syncDriveBackupFile = async (
+  accessToken: string,
+  folderId: string | undefined,
+  existingFileId: string | undefined,
+  data: SyncDataPayload
+): Promise<{ fileId: string; fileUrl: string }> => {
+  if (!accessToken || accessToken === 'locked_token_bypass') {
+    const errObj: any = new Error('Token OAuth Google belum aktif untuk menulis cadangan Google Drive.');
+    errObj.statusCode = 401;
+    throw errObj;
+  }
+
+  const validFolderId =
+    folderId && folderId !== 'folder_kesiswaan_puncak_darussalam' ? folderId : undefined;
+
+  const snapshotJson = JSON.stringify(
+    {
+      app: 'DISIPLIN KITA BISA',
+      syncedAt: new Date().toISOString(),
+      schoolName: data.settings.school_name,
+      counts: {
+        students: data.students.length,
+        classes: data.classes.length,
+        sessions: data.sessions.length,
+        attendance: data.attendance.length,
+        outOfClass: data.outOfClass.length,
+        violations: data.violations.length,
+        leaveRequests: data.leaveRequests?.length || 0,
+        violationTypes: data.violationTypes?.length || 0,
+      },
+      data: {
+        settings: data.settings,
+        notification_settings: data.notificationSettings,
+        classes: data.classes,
+        sessions: data.sessions,
+        students: data.students,
+        violation_types: data.violationTypes || [],
+        attendance: data.attendance,
+        out_of_class: data.outOfClass,
+        violations: data.violations,
+        leave_requests: data.leaveRequests || [],
+      },
+    },
+    null,
+    2
+  );
+
+  let targetFileId = existingFileId && existingFileId !== 'backup_kesiswaan_puncak_darussalam' ? existingFileId : '';
+
+  if (!targetFileId) {
+    const queryStr = validFolderId
+      ? `name='${DRIVE_BACKUP_FILENAME}' and '${validFolderId}' in parents and trashed=false`
+      : `name='${DRIVE_BACKUP_FILENAME}' and trashed=false`;
+    const searchRes = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(queryStr)}&fields=files(id,webViewLink)`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (searchRes.status === 401) {
+      setInMemoryToken(null);
+      const errObj: any = new Error('Sesi OAuth Google berakhir (401).');
+      errObj.statusCode = 401;
+      throw errObj;
+    }
+    if (searchRes.ok) {
+      const searchJson = await searchRes.json().catch(() => ({}));
+      if (searchJson.files && searchJson.files.length > 0) {
+        targetFileId = searchJson.files[0].id;
+      }
+    }
+  }
+
+  if (targetFileId) {
+    const updateRes = await fetch(
+      `https://www.googleapis.com/upload/drive/v3/files/${targetFileId}?uploadType=media&fields=id,webViewLink`,
+      {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: snapshotJson,
+      }
+    );
+    if (updateRes.status === 401) {
+      setInMemoryToken(null);
+      const errObj: any = new Error('Sesi OAuth Google berakhir (401).');
+      errObj.statusCode = 401;
+      throw errObj;
+    }
+    if (updateRes.ok) {
+      const updated = await updateRes.json().catch(() => ({}));
+      return {
+        fileId: updated.id || targetFileId,
+        fileUrl: updated.webViewLink || `https://drive.google.com/file/d/${targetFileId}/view`,
+      };
+    }
+    if (updateRes.status !== 404 && updateRes.status !== 403) {
+      const errObj: any = new Error(`Gagal memperbarui file Drive (${updateRes.status})`);
+      errObj.statusCode = updateRes.status;
+      throw errObj;
+    }
+    // If 404/403, fall through to create a new file
+  }
+
+  const boundary = `dkb_drive_${Date.now()}`;
+  const metadata: Record<string, any> = {
+    name: DRIVE_BACKUP_FILENAME,
+    mimeType: 'application/json',
+    description: 'Cadangan basis data real-time otomatis DISIPLIN KITA BISA',
+  };
+  if (validFolderId) {
+    metadata.parents = [validFolderId];
+  }
+
+  const multipartBody =
+    `--${boundary}\r\n` +
+    `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+    `${JSON.stringify(metadata)}\r\n` +
+    `--${boundary}\r\n` +
+    `Content-Type: application/json\r\n\r\n` +
+    `${snapshotJson}\r\n` +
+    `--${boundary}--`;
+
+  const createRes = await fetch(
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': `multipart/related; boundary=${boundary}`,
+      },
+      body: multipartBody,
+    }
+  );
+
+  if (createRes.status === 401) {
+    setInMemoryToken(null);
+    const errObj: any = new Error('Sesi OAuth Google berakhir (401).');
+    errObj.statusCode = 401;
+    throw errObj;
+  }
+
+  if (!createRes.ok) {
+    const errData = await createRes.json().catch(() => ({}));
+    const errObj: any = new Error(errData.error?.message || `Gagal menyimpan file cadangan Drive (${createRes.status})`);
+    errObj.statusCode = createRes.status;
+    throw errObj;
+  }
+
+  const created = await createRes.json();
+  return {
+    fileId: created.id,
+    fileUrl: created.webViewLink || `https://drive.google.com/file/d/${created.id}/view`,
+  };
+};
 
 /**
  * Synchronize all tables into Google Sheets
@@ -625,6 +832,12 @@ export const syncAllDataToGoogleSheets = async (
   spreadsheetId: string,
   data: SyncDataPayload
 ): Promise<{ success: boolean; rowsUpdated: number }> => {
+  if (!accessToken || accessToken === 'locked_token_bypass' || !spreadsheetId || spreadsheetId === 'spreadsheet_kesiswaan_puncak_darussalam') {
+    const errObj: any = new Error('Token OAuth atau ID Google Spreadsheet belum aktif.');
+    errObj.statusCode = 401;
+    throw errObj;
+  }
+
   // Ensure the sheets exist in spreadsheet
   const metaRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties.title`, {
     headers: { Authorization: `Bearer ${accessToken}` },
@@ -646,11 +859,21 @@ export const syncAllDataToGoogleSheets = async (
   const metaData = await metaRes.json();
   const existingSheetTitles: string[] = (metaData.sheets || []).map((s: any) => s.properties?.title);
 
-  const requiredSheets = ['Siswa', 'Kelas', 'Sesi_Presensi', 'Presensi', 'Izin_Keluar', 'Pelanggaran', 'Pengaturan'];
+  const requiredSheets = [
+    'Siswa',
+    'Kelas',
+    'Sesi_Presensi',
+    'Presensi',
+    'Izin_Keluar',
+    'Pelanggaran',
+    'Izin_Tidak_Masuk',
+    'Jenis_Pelanggaran',
+    'Pengaturan',
+  ];
   const missingSheets = requiredSheets.filter((title) => !existingSheetTitles.includes(title));
 
   if (missingSheets.length > 0) {
-    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
+    const addRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -667,6 +890,12 @@ export const syncAllDataToGoogleSheets = async (
         })),
       }),
     });
+    if (addRes.status === 401) {
+      setInMemoryToken(null);
+      const errorObj: any = new Error('Sesi otorisasi Google berakhir (401).');
+      errorObj.statusCode = 401;
+      throw errorObj;
+    }
   }
 
   // 1. Format Siswa rows
@@ -707,7 +936,7 @@ export const syncAllDataToGoogleSheets = async (
       sess.start_time,
       sess.on_time_limit,
       sess.end_time,
-      sess.late_tolerance_minutes,
+      sess.late_tolerance_minutes ?? 0,
       (sess.active_days || [1, 2, 3, 4, 5]).join(', '),
       sess.is_active ? 'Aktif' : 'Nonaktif',
     ]),
@@ -780,74 +1009,199 @@ export const syncAllDataToGoogleSheets = async (
     }),
   ];
 
-  // 7. Format Pengaturan & Status
+  // 7. Format Izin Tidak Masuk (Leave Requests)
+  const leaveRows = [
+    ['ID Pengajuan', 'NIS', 'Nama Siswa', 'Kelas', 'Jenis', 'Tanggal Mulai', 'Tanggal Selesai', 'Alasan', 'Status', 'Diproses Oleh'],
+    ...(data.leaveRequests || []).slice(0, 1000).map((lr) => {
+      const student = studentMap.get(lr.student_id);
+      return [
+        lr.id,
+        lr.student_id,
+        student?.name || '-',
+        lr.class_id,
+        lr.type,
+        lr.start_date,
+        lr.end_date,
+        lr.reason,
+        lr.status,
+        lr.approved_by || '-',
+      ];
+    }),
+  ];
+
+  // 8. Format Jenis Pelanggaran
+  const violationTypeRows = [
+    ['ID', 'Kode', 'Nama Pelanggaran/Prestasi', 'Kategori', 'Poin Default', 'Status Aktif', 'Keterangan'],
+    ...(data.violationTypes || []).map((vt) => [
+      vt.id,
+      vt.code,
+      vt.name,
+      vt.category,
+      vt.default_points,
+      vt.is_active ? 'Aktif' : 'Nonaktif',
+      vt.description || '',
+    ]),
+  ];
+
+  // 9. Format Pengaturan & Status
   const pengaturanRows = [
     ['Parameter Sistem', 'Nilai Saat Ini', 'Keterangan'],
     ['Nama Sekolah', data.settings.school_name, 'Nama identitas resmi sekolah'],
-    ['Total Siswa Terdaftar', String(data.students.length), 'Jumlah siswa aktif & terdaftar'],
-    ['Total Kelas', String(data.classes.length), 'Jumlah rombel kelas'],
-    ['Total Catatan Presensi', String(data.attendance.length), 'Presensi tercatat di sistem'],
-    ['Sinkron Terakhir', new Date().toLocaleString('id-ID'), 'Waktu sinkronisasi cloud real-time'],
-    ['Mode Database', 'Google Sheets & Drive Terintegrasi', 'Database real-time cloud multi-device'],
+    ['Email Google Terhubung', data.settings.google_account_email || '-', 'Akun Google Drive & Sheets sekolah'],
+    ['Total Siswa Terdaftar', data.students.length, 'Jumlah siswa aktif & terdaftar'],
+    ['Total Kelas', data.classes.length, 'Jumlah rombel kelas'],
+    ['Total Sesi Presensi', data.sessions.length, 'Jumlah sesi jadwal presensi'],
+    ['Total Jenis Pelanggaran', data.violationTypes?.length || 0, 'Jumlah master aturan pelanggaran/prestasi'],
+    ['Total Catatan Presensi', data.attendance.length, 'Presensi tercatat di sistem'],
+    ['Total Izin Keluar', data.outOfClass.length, 'Izin keluar kelas tercatat'],
+    ['Total Pelanggaran & Prestasi', data.violations.length, 'Catatan kedisiplinan'],
+    ['Notifikasi Email Orang Tua', data.notificationSettings?.email_enabled ? 'Aktif' : 'Nonaktif', 'Pengiriman pemberitahuan otomatis'],
+    ['Sinkron Terakhir', new Date().toLocaleString('id-ID'), 'Waktu sinkronisasi cloud otomatis real-time'],
+    ['Mode Database', 'Google Drive & Sheets Otomatis Real-Time', 'Sinkronisasi otomatis setiap perubahan data'],
   ];
 
-  // If in auto-adapted locked mode, return success immediately
-  if (!accessToken || accessToken === 'locked_token_bypass') {
-    return {
-      success: true,
-      rowsUpdated: siswaRows.length + presensiRows.length + pelanggaranRows.length,
-    };
+  // Clear existing ranges then batch write
+  const clearRanges = requiredSheets.map((title) => `${title}!A:Z`);
+  const clearRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchClear`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ ranges: clearRanges }),
+  });
+
+  if (!clearRes.ok) {
+    if (clearRes.status === 401) {
+      setInMemoryToken(null);
+    }
+    if (clearRes.status === 401 || clearRes.status === 403 || clearRes.status === 404) {
+      const errData = await clearRes.json().catch(() => ({}));
+      const errorObj: any = new Error(errData.error?.message || `Gagal membersihkan Google Sheets (${clearRes.status}).`);
+      errorObj.statusCode = clearRes.status;
+      throw errorObj;
+    }
   }
 
-  try {
-    // Clear existing ranges then batch write
-    const clearRanges = requiredSheets.map((title) => `${title}!A:Z`);
-    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchClear`, {
+  // Batch update values using RAW to preserve NIS leading zeros and exact HH:mm time strings
+  const writeRes = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`,
+    {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ ranges: clearRanges }),
-    }).catch(() => null);
-
-    // Batch update values
-    const writeRes = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          valueInputOption: 'USER_ENTERED',
-          data: [
-            { range: 'Siswa!A1', values: siswaRows },
-            { range: 'Kelas!A1', values: kelasRows },
-            { range: 'Sesi_Presensi!A1', values: sesiRows },
-            { range: 'Presensi!A1', values: presensiRows },
-            { range: 'Izin_Keluar!A1', values: izinRows },
-            { range: 'Pelanggaran!A1', values: pelanggaranRows },
-            { range: 'Pengaturan!A1', values: pengaturanRows },
-          ],
-        }),
-      }
-    ).catch(() => null);
-
-    if (writeRes && writeRes.ok) {
-      const result = await writeRes.json().catch(() => ({}));
-      return {
-        success: true,
-        rowsUpdated: result.totalUpdatedRows || siswaRows.length + presensiRows.length,
-      };
+      body: JSON.stringify({
+        valueInputOption: 'RAW',
+        data: [
+          { range: 'Siswa!A1', values: siswaRows },
+          { range: 'Kelas!A1', values: kelasRows },
+          { range: 'Sesi_Presensi!A1', values: sesiRows },
+          { range: 'Presensi!A1', values: presensiRows },
+          { range: 'Izin_Keluar!A1', values: izinRows },
+          { range: 'Pelanggaran!A1', values: pelanggaranRows },
+          { range: 'Izin_Tidak_Masuk!A1', values: leaveRows },
+          { range: 'Jenis_Pelanggaran!A1', values: violationTypeRows },
+          { range: 'Pengaturan!A1', values: pengaturanRows },
+        ],
+      }),
     }
-  } catch (err) {
-    console.warn('[Google Sheets Sync Safe Fallback]:', err);
+  );
+
+  if (!writeRes.ok) {
+    if (writeRes.status === 401) {
+      setInMemoryToken(null);
+    }
+    const errData = await writeRes.json().catch(() => ({}));
+    const errorObj: any = new Error(errData.error?.message || `Gagal menulis Google Sheets (${writeRes.status})`);
+    errorObj.statusCode = writeRes.status;
+    throw errorObj;
   }
 
+  const result = await writeRes.json().catch(() => ({}));
   return {
     success: true,
-    rowsUpdated: siswaRows.length + presensiRows.length + pelanggaranRows.length,
+    rowsUpdated: result.totalUpdatedRows || siswaRows.length + presensiRows.length + pelanggaranRows.length,
   };
+};
+
+/**
+ * Full automatic orchestrator: ensures Drive Folder, Drive JSON Backup File, and 9-tab Google Spreadsheet
+ * exist and are synchronized together, with automatic 403/404 self-healing.
+ */
+export const syncAllDataToDriveAndSheets = async (
+  accessToken: string,
+  payload: SyncDataPayload
+): Promise<{
+  folderId: string;
+  folderUrl: string;
+  spreadsheetId: string;
+  spreadsheetUrl: string;
+  backupFileId: string;
+  backupFileUrl: string;
+  rowsUpdated: number;
+}> => {
+  let folderId = payload.settings.google_drive_folder_id || '';
+  let folderUrl = payload.settings.google_drive_folder_url || '';
+  let spreadsheetId = payload.settings.google_sheet_id || '';
+  let spreadsheetUrl = payload.settings.google_sheet_url || '';
+  let backupFileId = payload.settings.google_drive_backup_file_id || '';
+  let backupFileUrl = payload.settings.google_drive_backup_file_url || '';
+
+  if (!folderId || folderId === 'folder_kesiswaan_puncak_darussalam') {
+    const folder = await getOrCreateDriveFolder(accessToken);
+    folderId = folder.folderId;
+    folderUrl = folder.folderUrl;
+  }
+
+  if (!spreadsheetId || spreadsheetId === 'spreadsheet_kesiswaan_puncak_darussalam') {
+    const sheet = await getOrCreateSpreadsheet(accessToken, folderId);
+    spreadsheetId = sheet.spreadsheetId;
+    spreadsheetUrl = sheet.spreadsheetUrl;
+  }
+
+  const runBoth = async (targetFolderId: string, targetSheetId: string, targetBackupId?: string) => {
+    const [sheetsResult, driveResult] = await Promise.all([
+      syncAllDataToGoogleSheets(accessToken, targetSheetId, payload),
+      syncDriveBackupFile(accessToken, targetFolderId, targetBackupId, payload),
+    ]);
+    return { sheetsResult, driveResult };
+  };
+
+  try {
+    const { sheetsResult, driveResult } = await runBoth(folderId, spreadsheetId, backupFileId);
+    return {
+      folderId,
+      folderUrl: folderUrl || `https://drive.google.com/drive/folders/${folderId}`,
+      spreadsheetId,
+      spreadsheetUrl: spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+      backupFileId: driveResult.fileId,
+      backupFileUrl: driveResult.fileUrl,
+      rowsUpdated: sheetsResult.rowsUpdated,
+    };
+  } catch (err: any) {
+    // Self-heal if sheet or folder was deleted / inaccessible (403/404)
+    if (
+      err?.statusCode === 403 ||
+      err?.statusCode === 404 ||
+      err?.message?.includes('403') ||
+      err?.message?.includes('404') ||
+      err?.message?.includes('permission')
+    ) {
+      const folder = await getOrCreateDriveFolder(accessToken);
+      const sheet = await getOrCreateSpreadsheet(accessToken, folder.folderId);
+      const { sheetsResult, driveResult } = await runBoth(folder.folderId, sheet.spreadsheetId, undefined);
+      return {
+        folderId: folder.folderId,
+        folderUrl: folder.folderUrl,
+        spreadsheetId: sheet.spreadsheetId,
+        spreadsheetUrl: sheet.spreadsheetUrl,
+        backupFileId: driveResult.fileId,
+        backupFileUrl: driveResult.fileUrl,
+        rowsUpdated: sheetsResult.rowsUpdated,
+      };
+    }
+    throw err;
+  }
 };

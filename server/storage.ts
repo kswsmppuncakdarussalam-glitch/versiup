@@ -194,6 +194,9 @@ class StorageManager {
 
       this.saveDbSync(db);
       this.lastCacheTime = Date.now();
+      if (googleSheetsClient.isConnected) {
+        googleSheetsClient.scheduleAutoSync(() => db);
+      }
       return result;
     } finally {
       release!();

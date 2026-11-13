@@ -104,6 +104,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         success: true,
         message: 'Sistem dan basis data berhasil diinisialisasi.',
         googleSheetsConnected: storage.isSheetsConnected(),
+        serverDriveSyncActive: googleSheetsClient.isConnected,
         version: fullSnapshot.version,
       });
     }
@@ -448,6 +449,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           {
             ...syncResult,
             googleSheetsConnected: storage.isSheetsConnected(),
+            serverDriveSyncActive: googleSheetsClient.isConnected,
           },
           {
             'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
@@ -463,6 +465,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         {
           ...syncResult,
           googleSheetsConnected: storage.isSheetsConnected(),
+          serverDriveSyncActive: googleSheetsClient.isConnected,
         },
         {
           'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
