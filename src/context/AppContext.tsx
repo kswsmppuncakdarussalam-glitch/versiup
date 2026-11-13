@@ -28,6 +28,8 @@ import {
   getOrCreateSpreadsheet,
   syncAllDataToGoogleSheets,
   getAccessToken,
+  hasValidGoogleToken,
+  setCustomGoogleClientId,
   ConnectedGoogleAccount,
 } from '../utils/googleWorkspace.js';
 
@@ -110,8 +112,8 @@ interface AppContextType {
   saveViolationType: (vt: ViolationType) => Promise<boolean>;
   deleteViolationType: (id: string) => Promise<boolean>;
 
-  updateSettings: (updates: Partial<AppSettings>) => Promise<boolean>;
-  updateNotificationSettings: (updates: Partial<NotificationSettings>) => Promise<boolean>;
+  updateSettings: (updates: Partial<AppSettings>, options?: { silent?: boolean }) => Promise<boolean>;
+  updateNotificationSettings: (updates: Partial<NotificationSettings>, options?: { silent?: boolean }) => Promise<boolean>;
   sendTestEmail: (email: string) => Promise<{ success: boolean; message: string }>;
   sendWeeklyRecap: (classId?: string) => Promise<{ success: boolean; message: string; results?: any; sent?: boolean; recipient?: string }>;
 
@@ -152,6 +154,7 @@ const defaultSettings: AppSettings = {
   toggle_kiosk_mode: false,
   google_account_email: 'kswsmp.puncakdarussalam@gmail.com',
   google_account_name: 'Kesiswaan SMP Puncak Darussalam',
+  google_client_id: '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com',
   updated_at: new Date().toISOString(),
 };
 
@@ -294,7 +297,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   });
   const [initialLoadError, setInitialLoadError] = useState<string | null>(null);
+  const [hasSyncedOnce, setHasSyncedOnce] = useState(false);
+  const [localDataNonce, setLocalDataNonce] = useState(0);
   const hasSyncedOnceRef = useRef(false);
+  const isAutoSheetSyncingRef = useRef(false);
+  const lastAutoSheetSigRef = useRef('');
 
   const isSyncingRef = useRef(false);
   const versionRef = useRef(0);
@@ -306,6 +313,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (syncChannelRef.current) {
         syncChannelRef.current.postMessage('sync');
       }
+    } catch {}
+  }, []);
+
+  const enqueueOfflineMutation = useCallback((type: string, action: string, payload: any) => {
+    try {
+      const rawQ = localStorage.getItem('dkb_offline_queue');
+      const q = rawQ ? JSON.parse(rawQ) : [];
+      q.push({ type, action, payload, queuedAt: new Date().toISOString() });
+      localStorage.setItem('dkb_offline_queue', JSON.stringify(q));
     } catch {}
   }, []);
 
@@ -384,12 +400,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (action === 'insert') {
             setAttendance((prev) => {
               if (prev.some((a) => a.id === entity_id)) return prev;
-              return [data, ...prev];
+              const next = [data, ...prev];
+              try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
+              return next;
             });
           } else if (action === 'update') {
-            setAttendance((prev) => prev.map((a) => (a.id === entity_id ? data : a)));
+            setAttendance((prev) => {
+              const next = prev.map((a) => (a.id === entity_id ? data : a));
+              try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
+              return next;
+            });
           } else if (action === 'delete') {
-            setAttendance((prev) => prev.filter((a) => a.id !== entity_id));
+            setAttendance((prev) => {
+              const next = prev.filter((a) => a.id !== entity_id);
+              try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
+              return next;
+            });
           }
           break;
 
@@ -397,10 +423,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (action === 'insert') {
             setOutOfClass((prev) => {
               if (prev.some((o) => o.id === entity_id)) return prev;
-              return [data, ...prev];
+              const next = [data, ...prev];
+              try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
+              return next;
             });
           } else if (action === 'update') {
-            setOutOfClass((prev) => prev.map((o) => (o.id === entity_id ? data : o)));
+            setOutOfClass((prev) => {
+              const next = prev.map((o) => (o.id === entity_id ? data : o));
+              try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
+              return next;
+            });
+          } else if (action === 'delete') {
+            setOutOfClass((prev) => {
+              const next = prev.filter((o) => o.id !== entity_id);
+              try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
+              return next;
+            });
           }
           break;
 
@@ -408,23 +446,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (action === 'insert') {
             setViolations((prev) => {
               if (prev.some((v) => v.id === entity_id)) return prev;
-              return [data, ...prev];
-            });
-          } else if (action === 'delete') {
-            setViolations((prev) => prev.filter((v) => v.id !== entity_id));
-          }
-          break;
-
-        case 'students':
-          if (action === 'insert') {
-            setStudents((prev) => {
-              if (prev.some((s) => s.nis === entity_id)) return prev;
-              return [...prev, data];
+              const next = [data, ...prev];
+              try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
+              return next;
             });
           } else if (action === 'update') {
-            setStudents((prev) => prev.map((s) => (s.nis === entity_id ? data : s)));
+            setViolations((prev) => {
+              const next = prev.map((v) => (v.id === entity_id ? data : v));
+              try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
+              return next;
+            });
           } else if (action === 'delete') {
-            setStudents((prev) => prev.filter((s) => s.nis !== entity_id));
+            setViolations((prev) => {
+              const next = prev.filter((v) => v.id !== entity_id);
+              try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
+              return next;
+            });
           }
           break;
 
@@ -441,7 +478,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             });
           } else if (action === 'update') {
             setStudents((prev) => {
-              const next = prev.map((s) => (s.nis === entity_id ? data : s));
+              const exists = prev.some((s) => s.nis === entity_id);
+              const next = exists ? prev.map((s) => (s.nis === entity_id ? data : s)) : [...prev, data];
               try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
               return next;
             });
@@ -460,13 +498,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             try { localStorage.setItem('dkb_cache_classes', JSON.stringify(data)); } catch {}
           } else if (action === 'insert') {
             setClasses((prev) => {
+              if (prev.some((c) => c.id === entity_id)) return prev;
               const next = [...prev, data];
               try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
               return next;
             });
           } else if (action === 'update') {
             setClasses((prev) => {
-              const next = prev.map((c) => (c.id === entity_id ? data : c));
+              const exists = prev.some((c) => c.id === entity_id);
+              const next = exists ? prev.map((c) => (c.id === entity_id ? data : c)) : [...prev, data];
               try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
               return next;
             });
@@ -485,13 +525,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(data)); } catch {}
           } else if (action === 'insert') {
             setSessions((prev) => {
+              if (prev.some((s) => s.id === entity_id)) return prev;
               const next = [...prev, data];
               try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
               return next;
             });
           } else if (action === 'update') {
             setSessions((prev) => {
-              const next = prev.map((s) => (s.id === entity_id ? data : s));
+              const exists = prev.some((s) => s.id === entity_id);
+              const next = exists ? prev.map((s) => (s.id === entity_id ? data : s)) : [...prev, data];
               try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
               return next;
             });
@@ -509,11 +551,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             setViolationTypes(data);
             try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(data)); } catch {}
           } else if (action === 'insert') {
-            setViolationTypes((prev) => [...prev, data]);
+            setViolationTypes((prev) => {
+              if (prev.some((vt) => vt.id === entity_id)) return prev;
+              const next = [...prev, data];
+              try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(next)); } catch {}
+              return next;
+            });
           } else if (action === 'update') {
-            setViolationTypes((prev) => prev.map((vt) => (vt.id === entity_id ? data : vt)));
+            setViolationTypes((prev) => {
+              const exists = prev.some((vt) => vt.id === entity_id);
+              const next = exists ? prev.map((vt) => (vt.id === entity_id ? data : vt)) : [...prev, data];
+              try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(next)); } catch {}
+              return next;
+            });
           } else if (action === 'delete') {
-            setViolationTypes((prev) => prev.filter((vt) => vt.id !== entity_id));
+            setViolationTypes((prev) => {
+              const next = prev.filter((vt) => vt.id !== entity_id);
+              try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(next)); } catch {}
+              return next;
+            });
           }
           break;
 
@@ -521,18 +577,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (action === 'insert') {
             setLeaveRequests((prev) => {
               if (prev.some((lr) => lr.id === entity_id)) return prev;
-              return [data, ...prev];
+              const next = [data, ...prev];
+              try { localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(next)); } catch {}
+              return next;
             });
           } else if (action === 'update') {
-            setLeaveRequests((prev) => prev.map((lr) => (lr.id === entity_id ? data : lr)));
+            setLeaveRequests((prev) => {
+              const next = prev.map((lr) => (lr.id === entity_id ? data : lr));
+              try { localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(next)); } catch {}
+              return next;
+            });
           } else if (action === 'delete') {
-            setLeaveRequests((prev) => prev.filter((lr) => lr.id !== entity_id));
+            setLeaveRequests((prev) => {
+              const next = prev.filter((lr) => lr.id !== entity_id);
+              try { localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(next)); } catch {}
+              return next;
+            });
           }
           break;
 
         case 'settings':
           if (data) {
             setSettings(data);
+            if (data.google_client_id && data.google_client_id.trim()) {
+              setCustomGoogleClientId(data.google_client_id.trim());
+            }
             try {
               localStorage.setItem('dkb_cache_settings', JSON.stringify(data));
             } catch {}
@@ -636,6 +705,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       const data = await res.json();
       hasSyncedOnceRef.current = true;
+      setHasSyncedOnce(true);
 
       // Update Clock Offset
       if (data.serverTime) {
@@ -650,7 +720,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       if (data.fullSnapshot && data.data) {
         // Full Snapshot initialization: Replace with fresh clean server data (purges old demo caches)
-        setSettings(data.data.settings || defaultSettings);
+        const nextSettings = data.data.settings || defaultSettings;
+        setSettings(nextSettings);
+        if (nextSettings.google_client_id && nextSettings.google_client_id.trim()) {
+          setCustomGoogleClientId(nextSettings.google_client_id.trim());
+        }
         setClasses(data.data.classes || []);
         setSessions(data.data.sessions || []);
         setStudents(data.data.students || []);
@@ -664,7 +738,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         try {
-          if (data.data.settings) localStorage.setItem('dkb_cache_settings', JSON.stringify(data.data.settings));
+          localStorage.setItem('dkb_cache_settings', JSON.stringify(nextSettings));
           localStorage.setItem('dkb_cache_classes', JSON.stringify(data.data.classes || []));
           if (data.data.sessions) localStorage.setItem('dkb_cache_sessions', JSON.stringify(data.data.sessions));
           localStorage.setItem('dkb_cache_students', JSON.stringify(data.data.students || []));
@@ -673,6 +747,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(data.data.out_of_class || []));
           localStorage.setItem('dkb_cache_violations', JSON.stringify(data.data.violations || []));
           localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(data.data.leave_requests || []));
+          if (data.data.notification_settings) {
+            localStorage.setItem('dkb_cache_notification_settings', JSON.stringify(data.data.notification_settings));
+          }
           localStorage.setItem('dkb_cache_version', String(data.version));
         } catch {}
       } else if (data.changes && data.changes.length > 0) {
@@ -711,7 +788,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     syncNow();
   }, [syncNow]);
 
-  // Adaptive Multi-Device Real-Time Polling & Cross-Tab Broadcast Synchronization
+  // Adaptive Multi-Device Real-Time Polling, Storage Event & Cross-Tab Broadcast Synchronization
   useEffect(() => {
     let intervalId: any;
 
@@ -732,8 +809,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const setupInterval = () => {
       if (intervalId) clearInterval(intervalId);
       const isVisible = document.visibilityState === 'visible';
-      // Real-time 4s non-blocking polling for active screens, 20s when tab in background
-      const delay = isVisible ? 4000 : 20000;
+      // Real-time 2.5s non-blocking polling for active screens, 15s when tab in background
+      const delay = isVisible ? 2500 : 15000;
       intervalId = setInterval(() => {
         syncNow(false);
       }, delay);
@@ -750,6 +827,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       syncNow();
     };
 
+    const handleStorageChange = (e: StorageEvent) => {
+      if (e.key && e.key.startsWith('dkb_')) {
+        if (e.key === 'dkb_google_client_id' && e.newValue) {
+          setCustomGoogleClientId(e.newValue);
+        }
+        syncNow(false, false);
+      }
+    };
+
     const handleOnline = () => {
       showToast('Koneksi internet kembali normal. Menyinkronkan...', 'info');
       syncNow();
@@ -762,6 +848,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('focus', handleFocus);
+    window.addEventListener('storage', handleStorageChange);
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
 
@@ -775,6 +862,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('storage', handleStorageChange);
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
@@ -1431,7 +1519,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       const nowIso = new Date().toISOString();
-      await updateSettings({ google_last_synced_at: nowIso });
+      await updateSettings({ google_last_synced_at: nowIso }, { silent: true });
       showToast(
         `Sinkronisasi Google Sheets sukses! ${syncRes.rowsUpdated} baris data berhasil diperbarui.`,
         'success'
@@ -1445,6 +1533,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setGoogleSyncing(false);
     }
   };
+
+  // Helper to push via /api/sync as immediate DB fallback when endpoint fails or session token is absent
+  const pushTwoWayMutation = useCallback(
+    async (type: string, action: string, payload: any, extraBody?: Record<string, any>) => {
+      try {
+        const res = await fetch('/api/sync', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+          },
+          body: JSON.stringify(
+            extraBody || { mutations: [{ type, action, payload }] }
+          ),
+        });
+        if (res.ok) {
+          const data = await res.json().catch(() => null);
+          if (data?.version) {
+            setServerVersion(data.version);
+            versionRef.current = data.version;
+            try { localStorage.setItem('dkb_cache_version', String(data.version)); } catch {}
+          }
+          broadcastSync();
+          return true;
+        }
+      } catch {}
+      enqueueOfflineMutation(type, action, payload);
+      return false;
+    },
+    [session?.token, broadcastSync, enqueueOfflineMutation]
+  );
 
   // Mutator Operations
   const recordAttendanceOffline = (params: {
@@ -1494,7 +1613,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     let lateMins = 0;
     let finalStatus = params.status || 'Hadir';
 
-    if (activeSession && activeSession.on_time_limit) {
+    if (activeSession && activeSession.on_time_limit && !params.status) {
       const [lh, lm] = activeSession.on_time_limit.split(':').map(Number);
       const limitMins = lh * 60 + lm;
       if (curMins > limitMins) {
@@ -1520,14 +1639,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       updated_at: nowIso,
     };
 
-    setAttendance((prev) => [offlineRecord, ...prev]);
+    setAttendance((prev) => {
+      const next = [offlineRecord, ...prev];
+      try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
+      return next;
+    });
 
-    try {
-      const rawQ = localStorage.getItem('dkb_offline_queue');
-      const q = rawQ ? JSON.parse(rawQ) : [];
-      q.push({ type: 'attendance', payload: params });
-      localStorage.setItem('dkb_offline_queue', JSON.stringify(q));
-    } catch {}
+    enqueueOfflineMutation('attendance', 'insert', offlineRecord);
+    setLocalDataNonce((n) => n + 1);
+    broadcastSync();
 
     soundEffects.playSuccessBeep();
     showToast(`Mode Offline: Presensi ${matchedStudent.name} berhasil disimpan lokal & akan otomatis disinkronkan saat online.`, 'info');
@@ -1573,58 +1693,84 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       soundEffects.playSuccessBeep();
-      // Optimistic update
-      setAttendance((prev) => [data.record, ...prev.filter((a) => a.id !== data.record.id)]);
-      syncNow(); // Quick sync
+      // Optimistic update + localStorage cache
+      setAttendance((prev) => {
+        const next = [data.record, ...prev.filter((a) => a.id !== data.record.id)];
+        try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
+        return next;
+      });
+      setLocalDataNonce((n) => n + 1);
+      broadcastSync();
+      syncNow(false, true);
       return {
         success: true,
         record: data.record,
         student: data.student,
         session: data.session,
       };
-    } catch (err: any) {
+    } catch {
       return recordAttendanceOffline(params);
     }
   };
 
   const updateAttendance = async (id: string, updates: Partial<AttendanceRecord>, reason: string) => {
+    setAttendance((prev) => {
+      const next = prev.map((a) => (a.id === id ? { ...a, ...updates, audit_reason: reason } : a));
+      try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/attendance', {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ id, updates, reason }),
       });
       if (res.ok) {
-        showToast('Presensi berhasil diperbarui.', 'success');
-        syncNow();
+        showToast('Presensi berhasil diperbarui & disinkronkan.', 'success');
+        broadcastSync();
+        syncNow(false, true);
         return true;
       }
-      return false;
+      const synced = await pushTwoWayMutation('attendance', 'update', { id, updates: { ...updates, audit_reason: reason } });
+      if (synced) syncNow(false, true);
+      return synced;
     } catch {
+      enqueueOfflineMutation('attendance', 'update', { id, updates: { ...updates, audit_reason: reason } });
       return false;
     }
   };
 
   const deleteAttendance = async (id: string, reason: string) => {
+    setAttendance((prev) => {
+      const next = prev.filter((a) => a.id !== id);
+      try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/attendance', {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ id, reason }),
       });
       if (res.ok) {
-        showToast('Presensi berhasil dibatalkan.', 'success');
-        syncNow();
+        showToast('Presensi berhasil dibatalkan & disinkronkan.', 'success');
+        broadcastSync();
+        syncNow(false, true);
         return true;
       }
-      return false;
+      const synced = await pushTwoWayMutation('attendance', 'delete', { id });
+      if (synced) syncNow(false, true);
+      return synced;
     } catch {
+      enqueueOfflineMutation('attendance', 'delete', { id });
       return false;
     }
   };
@@ -1634,8 +1780,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     type: 'BAK' | 'BAB' | 'Keperluan Lain',
     durationMinutes: number
   ) => {
-    // PWA Offline mode support
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    const makeOfflineOutOfClass = () => {
       const student = students.find((s) => s.nis === studentId);
       if (!student) return { success: false, error: 'Siswa tidak ditemukan.' };
       const now = new Date();
@@ -1655,19 +1800,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         created_at: now.toISOString(),
         updated_at: now.toISOString(),
       };
-      setOutOfClass((prev) => [offlineRecord, ...prev]);
-      try {
-        const rawQ = localStorage.getItem('dkb_offline_queue');
-        const q = rawQ ? JSON.parse(rawQ) : [];
-        q.push({
-          type: 'out_of_class',
-          payload: { studentId, type, durationMinutes, idempotencyKey: offlineRecord.id },
-        });
-        localStorage.setItem('dkb_offline_queue', JSON.stringify(q));
-      } catch {}
+      setOutOfClass((prev) => {
+        const next = [offlineRecord, ...prev];
+        try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
+        return next;
+      });
+      enqueueOfflineMutation('out_of_class', 'insert', offlineRecord);
+      setLocalDataNonce((n) => n + 1);
+      broadcastSync();
       soundEffects.playSuccessBeep();
-      showToast(`Mode Offline: Izin keluar ${student.name} tersimpan lokal.`, 'info');
+      showToast(`Mode Offline: Izin keluar ${student.name} tersimpan lokal & siap sinkron.`, 'info');
       return { success: true, record: offlineRecord, student };
+    };
+
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      return makeOfflineOutOfClass();
     }
 
     try {
@@ -1692,12 +1839,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       soundEffects.playSuccessBeep();
-      setOutOfClass((prev) => [data.record, ...prev]);
-      syncNow();
+      setOutOfClass((prev) => {
+        const next = [data.record, ...prev.filter((o) => o.id !== data.record.id)];
+        try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
+        return next;
+      });
+      setLocalDataNonce((n) => n + 1);
+      broadcastSync();
+      syncNow(false, true);
       return { success: true, record: data.record, student: data.student };
-    } catch (err: any) {
-      soundEffects.playErrorBeep();
-      return { success: false, error: err.message || 'Gagal memulai izin keluar.' };
+    } catch {
+      return makeOfflineOutOfClass();
     }
   };
 
@@ -1707,12 +1859,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     notes?: string,
     auditReason?: string
   ) => {
-    // PWA Offline mode support
+    const nowIso = new Date().toISOString();
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      const nowIso = new Date().toISOString();
-      setOutOfClass((prev) =>
-        prev.map((o) => (o.id === id ? { ...o, status: 'returned', returned_at: nowIso } : o))
-      );
+      setOutOfClass((prev) => {
+        const next = prev.map((o) => (o.id === id ? { ...o, status: 'returned' as const, returned_at: nowIso, return_method: returnMethod, return_notes: notes } : o));
+        try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
+        return next;
+      });
+      enqueueOfflineMutation('out_of_class', 'update', { id, status: 'returned', returned_at: nowIso, return_method: returnMethod, return_notes: notes, audit_reason: auditReason });
+      setLocalDataNonce((n) => n + 1);
+      broadcastSync();
       soundEffects.playSuccessBeep();
       showToast('Mode Offline: Pengembalian izin keluar tersimpan lokal.', 'info');
       return { success: true };
@@ -1734,12 +1890,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       soundEffects.playSuccessBeep();
-      setOutOfClass((prev) => prev.map((o) => (o.id === id ? data.record : o)));
-      syncNow();
+      setOutOfClass((prev) => {
+        const next = prev.map((o) => (o.id === id ? data.record : o));
+        try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
+        return next;
+      });
+      setLocalDataNonce((n) => n + 1);
+      broadcastSync();
+      syncNow(false, true);
       return { success: true, record: data.record };
-    } catch (err: any) {
-      soundEffects.playErrorBeep();
-      return { success: false, error: err.message };
+    } catch {
+      enqueueOfflineMutation('out_of_class', 'update', { id, status: 'returned', returned_at: nowIso, return_method: returnMethod, return_notes: notes });
+      return { success: true };
     }
   };
 
@@ -1752,8 +1914,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     evidenceBase64?: string;
     evidenceFileName?: string;
   }) => {
-    // PWA Offline mode support
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    const makeOfflineViolation = () => {
       const student = students.find((s) => s.nis === params.studentId);
       const vt = violationTypes.find((v) => v.id === params.violationTypeId);
       if (!student || !vt) return { success: false, error: 'Data siswa atau jenis pelanggaran tidak valid.' };
@@ -1776,16 +1937,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         created_at: nowIso,
         updated_at: nowIso,
       };
-      setViolations((prev) => [offlineRecord, ...prev]);
-      try {
-        const rawQ = localStorage.getItem('dkb_offline_queue');
-        const q = rawQ ? JSON.parse(rawQ) : [];
-        q.push({ type: 'violations', payload: params });
-        localStorage.setItem('dkb_offline_queue', JSON.stringify(q));
-      } catch {}
+      setViolations((prev) => {
+        const next = [offlineRecord, ...prev];
+        try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
+        return next;
+      });
+      enqueueOfflineMutation('violations', 'insert', offlineRecord);
+      setLocalDataNonce((n) => n + 1);
+      broadcastSync();
       soundEffects.playSuccessBeep();
       showToast(`Mode Offline: Pelanggaran ${student.name} (+${points} poin) tersimpan lokal.`, 'info');
       return { success: true, violation: offlineRecord, studentTotalPoints: points };
+    };
+
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      return makeOfflineViolation();
     }
 
     try {
@@ -1804,338 +1970,511 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       soundEffects.playSuccessBeep();
-      setViolations((prev) => [data.violation, ...prev]);
-      syncNow();
+      setViolations((prev) => {
+        const next = [data.violation, ...prev.filter((v) => v.id !== data.violation.id)];
+        try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
+        return next;
+      });
+      setLocalDataNonce((n) => n + 1);
+      broadcastSync();
+      syncNow(false, true);
       return {
         success: true,
         violation: data.violation,
         studentTotalPoints: data.studentTotalPoints,
       };
-    } catch (err: any) {
-      soundEffects.playErrorBeep();
-      return { success: false, error: err.message };
+    } catch {
+      return makeOfflineViolation();
     }
   };
 
   const deleteViolation = async (id: string, reason: string) => {
+    setViolations((prev) => {
+      const next = prev.filter((v) => v.id !== id);
+      try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/violations', {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ id, reason }),
       });
       if (res.ok) {
-        showToast('Catatan pelanggaran berhasil dihapus.', 'success');
-        syncNow();
+        showToast('Catatan pelanggaran berhasil dihapus & disinkronkan.', 'success');
+        broadcastSync();
+        syncNow(false, true);
         return true;
       }
-      return false;
+      const synced = await pushTwoWayMutation('violations', 'delete', { id });
+      if (synced) syncNow(false, true);
+      return synced;
     } catch {
+      enqueueOfflineMutation('violations', 'delete', { id });
       return false;
     }
   };
 
   const saveStudent = async (student: Student) => {
+    setStudents((prev) => {
+      const idx = prev.findIndex((s) => s.nis === student.nis);
+      const next = idx >= 0 ? prev.map((s) => (s.nis === student.nis ? student : s)) : [...prev, student];
+      try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/students', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify(student),
       });
       if (res.ok) {
-        showToast('Data siswa berhasil disimpan.', 'success');
-        syncNow();
+        showToast('Data siswa berhasil disimpan & disinkronkan.', 'success');
+        broadcastSync();
+        syncNow(false, true);
         return true;
       }
-      return false;
+      const synced = await pushTwoWayMutation('students', 'upsert', student);
+      if (synced) {
+        showToast('Data siswa berhasil disinkronkan ke database.', 'success');
+        syncNow(false, true);
+      }
+      return synced;
     } catch {
+      enqueueOfflineMutation('students', 'upsert', student);
+      showToast('Perubahan siswa disimpan lokal & akan otomatis sinkron saat online.', 'info');
       return false;
     }
   };
 
   const deleteStudent = async (nis: string) => {
+    setStudents((prev) => {
+      const next = prev.filter((s) => s.nis !== nis);
+      try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/students', {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ nis }),
       });
       if (res.ok) {
-        showToast('Siswa berhasil dihapus.', 'success');
-        syncNow();
+        showToast('Siswa berhasil dihapus & disinkronkan.', 'success');
+        broadcastSync();
+        syncNow(false, true);
         return true;
       }
-      return false;
+      const synced = await pushTwoWayMutation('students', 'delete', { nis });
+      if (synced) syncNow(false, true);
+      return synced;
     } catch {
+      enqueueOfflineMutation('students', 'delete', { nis });
       return false;
     }
   };
 
   const deleteStudents = async (nisses: string[]) => {
+    const delSet = new Set(nisses);
+    setStudents((prev) => {
+      const next = prev.filter((s) => !delSet.has(s.nis));
+      try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/students', {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ nisses }),
       });
       if (res.ok) {
-        showToast(`${nisses.length} data siswa berhasil dihapus.`, 'success');
-        syncNow();
+        showToast(`${nisses.length} data siswa berhasil dihapus & disinkronkan.`, 'success');
+        broadcastSync();
+        syncNow(false, true);
         return true;
       }
-      return false;
+      const synced = await pushTwoWayMutation('students', 'delete_many', { nisses });
+      if (synced) syncNow(false, true);
+      return synced;
     } catch {
+      enqueueOfflineMutation('students', 'delete_many', { nisses });
       return false;
     }
   };
 
   const clearAllStudents = async () => {
+    setStudents([]);
+    try { localStorage.setItem('dkb_cache_students', JSON.stringify([])); } catch {}
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/students', {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ action: 'clear_all' }),
       });
       if (res.ok) {
-        showToast('Semua data siswa berhasil dihapus dan dikosongkan.', 'success');
-        syncNow();
+        showToast('Semua data siswa berhasil dihapus dan disinkronkan.', 'success');
+        broadcastSync();
+        syncNow(false, true);
         return true;
       }
-      return false;
+      const synced = await pushTwoWayMutation('students', 'clear_all', {});
+      if (synced) syncNow(false, true);
+      return synced;
     } catch {
+      enqueueOfflineMutation('students', 'clear_all', {});
       return false;
     }
   };
 
   const batchImportStudents = async (newStudents: Student[]) => {
+    setStudents((prev) => {
+      const map = new Map(prev.map((s) => [s.nis, s]));
+      for (const s of newStudents) {
+        map.set(s.nis, s);
+      }
+      const next = Array.from(map.values());
+      try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/students?action=batch_import', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ students: newStudents }),
       });
       const data = await res.json();
       if (res.ok) {
-        showToast(`Impor selesai: ${data.added} ditambahkan, ${data.updated} diperbarui.`, 'success');
-        syncNow();
+        showToast(`Impor selesai: ${data.added} ditambahkan, ${data.updated} diperbarui & otomatis disinkronkan.`, 'success');
+        broadcastSync();
+        syncNow(false, true);
         return { success: true, added: data.added, updated: data.updated };
       }
-      return { success: false, added: 0, updated: 0 };
+      const synced = await pushTwoWayMutation('students', 'batch_import', { students: newStudents });
+      if (synced) syncNow(false, true);
+      return { success: synced, added: synced ? newStudents.length : 0, updated: 0 };
     } catch {
+      enqueueOfflineMutation('students', 'batch_import', { students: newStudents });
       return { success: false, added: 0, updated: 0 };
     }
   };
 
   const saveClass = async (cls: SchoolClass) => {
-    // 1. Instant optimistic state update
     setClasses((prev) => {
       const idx = prev.findIndex((c) => c.id === cls.id);
-      if (idx >= 0) {
-        const copy = [...prev];
-        copy[idx] = cls;
-        return copy;
-      }
-      return [...prev, cls];
+      const next = idx >= 0 ? prev.map((c) => (c.id === cls.id ? cls : c)) : [...prev, cls];
+      try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
+      return next;
     });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/classes', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify(cls),
       });
-      showToast('Kelas berhasil disimpan.', 'success');
-      syncNow();
-      return res.ok;
+      if (res.ok) {
+        showToast('Kelas berhasil disimpan & disinkronkan.', 'success');
+        broadcastSync();
+        syncNow(false, true);
+        return true;
+      }
+      const synced = await pushTwoWayMutation('classes', 'upsert', cls);
+      if (synced) {
+        showToast('Kelas berhasil disinkronkan ke database.', 'success');
+        syncNow(false, true);
+      }
+      return synced;
     } catch {
-      syncNow();
+      enqueueOfflineMutation('classes', 'upsert', cls);
       return false;
     }
   };
 
   const deleteClass = async (id: string) => {
-    // 1. Instant optimistic state update - disappears on 1-click immediately!
-    setClasses((prev) => prev.filter((c) => c.id !== id && c.id.toLowerCase() !== id.toLowerCase()));
-    showToast('Kelas berhasil dihapus.', 'success');
+    setClasses((prev) => {
+      const next = prev.filter((c) => c.id !== id && c.id.toLowerCase() !== id.toLowerCase());
+      try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
+    showToast('Kelas berhasil dihapus & disinkronkan.', 'success');
     try {
-      await fetch(`/api/classes?id=${encodeURIComponent(id)}`, {
+      const res = await fetch(`/api/classes?id=${encodeURIComponent(id)}`, {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ id }),
       });
-      syncNow();
+      if (!res.ok) {
+        await pushTwoWayMutation('classes', 'delete', { id });
+      }
+      broadcastSync();
+      syncNow(false, true);
       return true;
     } catch {
-      syncNow();
+      enqueueOfflineMutation('classes', 'delete', { id });
       return false;
     }
   };
 
   const saveSession = async (sess: AttendanceSession) => {
-    // 1. Instant optimistic state update
     setSessions((prev) => {
       const idx = prev.findIndex((s) => s.id === sess.id);
-      if (idx >= 0) {
-        const copy = [...prev];
-        copy[idx] = sess;
-        return copy;
-      }
-      return [...prev, sess];
+      const next = idx >= 0 ? prev.map((s) => (s.id === sess.id ? sess : s)) : [...prev, sess];
+      try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
+      return next;
     });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/sessions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify(sess),
       });
-      showToast('Sesi presensi berhasil disimpan.', 'success');
-      syncNow();
-      return res.ok;
+      if (res.ok) {
+        showToast('Sesi presensi berhasil disimpan & disinkronkan.', 'success');
+        broadcastSync();
+        syncNow(false, true);
+        return true;
+      }
+      const synced = await pushTwoWayMutation('sessions', 'upsert', sess);
+      if (synced) syncNow(false, true);
+      return synced;
     } catch {
-      syncNow();
+      enqueueOfflineMutation('sessions', 'upsert', sess);
       return false;
     }
   };
 
   const deleteSession = async (id: string) => {
-    // 1. Instant optimistic state update - disappears on 1-click immediately!
-    setSessions((prev) => prev.filter((s) => s.id !== id && s.id.toLowerCase() !== id.toLowerCase()));
-    showToast('Sesi presensi berhasil dihapus.', 'success');
+    setSessions((prev) => {
+      const next = prev.filter((s) => s.id !== id && s.id.toLowerCase() !== id.toLowerCase());
+      try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
+    showToast('Sesi presensi berhasil dihapus & disinkronkan.', 'success');
     try {
-      await fetch(`/api/sessions?id=${encodeURIComponent(id)}`, {
+      const res = await fetch(`/api/sessions?id=${encodeURIComponent(id)}`, {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ id }),
       });
-      syncNow();
+      if (!res.ok) {
+        await pushTwoWayMutation('sessions', 'delete', { id });
+      }
+      broadcastSync();
+      syncNow(false, true);
       return true;
     } catch {
-      syncNow();
+      enqueueOfflineMutation('sessions', 'delete', { id });
       return false;
     }
   };
 
   const saveViolationType = async (vt: ViolationType) => {
+    setViolationTypes((prev) => {
+      const idx = prev.findIndex((x) => x.id === vt.id);
+      const next = idx >= 0 ? prev.map((x) => (x.id === vt.id ? vt : x)) : [...prev, vt];
+      try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/violation-types', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify(vt),
       });
       if (res.ok) {
-        showToast('Jenis pelanggaran berhasil disimpan.', 'success');
-        syncNow();
+        showToast('Jenis pelanggaran berhasil disimpan & disinkronkan.', 'success');
+        broadcastSync();
+        syncNow(false, true);
         return true;
       }
-      return false;
+      const synced = await pushTwoWayMutation('violation_types', 'upsert', vt);
+      if (synced) syncNow(false, true);
+      return synced;
     } catch {
+      enqueueOfflineMutation('violation_types', 'upsert', vt);
       return false;
     }
   };
 
   const deleteViolationType = async (id: string) => {
+    setViolationTypes((prev) => {
+      const next = prev.filter((vt) => vt.id !== id);
+      try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/violation-types', {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ id }),
       });
       if (res.ok) {
-        showToast('Jenis pelanggaran berhasil dihapus.', 'success');
-        syncNow();
+        showToast('Jenis pelanggaran berhasil dihapus & disinkronkan.', 'success');
+        broadcastSync();
+        syncNow(false, true);
         return true;
       }
-      return false;
+      const synced = await pushTwoWayMutation('violation_types', 'delete', { id });
+      if (synced) syncNow(false, true);
+      return synced;
     } catch {
+      enqueueOfflineMutation('violation_types', 'delete', { id });
       return false;
     }
   };
 
-  const updateSettings = async (updates: Partial<AppSettings>) => {
-    // Optimistic state and local storage update for instant reactivity
-    setSettings((prev) => {
-      const next = { ...prev, ...updates };
+  const updateSettings = useCallback(
+    async (updates: Partial<AppSettings>, options?: { silent?: boolean }) => {
+      // Optimistic state and local storage update for instant reactivity
+      setSettings((prev) => {
+        const next = { ...prev, ...updates };
+        try {
+          localStorage.setItem('dkb_cache_settings', JSON.stringify(next));
+        } catch {}
+        return next;
+      });
+      if (updates.google_client_id !== undefined) {
+        setCustomGoogleClientId(updates.google_client_id || '');
+      }
+      // Do not re-trigger background Sheets auto-sync for pure sync-timestamp updates
+      const updatedKeys = Object.keys(updates);
+      const isPureSyncStamp =
+        updatedKeys.length === 1 && updatedKeys[0] === 'google_last_synced_at';
+      if (!isPureSyncStamp) {
+        setLocalDataNonce((n) => n + 1);
+      }
+
       try {
-        localStorage.setItem('dkb_cache_settings', JSON.stringify(next));
-      } catch {}
-      return next;
-    });
-
-    try {
-      const res = await fetch('/api/settings', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
-        },
-        body: JSON.stringify(updates),
-      });
-      if (res.ok) {
-        showToast('Pengaturan aplikasi berhasil disimpan.', 'success');
-        syncNow();
-        return true;
+        const res = await fetch('/api/settings', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+          },
+          body: JSON.stringify(updates),
+        });
+        if (res.ok) {
+          if (!options?.silent) {
+            showToast('Pengaturan aplikasi berhasil disimpan & disinkronkan.', 'success');
+          }
+          broadcastSync();
+          syncNow(false, true);
+          return true;
+        }
+        // Fallback via /api/sync two-way endpoint so settings always persist to DB
+        const synced = await pushTwoWayMutation('settings', 'update', updates, { settings: updates });
+        if (synced) {
+          if (!options?.silent) {
+            showToast('Pengaturan aplikasi berhasil disinkronkan ke database.', 'success');
+          }
+          syncNow(false, true);
+          return true;
+        }
+        return false;
+      } catch {
+        enqueueOfflineMutation('settings', 'update', updates);
+        return false;
       }
-      return false;
-    } catch {
-      return false;
-    }
-  };
+    },
+    [session?.token, showToast, broadcastSync, syncNow, pushTwoWayMutation, enqueueOfflineMutation]
+  );
 
-  const updateNotificationSettings = async (updates: Partial<NotificationSettings>) => {
-    try {
-      const res = await fetch('/api/notifications', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
-        },
-        body: JSON.stringify(updates),
+  const updateNotificationSettings = useCallback(
+    async (updates: Partial<NotificationSettings>, options?: { silent?: boolean }) => {
+      setNotificationSettings((prev) => {
+        const next = { ...prev, ...updates };
+        try {
+          localStorage.setItem('dkb_cache_notification_settings', JSON.stringify(next));
+        } catch {}
+        return next;
       });
-      if (res.ok) {
-        showToast('Pengaturan notifikasi berhasil diperbarui.', 'success');
-        syncNow();
-        return true;
+      setLocalDataNonce((n) => n + 1);
+
+      try {
+        const res = await fetch('/api/notifications', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+          },
+          body: JSON.stringify(updates),
+        });
+        if (res.ok) {
+          if (!options?.silent) {
+            showToast('Pengaturan notifikasi berhasil diperbarui & disinkronkan.', 'success');
+          }
+          broadcastSync();
+          syncNow(false, true);
+          return true;
+        }
+        const synced = await pushTwoWayMutation(
+          'notification_settings',
+          'update',
+          updates,
+          { notification_settings: updates }
+        );
+        if (synced) {
+          if (!options?.silent) {
+            showToast('Pengaturan notifikasi berhasil disinkronkan ke database.', 'success');
+          }
+          syncNow(false, true);
+          return true;
+        }
+        return false;
+      } catch {
+        enqueueOfflineMutation('notification_settings', 'update', updates);
+        return false;
       }
-      return false;
-    } catch {
-      return false;
-    }
-  };
+    },
+    [session?.token, showToast, broadcastSync, syncNow, pushTwoWayMutation, enqueueOfflineMutation]
+  );
 
   const sendTestEmail = async (email: string) => {
     try {
@@ -2190,25 +2529,144 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const approveLeaveRequest = async (id: string, status: 'approved' | 'rejected', rejectionReason?: string) => {
+    setLeaveRequests((prev) => {
+      const next = prev.map((lr) =>
+        lr.id === id ? { ...lr, status, rejection_reason: rejectionReason || lr.rejection_reason } : lr
+      );
+      try { localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(next)); } catch {}
+      return next;
+    });
+    setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/leave-requests', {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ id, status, rejectionReason }),
       });
       if (res.ok) {
-        showToast(`Pengajuan izin berhasil di${status === 'approved' ? 'setujui' : 'tolak'}.`, 'success');
-        syncNow();
+        showToast(`Pengajuan izin berhasil di${status === 'approved' ? 'setujui' : 'tolak'} & disinkronkan.`, 'success');
+        broadcastSync();
+        syncNow(false, true);
         return true;
       }
-      return false;
+      const synced = await pushTwoWayMutation('leave_requests', 'update', {
+        id,
+        status,
+        rejection_reason: rejectionReason,
+      });
+      if (synced) syncNow(false, true);
+      return synced;
     } catch {
+      enqueueOfflineMutation('leave_requests', 'update', { id, status, rejection_reason: rejectionReason });
       return false;
     }
   };
+
+  // Auto-persist Google Cloud Console Client ID between database settings and local app cache
+  useEffect(() => {
+    if (!hasSyncedOnce) return;
+    const dbClientId = (settings.google_client_id || '').trim();
+    const localClientId =
+      typeof window !== 'undefined'
+        ? (localStorage.getItem('dkb_google_client_id') || '').trim()
+        : '';
+
+    if (dbClientId) {
+      if (localClientId !== dbClientId) {
+        setCustomGoogleClientId(dbClientId);
+      }
+    } else if (localClientId) {
+      // Server DB did not have the custom Client ID yet -> auto-save it to DB silently
+      updateSettings({ google_client_id: localClientId }, { silent: true });
+    }
+  }, [hasSyncedOnce, settings.google_client_id, updateSettings]);
+
+  // Automatic Background Google Sheets Sync (1.5s debounced whenever data/settings change while OAuth token is active)
+  useEffect(() => {
+    if (!hasSyncedOnce || !hasValidGoogleToken()) return;
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+
+    const sig = JSON.stringify({
+      v: serverVersion,
+      n: localDataNonce,
+      s: students.length,
+      c: classes.length,
+      se: sessions.length,
+      a: attendance.length,
+      o: outOfClass.length,
+      vi: violations.length,
+      sn: settings.school_name,
+      gc: settings.google_client_id,
+      gs: settings.google_sheet_id,
+    });
+
+    if (sig === lastAutoSheetSigRef.current || isAutoSheetSyncingRef.current) {
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      if (isAutoSheetSyncingRef.current || !hasValidGoogleToken()) return;
+      isAutoSheetSyncingRef.current = true;
+      try {
+        const token = await getAccessToken();
+        if (!token) return;
+
+        let sheetId = settings.google_sheet_id;
+        if (!sheetId) {
+          const folder = await getOrCreateDriveFolder(token);
+          const sheet = await getOrCreateSpreadsheet(token, folder.folderId);
+          sheetId = sheet.spreadsheetId;
+          await updateSettings(
+            {
+              google_drive_folder_id: folder.folderId,
+              google_drive_folder_url: folder.folderUrl,
+              google_sheet_id: sheet.spreadsheetId,
+              google_sheet_url: sheet.spreadsheetUrl,
+            },
+            { silent: true }
+          );
+        }
+
+        if (sheetId) {
+          await syncAllDataToGoogleSheets(token, sheetId, {
+            students,
+            classes,
+            sessions,
+            attendance,
+            outOfClass,
+            violations,
+            settings,
+          });
+          lastAutoSheetSigRef.current = sig;
+          await updateSettings(
+            { google_last_synced_at: new Date().toISOString() },
+            { silent: true }
+          );
+        }
+      } catch (err) {
+        console.warn('[Auto Google Sheets Sync]:', err);
+      } finally {
+        isAutoSheetSyncingRef.current = false;
+      }
+    }, 1500);
+
+    return () => clearTimeout(timer);
+  }, [
+    hasSyncedOnce,
+    serverVersion,
+    localDataNonce,
+    students,
+    classes,
+    sessions,
+    attendance,
+    outOfClass,
+    violations,
+    settings,
+    updateSettings,
+  ]);
 
   return (
     <AppContext.Provider

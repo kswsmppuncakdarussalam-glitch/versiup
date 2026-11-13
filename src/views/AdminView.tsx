@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Sliders,
   Users,
@@ -140,12 +140,18 @@ export const AdminView: React.FC = () => {
   const [isClearAllModalOpen, setIsClearAllModalOpen] = useState(false);
   const [isDeletingBulk, setIsDeletingBulk] = useState(false);
   const [isGoogleModalOpen, setIsGoogleModalOpen] = useState(false);
-  const [customClientIdInput, setCustomClientIdInput] = useState(() => getGoogleClientId());
+  const [customClientIdInput, setCustomClientIdInput] = useState(() => getGoogleClientId(settings.google_client_id));
+  const [clientIdAutoStatus, setClientIdAutoStatus] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const clientIdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showClientIdConfig, setShowClientIdConfig] = useState(false);
   const [isEditingDriveIds, setIsEditingDriveIds] = useState(false);
   const [inlineSheetIdInput, setInlineSheetIdInput] = useState('');
   const [inlineFolderIdInput, setInlineFolderIdInput] = useState('');
   const [isManualMultiSyncing, setIsManualMultiSyncing] = useState(false);
+  const [ttsPresentInput, setTtsPresentInput] = useState(settings.tts_template_present || '');
+  const [ttsLateInput, setTtsLateInput] = useState(settings.tts_template_late || '');
+  const ttsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const schoolNameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleOpenInlineEdit = () => {
     setInlineSheetIdInput(settings.google_sheet_url || settings.google_sheet_id || '');
@@ -258,6 +264,36 @@ export const AdminView: React.FC = () => {
   useEffect(() => {
     setLogoUrlInput(settings.logo_url || '');
   }, [settings.logo_url]);
+
+  useEffect(() => {
+    const resolved = getGoogleClientId(settings.google_client_id);
+    setCustomClientIdInput((prev) => (prev === resolved ? prev : resolved));
+  }, [settings.google_client_id]);
+
+  useEffect(() => {
+    setTtsPresentInput(settings.tts_template_present || '');
+  }, [settings.tts_template_present]);
+
+  useEffect(() => {
+    setTtsLateInput(settings.tts_template_late || '');
+  }, [settings.tts_template_late]);
+
+  useEffect(() => {
+    if (notificationSettings.weekly_recap_day !== undefined) {
+      setWeeklyRecapDay(notificationSettings.weekly_recap_day);
+    }
+    if (notificationSettings.weekly_recap_time) {
+      setWeeklyRecapTime(notificationSettings.weekly_recap_time);
+    }
+  }, [notificationSettings.weekly_recap_day, notificationSettings.weekly_recap_time]);
+
+  useEffect(() => {
+    return () => {
+      if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
+      if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
+      if (schoolNameTimerRef.current) clearTimeout(schoolNameTimerRef.current);
+    };
+  }, []);
 
   // Fetch all user accounts from server
   const fetchUsers = async () => {
@@ -2045,7 +2081,22 @@ export const AdminView: React.FC = () => {
                   <input
                     type="text"
                     value={schoolNameInput}
-                    onChange={(e) => setSchoolNameInput(e.target.value)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setSchoolNameInput(val);
+                      if (schoolNameTimerRef.current) clearTimeout(schoolNameTimerRef.current);
+                      schoolNameTimerRef.current = setTimeout(() => {
+                        if (val.trim() !== (settings.school_name || '').trim()) {
+                          updateSettings({ school_name: val.trim() }, { silent: true });
+                        }
+                      }, 600);
+                    }}
+                    onBlur={() => {
+                      if (schoolNameTimerRef.current) clearTimeout(schoolNameTimerRef.current);
+                      if (schoolNameInput.trim() !== (settings.school_name || '').trim()) {
+                        updateSettings({ school_name: schoolNameInput.trim() }, { silent: true });
+                      }
+                    }}
                     placeholder="Contoh: SMK BISA HEBAT NUSANTARA / SMAN 1..."
                     maxLength={80}
                     className="w-full px-3 py-2.5 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-sm focus:outline-hidden focus:ring-2 focus:ring-indigo-500 font-medium"
@@ -2718,25 +2769,57 @@ export const AdminView: React.FC = () => {
 
           <div className="space-y-3">
             <div>
-              <label className="block text-slate-500 mb-1">
-                Template Kalimat Hadir Tepat Waktu (Variabel: &#123;nama&#125;, &#123;kelas&#125;, &#123;sesi&#125;)
-              </label>
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-slate-500">
+                  Template Kalimat Hadir Tepat Waktu (Variabel: &#123;nama&#125;, &#123;kelas&#125;, &#123;sesi&#125;)
+                </label>
+                <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">Tersimpan otomatis</span>
+              </div>
               <input
                 type="text"
-                value={settings.tts_template_present}
-                onChange={(e) => updateSettings({ tts_template_present: e.target.value })}
+                value={ttsPresentInput}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setTtsPresentInput(val);
+                  if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
+                  ttsTimerRef.current = setTimeout(() => {
+                    updateSettings({ tts_template_present: val }, { silent: true });
+                  }, 500);
+                }}
+                onBlur={() => {
+                  if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
+                  if (ttsPresentInput !== settings.tts_template_present) {
+                    updateSettings({ tts_template_present: ttsPresentInput }, { silent: true });
+                  }
+                }}
                 className="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
               />
             </div>
 
             <div>
-              <label className="block text-slate-500 mb-1">
-                Template Kalimat Terlambat (Variabel: &#123;nama&#125;, &#123;menit&#125;, &#123;sesi&#125;)
-              </label>
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-slate-500">
+                  Template Kalimat Terlambat (Variabel: &#123;nama&#125;, &#123;menit&#125;, &#123;sesi&#125;)
+                </label>
+                <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">Tersimpan otomatis</span>
+              </div>
               <input
                 type="text"
-                value={settings.tts_template_late}
-                onChange={(e) => updateSettings({ tts_template_late: e.target.value })}
+                value={ttsLateInput}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setTtsLateInput(val);
+                  if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
+                  ttsTimerRef.current = setTimeout(() => {
+                    updateSettings({ tts_template_late: val }, { silent: true });
+                  }, 500);
+                }}
+                onBlur={() => {
+                  if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
+                  if (ttsLateInput !== settings.tts_template_late) {
+                    updateSettings({ tts_template_late: ttsLateInput }, { silent: true });
+                  }
+                }}
                 className="w-full px-3 py-2 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
               />
             </div>
@@ -2864,7 +2947,11 @@ export const AdminView: React.FC = () => {
                   </label>
                   <select
                     value={weeklyRecapDay}
-                    onChange={(e) => setWeeklyRecapDay(parseInt(e.target.value))}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value, 10);
+                      setWeeklyRecapDay(val);
+                      updateNotificationSettings({ weekly_recap_day: val }, { silent: true });
+                    }}
                     className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs"
                   >
                     <option value="1">Setiap Senin</option>
@@ -2884,25 +2971,20 @@ export const AdminView: React.FC = () => {
                   <input
                     type="time"
                     value={weeklyRecapTime}
-                    onChange={(e) => setWeeklyRecapTime(e.target.value)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setWeeklyRecapTime(val);
+                      updateNotificationSettings({ weekly_recap_time: val }, { silent: true });
+                    }}
                     className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-mono"
                   />
                 </div>
 
                 <div className="flex items-end">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      updateNotificationSettings({
-                        weekly_recap_day: weeklyRecapDay,
-                        weekly_recap_time: weeklyRecapTime,
-                      });
-                      showToast('Jadwal rekap mingguan berhasil diperbarui.', 'success');
-                    }}
-                    className="w-full py-1.5 px-3 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold text-xs hover:bg-slate-800"
-                  >
-                    Simpan Jadwal Pengiriman
-                  </button>
+                  <div className="w-full py-1.5 px-3 rounded bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 font-semibold text-xs text-center flex items-center justify-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Jadwal Tersimpan Otomatis</span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -3032,24 +3114,25 @@ export const AdminView: React.FC = () => {
                   <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
                     Basis Data Google Drive & Google Sheets
                     <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${googleSheetsConnected ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
-                      {googleSheetsConnected ? 'Cloud Google Aktif' : 'Penyimpanan Lokal Aktif'}
+                      {googleSheetsConnected ? 'Sinkronisasi Otomatis Aktif' : 'Penyimpanan Lokal Aktif'}
                     </span>
                   </h2>
                   <p className="text-slate-500">
-                    Hubungkan akun Google Anda. Aplikasi secara otomatis membuat folder khusus di Google Drive dan spreadsheet multi-tabel di Google Sheets.
+                    Setiap perubahan data dan pengaturan otomatis tersimpan ke database dan disinkronkan ke Google Sheets secara real-time tanpa perlu klik sinkronisasi manual.
                   </p>
                 </div>
               </div>
 
-              {/* Action: Sync now */}
+              {/* Action: Optional manual sync trigger */}
               <button
                 type="button"
                 disabled={googleSyncing}
                 onClick={() => syncGoogleSheetsNow()}
-                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold shadow-xs disabled:opacity-50 transition-colors shrink-0"
+                className="flex items-center gap-2 px-3.5 py-2 rounded-lg border border-emerald-200 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:hover:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 font-semibold disabled:opacity-50 transition-colors shrink-0"
+                title="Sinkronisasi berjalan otomatis di latar belakang; klik jika ingin paksa sinkron ulang sekarang"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${googleSyncing ? 'animate-spin' : ''}`} />
-                <span>{googleSyncing ? 'Menyinkronkan...' : 'Sinkronkan ke Google Sheets'}</span>
+                <span>{googleSyncing ? 'Menyinkronkan...' : 'Sinkron Ulang Manual (Opsional)'}</span>
               </button>
             </div>
 
@@ -3127,11 +3210,11 @@ export const AdminView: React.FC = () => {
                         type="button"
                         disabled={googleSyncing}
                         onClick={() => syncGoogleSheetsNow()}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold transition-colors shadow-xs disabled:opacity-50"
-                        title="Kirim dan sinkronkan data terkini ke Google Sheets & Google Drive"
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 font-semibold transition-colors disabled:opacity-50"
+                        title="Sinkronisasi otomatis selalu aktif; klik untuk paksa sinkron ulang Google Sheets"
                       >
                         <RefreshCw className={`w-3.5 h-3.5 ${googleSyncing ? 'animate-spin' : ''}`} />
-                        <span>{googleSyncing ? 'Menyinkronkan...' : 'Sinkronkan Sekarang'}</span>
+                        <span>{googleSyncing ? 'Menyinkronkan...' : 'Sinkron Ulang Sheets'}</span>
                       </button>
 
                       <button
@@ -3225,13 +3308,39 @@ export const AdminView: React.FC = () => {
                   </div>
 
                   <div>
-                    <label className="block font-semibold text-slate-700 dark:text-slate-300 text-[11px] mb-1">
-                      OAuth 2.0 Web Client ID (dari console.cloud.google.com):
-                    </label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block font-semibold text-slate-700 dark:text-slate-300 text-[11px]">
+                        OAuth 2.0 Web Client ID (dari console.cloud.google.com):
+                      </label>
+                      <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                        {clientIdAutoStatus === 'saving' ? 'Menyimpan otomatis...' : 'Tersimpan otomatis ke database & aplikasi'}
+                      </span>
+                    </div>
                     <input
                       type="text"
                       value={customClientIdInput}
-                      onChange={(e) => setCustomClientIdInput(e.target.value)}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setCustomClientIdInput(val);
+                        setClientIdAutoStatus('saving');
+                        if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
+                        clientIdTimerRef.current = setTimeout(async () => {
+                          const cleaned = val.trim();
+                          setCustomGoogleClientId(cleaned);
+                          await updateSettings({ google_client_id: cleaned }, { silent: true });
+                          setClientIdAutoStatus('saved');
+                        }, 500);
+                      }}
+                      onBlur={async () => {
+                        if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
+                        const cleaned = customClientIdInput.trim();
+                        if (cleaned !== (settings.google_client_id || '').trim()) {
+                          setClientIdAutoStatus('saving');
+                          setCustomGoogleClientId(cleaned);
+                          await updateSettings({ google_client_id: cleaned }, { silent: true });
+                          setClientIdAutoStatus('saved');
+                        }
+                      }}
                       placeholder="contoh: 1049823447787-xxxx.apps.googleusercontent.com"
                       className="w-full px-3 py-1.5 text-xs font-mono bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-800 dark:text-slate-100 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                     />
@@ -3239,17 +3348,18 @@ export const AdminView: React.FC = () => {
 
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-[11px] text-slate-500">
-                      Pastikan URL asal aplikasi di atas didaftarkan di <strong>Authorized JavaScript origins</strong> pada Client ID ini.
+                      ID Cloud Console langsung disimpan otomatis ke database agar tidak perlu dimasukkan ulang di perangkat lain.
                     </p>
                     <div className="flex items-center gap-2 shrink-0">
                       <button
                         type="button"
                         onClick={async () => {
-                          setCustomGoogleClientId('');
-                          await updateSettings({ google_client_id: '' });
-                          setCustomClientIdInput(getGoogleClientId());
-                          showToast('Client ID dikembalikan ke bawaan.', 'info');
-                          setShowClientIdConfig(false);
+                          const defaultId = '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com';
+                          setCustomGoogleClientId(defaultId);
+                          await updateSettings({ google_client_id: defaultId }, { silent: true });
+                          setCustomClientIdInput(defaultId);
+                          setClientIdAutoStatus('saved');
+                          showToast('Client ID dikembalikan ke bawaan & disimpan ke database.', 'info');
                         }}
                         className="px-2.5 py-1 text-[11px] font-semibold text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
                       >
@@ -3258,15 +3368,16 @@ export const AdminView: React.FC = () => {
                       <button
                         type="button"
                         onClick={async () => {
+                          if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
                           const cleaned = customClientIdInput.trim();
                           setCustomGoogleClientId(cleaned);
                           await updateSettings({ google_client_id: cleaned });
-                          showToast('Client ID Google Console disimpan ke database!', 'success');
+                          setClientIdAutoStatus('saved');
                           setShowClientIdConfig(false);
                         }}
                         className="px-3 py-1 text-[11px] font-semibold text-white bg-slate-900 hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 rounded-lg shadow-xs"
                       >
-                        Simpan Client ID
+                        Simpan &amp; Tutup
                       </button>
                     </div>
                   </div>
@@ -3475,10 +3586,10 @@ export const AdminView: React.FC = () => {
               <div>
                 <h3 className="font-bold text-slate-900 dark:text-white flex items-center gap-2">
                   <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-                  Status Sinkronisasi Multi-Device Real-Time (Semua Perangkat &amp; Pengguna)
+                  Sinkronisasi Multi-Perangkat Otomatis Real-Time (Aktif di Semua Perangkat)
                 </h3>
                 <p className="text-slate-500 text-[11px] mt-0.5">
-                  Setiap mutasi presensi, izin keluar, dan pelanggaran otomatis disinkronkan ke seluruh HP/laptop petugas piket, wali kelas, dan kesiswaan.
+                  Berjalan otomatis setiap 2.5 detik dan seketika antar-tab tanpa perlu klik tombol sinkronisasi. Setiap perubahan siswa, kelas, sesi, presensi, izin keluar, pelanggaran, dan pengaturan langsung tersinkron ke seluruh perangkat.
                 </p>
               </div>
 
@@ -3489,15 +3600,16 @@ export const AdminView: React.FC = () => {
                   setIsManualMultiSyncing(true);
                   try {
                     await syncNow();
-                    showToast(`Sinkronisasi berhasil! Versi data server: v${serverVersion} (terkini).`, 'success');
+                    showToast(`Sinkronisasi terkini: Versi data server v${serverVersion}.`, 'success');
                   } finally {
                     setIsManualMultiSyncing(false);
                   }
                 }}
-                className="flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-xs disabled:opacity-50 transition-colors shrink-0"
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-emerald-200 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 font-semibold text-xs disabled:opacity-50 transition-colors shrink-0"
+                title="Sinkronisasi multi-perangkat berjalan otomatis setiap 2.5 detik"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${isManualMultiSyncing ? 'animate-spin' : ''}`} />
-                <span>{isManualMultiSyncing ? 'Menyinkronkan...' : 'Sinkronkan Multi-Perangkat Sekarang'}</span>
+                <span>{isManualMultiSyncing ? 'Menyegarkan...' : 'Otomatis Aktif (Refresh Manual)'}</span>
               </button>
             </div>
 

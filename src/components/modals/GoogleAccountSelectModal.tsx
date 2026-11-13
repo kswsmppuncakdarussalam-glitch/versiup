@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   X,
   CheckCircle,
@@ -77,15 +77,24 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
     }
   }, [isOpen]);
 
+  const clientIdDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [clientIdSavedIndicator, setClientIdSavedIndicator] = useState<'idle' | 'saving' | 'saved'>('idle');
+
   useEffect(() => {
     if (isOpen) {
-      setCustomIdInput(settings.google_client_id || getGoogleClientId());
+      setCustomIdInput(getGoogleClientId(settings.google_client_id));
       setManualSheetInput(settings.google_sheet_url || settings.google_sheet_id || '');
       setManualFolderInput(settings.google_drive_folder_url || settings.google_drive_folder_id || '');
       setEmailInput(settings.google_account_email || officialEmail);
       setNameInput(settings.google_account_name || officialName);
     }
   }, [isOpen, settings.google_client_id, settings.google_sheet_url, settings.google_sheet_id, settings.google_drive_folder_url, settings.google_drive_folder_id, settings.google_account_email, settings.google_account_name]);
+
+  useEffect(() => {
+    return () => {
+      if (clientIdDebounceRef.current) clearTimeout(clientIdDebounceRef.current);
+    };
+  }, []);
 
   if (!isOpen) return null;
 
@@ -105,11 +114,29 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
     }
   };
 
-  const handleSaveClientId = async () => {
-    const cleaned = customIdInput.trim();
+  const persistClientId = async (rawValue: string, showFeedback = false) => {
+    const cleaned = rawValue.trim();
+    setClientIdSavedIndicator('saving');
     setCustomGoogleClientId(cleaned);
-    await updateSettings({ google_client_id: cleaned });
-    showToast(cleaned ? 'Client ID Google Cloud Console disimpan!' : 'Client ID dikembalikan ke bawaan.', 'success');
+    await updateSettings({ google_client_id: cleaned }, { silent: !showFeedback });
+    setClientIdSavedIndicator('saved');
+    if (showFeedback) {
+      showToast(cleaned ? 'Client ID Google Cloud Console tersimpan ke database!' : 'Client ID dikembalikan ke bawaan.', 'success');
+    }
+  };
+
+  const handleClientIdChange = (val: string) => {
+    setCustomIdInput(val);
+    setClientIdSavedIndicator('saving');
+    if (clientIdDebounceRef.current) clearTimeout(clientIdDebounceRef.current);
+    clientIdDebounceRef.current = setTimeout(() => {
+      persistClientId(val, false);
+    }, 500);
+  };
+
+  const handleSaveClientId = async () => {
+    if (clientIdDebounceRef.current) clearTimeout(clientIdDebounceRef.current);
+    await persistClientId(customIdInput, true);
   };
 
   const handleSaveManualSheet = async (e: React.FormEvent) => {
@@ -366,22 +393,23 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
 
               {/* Client ID Input */}
               <div className="space-y-1.5 bg-white dark:bg-slate-900 p-3 rounded-xl border border-slate-200 dark:border-slate-800">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2">
                   <label className="block text-[11px] font-bold text-slate-800 dark:text-slate-200">
                     OAuth 2.0 Web Client ID (Google Cloud Console):
                   </label>
-                  <button
-                    type="button"
-                    onClick={handleSaveClientId}
-                    className="text-[11px] font-bold text-blue-600 dark:text-blue-400 hover:underline"
-                  >
-                    Simpan Client ID
-                  </button>
+                  <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                    {clientIdSavedIndicator === 'saving' ? 'Menyimpan otomatis...' : 'Tersimpan otomatis ke database'}
+                  </span>
                 </div>
                 <input
                   type="text"
                   value={customIdInput}
-                  onChange={(e) => setCustomIdInput(e.target.value)}
+                  onChange={(e) => handleClientIdChange(e.target.value)}
+                  onBlur={() => {
+                    if (customIdInput.trim() !== (settings.google_client_id || '').trim()) {
+                      persistClientId(customIdInput, false);
+                    }
+                  }}
                   placeholder="contoh: 1049823447787-xxxx.apps.googleusercontent.com"
                   className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-mono text-[11px] text-slate-900 dark:text-white"
                 />

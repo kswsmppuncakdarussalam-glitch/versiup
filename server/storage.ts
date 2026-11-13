@@ -138,6 +138,10 @@ class StorageManager {
             this.db.settings.toggle_email_notifications = true;
             modified = true;
           }
+          if (this.db.settings.google_client_id === undefined) {
+            this.db.settings.google_client_id = '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com';
+            modified = true;
+          }
         }
 
         if (modified && this.db) {
@@ -227,13 +231,14 @@ class StorageManager {
     classes?: SchoolClass[];
     students?: Student[];
     sessions?: AttendanceSession[];
+    violation_types?: ViolationType[];
     attendance?: AttendanceRecord[];
     out_of_class?: OutOfClassRecord[];
     violations?: ViolationRecord[];
     leave_requests?: LeaveRequest[];
     settings?: Partial<AppSettings>;
     notification_settings?: Partial<NotificationSettings>;
-    mutations?: Array<{ type: string; action: string; payload: any }>;
+    mutations?: Array<{ type: string; action?: string; payload: any }>;
   }) {
     return this.mutate((db) => {
       const nowIso = new Date().toISOString();
@@ -253,30 +258,48 @@ class StorageManager {
         this.recordChange(db, 'sessions', 'bulk', 'update', db.sessions);
       }
 
+      if (Array.isArray(payload.violation_types)) {
+        db.violation_types = payload.violation_types;
+        this.recordChange(db, 'violation_types', 'bulk', 'update', db.violation_types);
+      }
+
       if (Array.isArray(payload.attendance)) {
         for (const att of payload.attendance) {
+          if (!att || !att.id) continue;
           const idx = db.attendance.findIndex((a) => a.id === att.id);
           if (idx >= 0) db.attendance[idx] = att;
           else db.attendance.unshift(att);
-          this.recordChange(db, 'attendance', att.id, 'insert', att);
+          this.recordChange(db, 'attendance', att.id, idx >= 0 ? 'update' : 'insert', att);
         }
       }
 
       if (Array.isArray(payload.out_of_class)) {
         for (const ooc of payload.out_of_class) {
+          if (!ooc || !ooc.id) continue;
           const idx = db.out_of_class.findIndex((o) => o.id === ooc.id);
           if (idx >= 0) db.out_of_class[idx] = ooc;
           else db.out_of_class.unshift(ooc);
-          this.recordChange(db, 'out_of_class', ooc.id, 'insert', ooc);
+          this.recordChange(db, 'out_of_class', ooc.id, idx >= 0 ? 'update' : 'insert', ooc);
         }
       }
 
       if (Array.isArray(payload.violations)) {
         for (const v of payload.violations) {
+          if (!v || !v.id) continue;
           const idx = db.violations.findIndex((item) => item.id === v.id);
           if (idx >= 0) db.violations[idx] = v;
           else db.violations.unshift(v);
-          this.recordChange(db, 'violations', v.id, 'insert', v);
+          this.recordChange(db, 'violations', v.id, idx >= 0 ? 'update' : 'insert', v);
+        }
+      }
+
+      if (Array.isArray(payload.leave_requests)) {
+        for (const lr of payload.leave_requests) {
+          if (!lr || !lr.id) continue;
+          const idx = db.leave_requests.findIndex((item) => item.id === lr.id);
+          if (idx >= 0) db.leave_requests[idx] = lr;
+          else db.leave_requests.unshift(lr);
+          this.recordChange(db, 'leave_requests', lr.id, idx >= 0 ? 'update' : 'insert', lr);
         }
       }
 
@@ -292,21 +315,216 @@ class StorageManager {
 
       if (Array.isArray(payload.mutations)) {
         for (const m of payload.mutations) {
-          if (m.type === 'attendance' && m.payload) {
-            const idx = db.attendance.findIndex((a) => a.id === m.payload.id);
-            if (idx >= 0) db.attendance[idx] = m.payload;
-            else db.attendance.unshift(m.payload);
-            this.recordChange(db, 'attendance', m.payload.id, 'insert', m.payload);
-          } else if (m.type === 'out_of_class' && m.payload) {
-            const idx = db.out_of_class.findIndex((o) => o.id === m.payload.id);
-            if (idx >= 0) db.out_of_class[idx] = m.payload;
-            else db.out_of_class.unshift(m.payload);
-            this.recordChange(db, 'out_of_class', m.payload.id, 'insert', m.payload);
-          } else if (m.type === 'violations' && m.payload) {
-            const idx = db.violations.findIndex((v) => v.id === m.payload.id);
-            if (idx >= 0) db.violations[idx] = m.payload;
-            else db.violations.unshift(m.payload);
-            this.recordChange(db, 'violations', m.payload.id, 'insert', m.payload);
+          if (!m || !m.type) continue;
+          const action = m.action || 'upsert';
+          const p = m.payload;
+
+          if (m.type === 'settings' && p) {
+            db.settings = { ...db.settings, ...p, updated_at: nowIso };
+            this.recordChange(db, 'settings', 'global', 'update', db.settings);
+          } else if (m.type === 'notification_settings' && p) {
+            db.notification_settings = { ...db.notification_settings, ...p, updated_at: nowIso };
+            this.recordChange(db, 'notification_settings', 'global', 'update', db.notification_settings);
+          } else if (m.type === 'classes' && p) {
+            if (action === 'delete') {
+              const delId = typeof p === 'string' ? p : p.id;
+              const idx = db.classes.findIndex((c) => c.id === delId);
+              if (idx >= 0) {
+                db.classes.splice(idx, 1);
+                this.recordChange(db, 'classes', delId, 'delete');
+              }
+            } else if (p.id) {
+              const cls = { ...p, updated_at: nowIso, created_at: p.created_at || nowIso };
+              const idx = db.classes.findIndex((c) => c.id === cls.id);
+              if (idx >= 0) {
+                db.classes[idx] = cls;
+                this.recordChange(db, 'classes', cls.id, 'update', cls);
+              } else {
+                db.classes.push(cls);
+                this.recordChange(db, 'classes', cls.id, 'insert', cls);
+              }
+            }
+          } else if (m.type === 'students') {
+            if (action === 'clear_all') {
+              db.students = [];
+              this.recordChange(db, 'students', 'bulk', 'update', db.students);
+            } else if (action === 'delete_many') {
+              const nisses: string[] = Array.isArray(p?.nisses) ? p.nisses : Array.isArray(p) ? p : [];
+              const delSet = new Set(nisses);
+              db.students = db.students.filter((s) => !delSet.has(s.nis));
+              for (const nis of nisses) {
+                this.recordChange(db, 'students', nis, 'delete');
+              }
+            } else if (action === 'delete' && p) {
+              const delNis = typeof p === 'string' ? p : p.nis;
+              const idx = db.students.findIndex((s) => s.nis === delNis);
+              if (idx >= 0) {
+                db.students.splice(idx, 1);
+                this.recordChange(db, 'students', delNis, 'delete');
+              }
+            } else if (action === 'batch_import') {
+              const incoming: Student[] = Array.isArray(p?.students) ? p.students : Array.isArray(p) ? p : [];
+              for (const st of incoming) {
+                if (!st?.nis) continue;
+                const s = { ...st, updated_at: nowIso, created_at: st.created_at || nowIso };
+                const idx = db.students.findIndex((x) => x.nis === s.nis);
+                if (idx >= 0) {
+                  db.students[idx] = s;
+                  this.recordChange(db, 'students', s.nis, 'update', s);
+                } else {
+                  db.students.push(s);
+                  this.recordChange(db, 'students', s.nis, 'insert', s);
+                }
+              }
+            } else if (p?.nis) {
+              const s = { ...p, updated_at: nowIso, created_at: p.created_at || nowIso };
+              const idx = db.students.findIndex((x) => x.nis === s.nis);
+              if (idx >= 0) {
+                db.students[idx] = s;
+                this.recordChange(db, 'students', s.nis, 'update', s);
+              } else {
+                db.students.push(s);
+                this.recordChange(db, 'students', s.nis, 'insert', s);
+              }
+            }
+          } else if (m.type === 'sessions' && p) {
+            if (action === 'delete') {
+              const delId = typeof p === 'string' ? p : p.id;
+              const idx = db.sessions.findIndex((s) => s.id === delId);
+              if (idx >= 0) {
+                db.sessions.splice(idx, 1);
+                this.recordChange(db, 'sessions', delId, 'delete');
+              }
+            } else if (p.id) {
+              const sess = { ...p, updated_at: nowIso, created_at: p.created_at || nowIso };
+              const idx = db.sessions.findIndex((s) => s.id === sess.id);
+              if (idx >= 0) {
+                db.sessions[idx] = sess;
+                this.recordChange(db, 'sessions', sess.id, 'update', sess);
+              } else {
+                db.sessions.push(sess);
+                this.recordChange(db, 'sessions', sess.id, 'insert', sess);
+              }
+            }
+          } else if (m.type === 'violation_types' && p) {
+            if (action === 'delete') {
+              const delId = typeof p === 'string' ? p : p.id;
+              const idx = db.violation_types.findIndex((vt) => vt.id === delId);
+              if (idx >= 0) {
+                const isUsed = db.violations.some((v) => v.violation_type_id === delId);
+                if (isUsed) {
+                  db.violation_types[idx].is_active = false;
+                  db.violation_types[idx].updated_at = nowIso;
+                  this.recordChange(db, 'violation_types', delId, 'update', db.violation_types[idx]);
+                } else {
+                  db.violation_types.splice(idx, 1);
+                  this.recordChange(db, 'violation_types', delId, 'delete');
+                }
+              }
+            } else if (p.id) {
+              const vt = { ...p, updated_at: nowIso, created_at: p.created_at || nowIso };
+              const idx = db.violation_types.findIndex((x) => x.id === vt.id);
+              if (idx >= 0) {
+                db.violation_types[idx] = vt;
+                this.recordChange(db, 'violation_types', vt.id, 'update', vt);
+              } else {
+                db.violation_types.push(vt);
+                this.recordChange(db, 'violation_types', vt.id, 'insert', vt);
+              }
+            }
+          } else if (m.type === 'attendance' && p) {
+            if (action === 'delete') {
+              const delId = typeof p === 'string' ? p : p.id;
+              const idx = db.attendance.findIndex((a) => a.id === delId);
+              if (idx >= 0) {
+                db.attendance.splice(idx, 1);
+                this.recordChange(db, 'attendance', delId, 'delete');
+              }
+            } else if (action === 'update' && p.id) {
+              const idx = db.attendance.findIndex((a) => a.id === p.id);
+              if (idx >= 0) {
+                const old = db.attendance[idx];
+                const updated = {
+                  ...old,
+                  ...(p.updates || p),
+                  version: (old.version || 1) + 1,
+                  updated_at: nowIso,
+                };
+                db.attendance[idx] = updated;
+                this.recordChange(db, 'attendance', p.id, 'update', updated);
+              }
+            } else if (p.id && p.student_id) {
+              const idx = db.attendance.findIndex((a) => a.id === p.id);
+              const dup = db.attendance.find(
+                (a) =>
+                  a.student_id === p.student_id &&
+                  a.session_id === p.session_id &&
+                  a.date === p.date
+              );
+              if (idx >= 0) {
+                db.attendance[idx] = p;
+                this.recordChange(db, 'attendance', p.id, 'update', p);
+              } else if (!dup) {
+                db.attendance.unshift(p);
+                this.recordChange(db, 'attendance', p.id, 'insert', p);
+              }
+            }
+          } else if (m.type === 'out_of_class' && p) {
+            if (action === 'delete') {
+              const delId = typeof p === 'string' ? p : p.id;
+              const idx = db.out_of_class.findIndex((o) => o.id === delId);
+              if (idx >= 0) {
+                db.out_of_class.splice(idx, 1);
+                this.recordChange(db, 'out_of_class', delId, 'delete');
+              }
+            } else if (p.id) {
+              const idx = db.out_of_class.findIndex((o) => o.id === p.id);
+              if (idx >= 0) {
+                const updated = { ...db.out_of_class[idx], ...p, updated_at: nowIso };
+                db.out_of_class[idx] = updated;
+                this.recordChange(db, 'out_of_class', p.id, 'update', updated);
+              } else if (p.student_id) {
+                db.out_of_class.unshift(p);
+                this.recordChange(db, 'out_of_class', p.id, 'insert', p);
+              }
+            }
+          } else if (m.type === 'violations' && p) {
+            if (action === 'delete') {
+              const delId = typeof p === 'string' ? p : p.id;
+              const idx = db.violations.findIndex((v) => v.id === delId);
+              if (idx >= 0) {
+                db.violations.splice(idx, 1);
+                this.recordChange(db, 'violations', delId, 'delete');
+              }
+            } else if (p.id && p.student_id) {
+              const idx = db.violations.findIndex((v) => v.id === p.id);
+              if (idx >= 0) {
+                db.violations[idx] = p;
+                this.recordChange(db, 'violations', p.id, 'update', p);
+              } else {
+                db.violations.unshift(p);
+                this.recordChange(db, 'violations', p.id, 'insert', p);
+              }
+            }
+          } else if (m.type === 'leave_requests' && p) {
+            if (action === 'delete') {
+              const delId = typeof p === 'string' ? p : p.id;
+              const idx = db.leave_requests.findIndex((lr) => lr.id === delId);
+              if (idx >= 0) {
+                db.leave_requests.splice(idx, 1);
+                this.recordChange(db, 'leave_requests', delId, 'delete');
+              }
+            } else if (p.id) {
+              const idx = db.leave_requests.findIndex((lr) => lr.id === p.id);
+              if (idx >= 0) {
+                const updated = { ...db.leave_requests[idx], ...p, updated_at: nowIso };
+                db.leave_requests[idx] = updated;
+                this.recordChange(db, 'leave_requests', p.id, 'update', updated);
+              } else {
+                db.leave_requests.unshift({ ...p, created_at: p.created_at || nowIso, updated_at: nowIso });
+                this.recordChange(db, 'leave_requests', p.id, 'insert', p);
+              }
+            }
           }
         }
       }
@@ -314,7 +532,7 @@ class StorageManager {
       const curVer = parseInt(db.meta['current_version'] || '1', 10);
       return {
         success: true,
-        version: curVer,
+        version: curVer + 1,
         serverTime: nowIso,
         data: {
           settings: db.settings,
