@@ -27,7 +27,7 @@ import { getGoogleClientId, setCustomGoogleClientId } from '../../utils/googleWo
 interface GoogleAccountSelectModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onConfirmConnect: () => void;
+  onConfirmConnect: (overrideClientId?: string) => void;
   isLoading: boolean;
   currentEmail?: string;
 }
@@ -392,27 +392,41 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
               </div>
 
               {/* Client ID Input */}
-              <div className="space-y-1.5 bg-white dark:bg-slate-900 p-3 rounded-xl border border-slate-200 dark:border-slate-800">
+              <div className="space-y-2 bg-white dark:bg-slate-900 p-3 rounded-xl border border-slate-200 dark:border-slate-800">
                 <div className="flex items-center justify-between gap-2">
                   <label className="block text-[11px] font-bold text-slate-800 dark:text-slate-200">
-                    OAuth 2.0 Web Client ID (Google Cloud Console):
+                    ID Cloud Console (OAuth 2.0 Web Client ID):
                   </label>
                   <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
-                    {clientIdSavedIndicator === 'saving' ? 'Menyimpan otomatis...' : 'Tersimpan otomatis ke database'}
+                    {clientIdSavedIndicator === 'saving'
+                      ? 'Menyimpan otomatis...'
+                      : 'Tersimpan di DB & sinkron multi-perangkat'}
                   </span>
                 </div>
-                <input
-                  type="text"
-                  value={customIdInput}
-                  onChange={(e) => handleClientIdChange(e.target.value)}
-                  onBlur={() => {
-                    if (customIdInput.trim() !== (settings.google_client_id || '').trim()) {
-                      persistClientId(customIdInput, false);
-                    }
-                  }}
-                  placeholder="contoh: 1049823447787-xxxx.apps.googleusercontent.com"
-                  className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-mono text-[11px] text-slate-900 dark:text-white"
-                />
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    type="text"
+                    value={customIdInput}
+                    onChange={(e) => handleClientIdChange(e.target.value)}
+                    onBlur={() => {
+                      if (customIdInput.trim() !== (settings.google_client_id || '').trim()) {
+                        persistClientId(customIdInput, false);
+                      }
+                    }}
+                    placeholder="contoh: 1049823447787-xxxx.apps.googleusercontent.com"
+                    className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-mono text-[11px] text-slate-900 dark:text-white"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleSaveClientId}
+                    className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-100 font-semibold text-[11px] shrink-0"
+                  >
+                    Simpan ID Cloud
+                  </button>
+                </div>
+                <p className="text-[10px] text-slate-500">
+                  Setelah ID Cloud disimpan ke database, perangkat lain langsung tersinkron otomatis tanpa memasukkan ulang ID Cloud.
+                </p>
               </div>
 
               {/* Iframe notice if inside preview */}
@@ -436,10 +450,12 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                 <button
                   type="button"
                   onClick={async () => {
-                    if (customIdInput.trim() !== (settings.google_client_id || '')) {
-                      await handleSaveClientId();
+                    const cleaned = customIdInput.trim();
+                    if (clientIdDebounceRef.current) clearTimeout(clientIdDebounceRef.current);
+                    if (cleaned !== (settings.google_client_id || '').trim()) {
+                      await persistClientId(cleaned, false);
                     }
-                    onConfirmConnect();
+                    onConfirmConnect(cleaned);
                   }}
                   disabled={isLoading}
                   className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-md transition-all active:scale-[0.99] disabled:opacity-50"
@@ -447,7 +463,7 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                   {isLoading ? (
                     <>
                       <RefreshCw className="w-4 h-4 animate-spin" />
-                      <span>Menghubungkan &amp; Membuat Folder/Sheet...</span>
+                      <span>Menghubungkan &amp; Menyinkronkan Drive + Sheet...</span>
                     </>
                   ) : (
                     <>
@@ -457,7 +473,7 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                         <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
                         <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
                       </svg>
-                      <span>Buka Google OAuth (Otomatis Buat Folder Drive &amp; Spreadsheet)</span>
+                      <span>Simpan ID Cloud &amp; Langsung Sinkronkan Drive + Sheets</span>
                       <ArrowRight className="w-4 h-4" />
                     </>
                   )}

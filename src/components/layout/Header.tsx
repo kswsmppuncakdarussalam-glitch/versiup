@@ -41,6 +41,11 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
   } = useApp();
 
   const isAutoDriveActive = googleOAuthActive || serverDriveSyncActive;
+  const isCloudConfiguredInDb = Boolean(
+    settings.google_client_id?.trim() &&
+      settings.google_account_email?.trim() &&
+      (settings.google_sheet_id?.trim() || settings.google_drive_folder_id?.trim())
+  );
 
   const isLockedMenuOpen = Boolean(session?.lockedMenuRole);
 
@@ -185,6 +190,16 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
             <Database className="w-3 h-3" />
             <span>Auto-Sync Drive & Sheets</span>
           </div>
+        ) : isCloudConfiguredInDb ? (
+          <button
+            type="button"
+            onClick={() => syncGoogleSheetsNow()}
+            title={`ID Cloud & database sekolah (${settings.google_account_email}) sudah tersimpan & tersinkron otomatis ke seluruh perangkat. Klik jika ingin langsung menulis Drive & Sheets dari tab browser ini.`}
+            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:hover:bg-emerald-950/50 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800 transition-colors"
+          >
+            <Database className="w-3 h-3" />
+            <span>Cloud &amp; Multi-Perangkat Aktif</span>
+          </button>
         ) : (
           <button
             type="button"

@@ -168,7 +168,11 @@ class StorageManager {
       const tempFile = `${DB_FILE}.tmp.${Date.now()}.${Math.random().toString(36).substring(2, 6)}`;
       fs.writeFileSync(tempFile, JSON.stringify(db, null, 2), 'utf-8');
       fs.renameSync(tempFile, DB_FILE);
-      this.lastMtimeMs = Date.now();
+      try {
+        this.lastMtimeMs = fs.statSync(DB_FILE).mtimeMs;
+      } catch {
+        this.lastMtimeMs = Date.now();
+      }
     } catch (err) {
       console.warn('[Storage] saveDbSync error (ephemeral cache active):', err);
     }

@@ -55,10 +55,10 @@ interface AppContextType {
   googleSyncing: boolean;
   googleOAuthActive: boolean;
   serverDriveSyncActive: boolean;
-  connectGoogle: (promptSelect?: boolean, emailHint?: string) => Promise<{ success: boolean; error?: string }>;
+  connectGoogle: (promptSelect?: boolean, emailHint?: string, overrideClientId?: string) => Promise<{ success: boolean; error?: string }>;
   disconnectGoogle: () => Promise<void>;
   linkEmailDirectly: (email: string, name?: string) => Promise<{ success: boolean; error?: string }>;
-  syncGoogleSheetsNow: (emailHint?: string) => Promise<{ success: boolean; rowsUpdated?: number; error?: string }>;
+  syncGoogleSheetsNow: (emailHint?: string, overrideClientId?: string) => Promise<{ success: boolean; rowsUpdated?: number; error?: string }>;
 
   // Data
   settings: AppSettings;
@@ -307,7 +307,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const pendingAutoSheetSyncRef = useRef(false);
   const lastAutoSheetSigRef = useRef('');
 
+  const settingsRef = useRef<AppSettings>(settings);
+  settingsRef.current = settings;
   const isSyncingRef = useRef(false);
+  const pendingSyncRef = useRef(false);
+  const pendingBroadcastRef = useRef(false);
   const versionRef = useRef(0);
   versionRef.current = serverVersion;
   const syncChannelRef = useRef<BroadcastChannel | null>(null);
@@ -603,8 +607,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         case 'settings':
           if (data) {
             setSettings(data);
-            if (data.google_client_id && data.google_client_id.trim()) {
-              setCustomGoogleClientId(data.google_client_id.trim());
+            settingsRef.current = data;
+            setCustomGoogleClientId((data.google_client_id || '').trim());
+            setGoogleSheetsConnected(Boolean(data.google_account_email || hasValidGoogleToken() || serverDriveSyncActive));
+            if (data.google_account_email) {
+              setGoogleAccount((prev) => ({
+                email: data.google_account_email,
+                name: data.google_account_name || prev?.name || 'Kesiswaan SMP Puncak Darussalam',
+                photo: data.google_account_photo || prev?.photo,
+                uid: prev?.uid || 'saved_google_account',
+                connectedAt: data.google_last_synced_at || prev?.connectedAt || new Date().toISOString(),
+              }));
             }
             try {
               localStorage.setItem('dkb_cache_settings', JSON.stringify(data));
@@ -643,9 +656,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [session, showToast]);
 
-  // Two-Way Delta Sync with Timeout & Non-Stuttering Updates
+  // Two-Way Delta Sync with Timeout, Follow-up Queueing & Non-Stuttering Updates
   const syncNow = useCallback(async (isManual = false, shouldBroadcast = true) => {
-    if (isSyncingRef.current) return;
+    if (isSyncingRef.current) {
+      pendingSyncRef.current = true;
+      if (shouldBroadcast) pendingBroadcastRef.current = true;
+      return;
+    }
     isSyncingRef.current = true;
     if (isManual) {
       setSyncStatus('syncing');
@@ -726,10 +743,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         // Full Snapshot initialization: Replace with fresh clean server data (purges old demo caches)
         const nextSettings = data.data.settings || defaultSettings;
         setSettings(nextSettings);
+        settingsRef.current = nextSettings;
         setGoogleSheetsConnected(Boolean(nextSettings.google_account_email || hasValidGoogleToken() || data.serverDriveSyncActive));
-        if (nextSettings.google_client_id && nextSettings.google_client_id.trim()) {
-          setCustomGoogleClientId(nextSettings.google_client_id.trim());
-        }
+        setCustomGoogleClientId((nextSettings.google_client_id || '').trim());
         setClasses(data.data.classes || []);
         setSessions(data.data.sessions || []);
         setStudents(data.data.students || []);
@@ -785,8 +801,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       clearTimeout(timeoutId);
       isSyncingRef.current = false;
       setIsInitialLoading(false);
+      if (pendingSyncRef.current) {
+        const shouldBcast = pendingBroadcastRef.current;
+        pendingSyncRef.current = false;
+        pendingBroadcastRef.current = false;
+        setTimeout(() => {
+          syncNow(false, shouldBcast);
+        }, 50);
+      }
     }
-  }, [session, applyDeltaChanges, showToast, broadcastSync]);
+  }, [session, applyDeltaChanges, showToast, broadcastSync, serverDriveSyncActive]);
 
   // Initial Sync on Mount (Instant and non-blocking)
   useEffect(() => {
@@ -1369,12 +1393,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   ]);
 
   // Google Workspace Integration Actions
-  const connectGoogle = async (promptSelect: boolean = true, emailHint?: string) => {
+  const connectGoogle = async (promptSelect: boolean = true, emailHint?: string, overrideClientId?: string) => {
     try {
       setGoogleSyncing(true);
-      const targetHint = emailHint || settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com';
+      const latestSettings = settingsRef.current;
+      const targetHint = emailHint || latestSettings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com';
+      const targetClientId =
+        overrideClientId !== undefined
+          ? overrideClientId.trim()
+          : (latestSettings.google_client_id || '').trim();
       showToast(`Membuka OAuth 2.0 Cloud Console untuk ${targetHint}...`, 'info');
-      const res = await signInWithGoogle(promptSelect, settings.google_client_id, targetHint);
+      const res = await signInWithGoogle(promptSelect, targetClientId, targetHint);
       if (res.cancelled || !res.accessToken) {
         showToast('Pemilihan akun Google dibatalkan.', 'info');
         return { success: false };
@@ -1404,7 +1433,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       showToast(`Menghubungkan & menyinkronkan Drive + Sheets (${accountInfo.email})...`, 'info');
 
       const nextSettingsSnapshot: AppSettings = {
-        ...settings,
+        ...settingsRef.current,
+        ...(targetClientId ? { google_client_id: targetClientId } : {}),
         google_account_email: accountInfo.email,
         google_account_name: accountInfo.name,
         google_account_photo: accountInfo.photo,
@@ -1516,14 +1546,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const syncGoogleSheetsNow = async (emailHint?: string) => {
+  const syncGoogleSheetsNow = async (emailHint?: string, overrideClientId?: string) => {
     try {
       setGoogleSyncing(true);
       let token = await getAccessToken();
-      const targetHint = emailHint || settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com';
+      const latestSettings = settingsRef.current;
+      const targetHint = emailHint || latestSettings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com';
+      const targetClientId =
+        overrideClientId !== undefined
+          ? overrideClientId.trim()
+          : (latestSettings.google_client_id || '').trim();
       if (!token) {
         showToast(`Meminta otorisasi OAuth Google untuk ${targetHint}...`, 'info');
-        const res = await signInWithGoogle(false, settings.google_client_id, targetHint);
+        const res = await signInWithGoogle(false, targetClientId, targetHint);
         if (res.cancelled || !res.accessToken) {
           showToast('Otorisasi Google diperlukan untuk sinkronisasi otomatis ke Drive & Sheets.', 'info');
           return { success: false };
@@ -1553,7 +1588,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         violations,
         leaveRequests,
         violationTypes,
-        settings,
+        settings: settingsRef.current,
         notificationSettings,
       });
 
@@ -1602,12 +1637,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           ),
         });
         if (res.ok) {
-          const data = await res.json().catch(() => null);
-          if (data?.version) {
-            setServerVersion(data.version);
-            versionRef.current = data.version;
-            try { localStorage.setItem('dkb_cache_version', String(data.version)); } catch {}
-          }
           broadcastSync();
           return true;
         }
@@ -2453,9 +2482,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const updateSettings = useCallback(
     async (updates: Partial<AppSettings>, options?: { silent?: boolean }) => {
-      // Optimistic state and local storage update for instant reactivity
+      settingsRef.current = { ...settingsRef.current, ...updates };
       setSettings((prev) => {
         const next = { ...prev, ...updates };
+        settingsRef.current = next;
         try {
           localStorage.setItem('dkb_cache_settings', JSON.stringify(next));
         } catch {}
@@ -2654,7 +2684,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  // Auto-persist Google Cloud Console Client ID between database settings and local app cache
+  // Keep local Client ID mirror strictly synchronized with authoritative server DB settings
   useEffect(() => {
     if (!hasSyncedOnce) return;
     const dbClientId = (settings.google_client_id || '').trim();
@@ -2663,15 +2693,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ? (localStorage.getItem('dkb_google_client_id') || '').trim()
         : '';
 
-    if (dbClientId) {
-      if (localClientId !== dbClientId) {
-        setCustomGoogleClientId(dbClientId);
-      }
-    } else if (localClientId) {
-      // Server DB did not have the custom Client ID yet -> auto-save it to DB silently
-      updateSettings({ google_client_id: localClientId }, { silent: true });
+    if (localClientId !== dbClientId) {
+      setCustomGoogleClientId(dbClientId);
     }
-  }, [hasSyncedOnce, settings.google_client_id, updateSettings]);
+  }, [hasSyncedOnce, settings.google_client_id]);
 
   const latestDrivePayloadRef = useRef({
     driveSheetSignature,
