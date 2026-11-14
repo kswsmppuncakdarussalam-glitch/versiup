@@ -142,6 +142,10 @@ class StorageManager {
             this.db.settings.google_client_id = '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com';
             modified = true;
           }
+          if (this.db.settings.google_oauth_connected === undefined) {
+            this.db.settings.google_oauth_connected = false;
+            modified = true;
+          }
         }
 
         if (modified && this.db) {
@@ -1610,6 +1614,7 @@ class StorageManager {
         google_account_email: 'kswsmp.puncakdarussalam@gmail.com',
         google_account_name: 'Kesiswaan SMP Puncak Darussalam',
         google_client_id: '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com',
+        google_oauth_connected: false,
         updated_at: now,
       },
       notification_settings: {

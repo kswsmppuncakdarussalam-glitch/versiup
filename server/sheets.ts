@@ -49,13 +49,49 @@ export class GoogleSheetsClient {
 
   private autoSyncTimer: ReturnType<typeof setTimeout> | null = null;
   private driveBackupFileId: string = '';
+  private oauthAccessToken: string = '';
+  private oauthExpiresAt: number = 0;
+  private oauthEmail: string = '';
+  private oauthTokenExpired: boolean = false;
 
   get isConnected(): boolean {
-    return this.isConfigured;
+    return this.isConfigured || this.hasValidOAuthToken();
+  }
+
+  get isOAuthExpired(): boolean {
+    return this.oauthTokenExpired;
   }
 
   get sheetId(): string {
     return this.spreadsheetId;
+  }
+
+  public hasValidOAuthToken(): boolean {
+    if (!this.oauthAccessToken) return false;
+    if (this.oauthExpiresAt > 0 && Date.now() >= this.oauthExpiresAt - 30000) {
+      this.oauthAccessToken = '';
+      this.oauthExpiresAt = 0;
+      this.oauthTokenExpired = true;
+      return false;
+    }
+    return true;
+  }
+
+  public setOAuthSession(accessToken: string, expiresInSeconds?: number, email?: string): void {
+    const clean = (accessToken || '').trim();
+    if (!clean) return;
+    this.oauthAccessToken = clean;
+    const ttl = typeof expiresInSeconds === 'number' && expiresInSeconds > 120 ? expiresInSeconds : 3500;
+    this.oauthExpiresAt = Date.now() + ttl * 1000;
+    this.oauthEmail = email || this.oauthEmail;
+    this.oauthTokenExpired = false;
+  }
+
+  public clearOAuthSession(): void {
+    this.oauthAccessToken = '';
+    this.oauthExpiresAt = 0;
+    this.oauthEmail = '';
+    this.oauthTokenExpired = false;
   }
 
   /**
@@ -127,7 +163,7 @@ export class GoogleSheetsClient {
    * Schedule non-blocking debounced sync of entire DB to Google Drive & Google Sheets
    */
   public scheduleAutoSync(getSnapshot: () => any) {
-    if (!this.isConfigured) return;
+    if (!this.isConnected) return;
     if (this.autoSyncTimer) {
       clearTimeout(this.autoSyncTimer);
     }
@@ -137,14 +173,16 @@ export class GoogleSheetsClient {
       this.syncFullDatabase(db).catch((err) => {
         console.warn('[GoogleSheetsClient Auto-Sync Warning]:', err?.message || err);
       });
-    }, 1000);
+    }, 800);
   }
 
   /**
    * Synchronize all tables to Google Sheets and JSON backup to Google Drive
    */
   public async syncFullDatabase(db: any): Promise<void> {
-    if (!this.isConfigured || !this.sheetsService || !this.driveService) return;
+    const useServiceAccount = Boolean(this.isConfigured && this.sheetsService && this.driveService);
+    const useOAuthToken = !useServiceAccount && this.hasValidOAuthToken();
+    if (!useServiceAccount && !useOAuthToken) return;
 
     const targetSheetId =
       this.spreadsheetId ||
@@ -159,19 +197,199 @@ export class GoogleSheetsClient {
         : '');
 
     await writeQueue.enqueue(async () => {
-      // 1. Sync to Google Sheets if a valid Spreadsheet ID is available
+      const students = db.students || [];
+      const classes = db.classes || [];
+      const sessions = db.sessions || [];
+      const attendance = db.attendance || [];
+      const outOfClass = db.out_of_class || [];
+      const violations = db.violations || [];
+      const leaveRequests = db.leave_requests || [];
+      const violationTypes = db.violation_types || [];
+      const settings = db.settings || {};
+      const studentMap = new Map<string, any>(students.map((s: any) => [s.nis, s]));
+      const requiredSheets = [
+        'Siswa',
+        'Kelas',
+        'Sesi_Presensi',
+        'Presensi',
+        'Izin_Keluar',
+        'Pelanggaran',
+        'Izin_Tidak_Masuk',
+        'Jenis_Pelanggaran',
+        'Pengaturan',
+      ];
+
+      const buildDataPayload = () => [
+        {
+          range: 'Siswa!A1',
+          values: [
+            ['NIS', 'Nama Siswa', 'Kelas', 'Jenis Kelamin', 'RFID UID', 'Kode Kartu/NIS', 'Nama Orang Tua', 'Email Orang Tua', 'Status Keaktifan'],
+            ...students.map((s: any) => [s.nis, s.name, s.class_id, s.gender === 'L' ? 'Laki-laki' : 'Perempuan', s.rfid_uid || '-', s.card_code || s.nis, s.parent_name || '-', s.parent_email || '-', 'Aktif']),
+          ],
+        },
+        {
+          range: 'Kelas!A1',
+          values: [
+            ['ID Kelas', 'Nama Kelas', 'Tingkat', 'Jurusan', 'Nama Wali Kelas', 'Email Wali Kelas'],
+            ...classes.map((c: any) => [c.id, c.name, c.grade, c.major, c.homeroom_teacher_name || '-', c.homeroom_teacher_email || '-']),
+          ],
+        },
+        {
+          range: 'Sesi_Presensi!A1',
+          values: [
+            ['ID Sesi', 'Nama Sesi', 'Jam Mulai', 'Batas Tepat Waktu', 'Jam Selesai', 'Toleransi Terlambat (Menit)', 'Hari Aktif (0=Min,1=Sen..)', 'Status'],
+            ...sessions.map((sess: any) => [sess.id, sess.name, sess.start_time, sess.on_time_limit, sess.end_time, sess.late_tolerance_minutes ?? 0, (sess.active_days || [1, 2, 3, 4, 5]).join(', '), sess.is_active ? 'Aktif' : 'Nonaktif']),
+          ],
+        },
+        {
+          range: 'Presensi!A1',
+          values: [
+            ['ID Presensi', 'Tanggal', 'Jam', 'NIS', 'Nama Siswa', 'Kelas', 'ID Sesi', 'Status', 'Terlambat (Menit)', 'Metode', 'Perangkat', 'Catatan'],
+            ...attendance.slice(0, 1500).map((a: any) => {
+              const st = studentMap.get(a.student_id);
+              return [a.id, a.date, a.timestamp ? new Date(a.timestamp).toLocaleTimeString('id-ID') : '-', a.student_id, st?.name || '-', st?.class_id || '-', a.session_id, a.status, a.late_minutes || 0, a.method || 'rfid', a.device_id || 'utama', a.notes || ''];
+            }),
+          ],
+        },
+        {
+          range: 'Izin_Keluar!A1',
+          values: [
+            ['ID Izin', 'NIS', 'Nama Siswa', 'Kelas', 'Jenis', 'Mulai', 'Batas', 'Kembali', 'Durasi', 'Terlambat', 'Status', 'Metode', 'Catatan'],
+            ...outOfClass.slice(0, 1000).map((o: any) => {
+              const st = studentMap.get(o.student_id);
+              return [o.id, o.student_id, st?.name || '-', o.class_id, o.type, new Date(o.started_at).toLocaleString('id-ID'), new Date(o.due_at).toLocaleTimeString('id-ID'), o.returned_at ? new Date(o.returned_at).toLocaleTimeString('id-ID') : '-', o.duration_minutes, o.late_return_minutes || 0, o.status, o.return_method || '-', o.return_notes || ''];
+            }),
+          ],
+        },
+        {
+          range: 'Pelanggaran!A1',
+          values: [
+            ['ID', 'Waktu', 'NIS', 'Nama Siswa', 'Kelas', 'Pelanggaran', 'Kategori', 'Poin', 'Lokasi', 'Petugas', 'Catatan'],
+            ...violations.slice(0, 1000).map((v: any) => {
+              const st = studentMap.get(v.student_id);
+              return [v.id, new Date(v.recorded_at).toLocaleString('id-ID'), v.student_id, st?.name || '-', v.class_id, v.type_name, v.category, v.points, v.location || '-', v.recorded_by || 'Admin', v.notes || ''];
+            }),
+          ],
+        },
+        {
+          range: 'Izin_Tidak_Masuk!A1',
+          values: [
+            ['ID', 'NIS', 'Nama Siswa', 'Kelas', 'Jenis', 'Mulai', 'Selesai', 'Alasan', 'Status', 'Diproses Oleh'],
+            ...leaveRequests.slice(0, 1000).map((lr: any) => {
+              const st = studentMap.get(lr.student_id);
+              return [lr.id, lr.student_id, st?.name || '-', lr.class_id, lr.type, lr.start_date, lr.end_date, lr.reason, lr.status, lr.approved_by || '-'];
+            }),
+          ],
+        },
+        {
+          range: 'Jenis_Pelanggaran!A1',
+          values: [
+            ['ID', 'Kode', 'Nama', 'Kategori', 'Poin Default', 'Status', 'Keterangan'],
+            ...violationTypes.map((vt: any) => [vt.id, vt.code, vt.name, vt.category, vt.default_points, vt.is_active ? 'Aktif' : 'Nonaktif', vt.description || '']),
+          ],
+        },
+        {
+          range: 'Pengaturan!A1',
+          values: [
+            ['Parameter Sistem', 'Nilai Saat Ini', 'Keterangan'],
+            ['ID Cloud Console (Client ID)', settings.google_client_id || '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com', 'OAuth 2.0 Web Client ID tersimpan otomatis di aplikasi & sheet'],
+            ['Nama Sekolah', settings.school_name || 'SMP Puncak Darussalam', 'Identitas sekolah'],
+            ['Email Google Terhubung (OAuth 2.0)', settings.google_account_email || this.oauthEmail || '-', 'Akun Google Drive & Sheets sekolah'],
+            ['Nama Akun Google', settings.google_account_name || '-', 'Nama profil akun Google OAuth 2.0'],
+            ['ID Folder Google Drive', targetFolderId || settings.google_drive_folder_id || '-', 'Folder penyimpanan otomatis database JSON'],
+            ['ID Google Spreadsheet', targetSheetId || '-', 'ID Google Spreadsheet database 9 lembar kerja'],
+            ['Total Siswa Terdaftar', students.length, 'Jumlah siswa terdaftar'],
+            ['Total Kelas', classes.length, 'Jumlah kelas'],
+            ['Total Sesi Presensi', sessions.length, 'Jumlah sesi jadwal presensi'],
+            ['Total Jenis Pelanggaran', violationTypes.length, 'Jumlah master aturan pelanggaran/prestasi'],
+            ['Total Catatan Presensi', attendance.length, 'Presensi tercatat di sistem'],
+            ['Total Izin Keluar', outOfClass.length, 'Izin keluar kelas tercatat'],
+            ['Total Pelanggaran & Prestasi', violations.length, 'Catatan kedisiplinan'],
+            ['Notifikasi Email Orang Tua', settings.toggle_email_notifications !== false && db.notification_settings?.email_enabled !== false ? 'Aktif (Otomatis)' : 'Nonaktif', 'Pengiriman pemberitahuan otomatis tanpa klik manual'],
+            ['Rekap Mingguan Wali Kelas', db.notification_settings?.weekly_recap_enabled !== false ? `Aktif (Hari ${db.notification_settings?.weekly_recap_day ?? 5}, Jam ${db.notification_settings?.weekly_recap_time || '15:00'})` : 'Nonaktif', 'Pengiriman otomatis ke wali kelas per sesi'],
+            ['Sinkron Terakhir', new Date().toLocaleString('id-ID'), 'Otomatis real-time server'],
+            ['Mode Database', 'Google OAuth 2.0 + Drive & Sheets Otomatis Real-Time', 'Sinkronisasi otomatis setiap perubahan data'],
+          ],
+        },
+      ];
+
+      if (useOAuthToken && this.oauthAccessToken) {
+        const token = this.oauthAccessToken;
+        if (targetSheetId) {
+          const clearRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${targetSheetId}/values:batchClear`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ ranges: requiredSheets.map((t) => `${t}!A:Z`) }),
+          });
+          if (clearRes.status === 401) {
+            this.oauthAccessToken = '';
+            this.oauthExpiresAt = 0;
+            this.oauthTokenExpired = true;
+            return;
+          }
+          const writeRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${targetSheetId}/values:batchUpdate`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ valueInputOption: 'RAW', data: buildDataPayload() }),
+          });
+          if (writeRes.status === 401) {
+            this.oauthAccessToken = '';
+            this.oauthExpiresAt = 0;
+            this.oauthTokenExpired = true;
+            return;
+          }
+        }
+
+        const backupFileId = this.driveBackupFileId || db?.settings?.google_drive_backup_file_id || '';
+        if (backupFileId && backupFileId !== 'backup_kesiswaan_puncak_darussalam') {
+          const snapshotBody = JSON.stringify(
+            {
+              app: 'DISIPLIN KITA BISA',
+              syncedAt: new Date().toISOString(),
+              data: {
+                settings: db.settings,
+                notification_settings: db.notification_settings,
+                classes: db.classes,
+                sessions: db.sessions,
+                students: db.students,
+                violation_types: db.violation_types,
+                attendance: db.attendance,
+                out_of_class: db.out_of_class,
+                violations: db.violations,
+                leave_requests: db.leave_requests,
+              },
+            },
+            null,
+            2
+          );
+          const patchRes = await fetch(
+            `https://www.googleapis.com/upload/drive/v3/files/${backupFileId}?uploadType=media&fields=id`,
+            {
+              method: 'PATCH',
+              headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+              },
+              body: snapshotBody,
+            }
+          );
+          if (patchRes.status === 401) {
+            this.oauthAccessToken = '';
+            this.oauthExpiresAt = 0;
+            this.oauthTokenExpired = true;
+          }
+        }
+        return;
+      }
+
+      // 1. Service-account sync to Google Sheets if a valid Spreadsheet ID is available
       if (targetSheetId) {
-        const requiredSheets = [
-          'Siswa',
-          'Kelas',
-          'Sesi_Presensi',
-          'Presensi',
-          'Izin_Keluar',
-          'Pelanggaran',
-          'Izin_Tidak_Masuk',
-          'Jenis_Pelanggaran',
-          'Pengaturan',
-        ];
         const meta = await this.sheetsService.spreadsheets.get({
           spreadsheetId: targetSheetId,
           fields: 'sheets.properties.title',
@@ -189,110 +407,7 @@ export class GoogleSheetsClient {
           });
         }
 
-        const students = db.students || [];
-        const classes = db.classes || [];
-        const sessions = db.sessions || [];
-        const attendance = db.attendance || [];
-        const outOfClass = db.out_of_class || [];
-        const violations = db.violations || [];
-        const leaveRequests = db.leave_requests || [];
-        const violationTypes = db.violation_types || [];
-        const settings = db.settings || {};
-        const studentMap = new Map<string, any>(students.map((s: any) => [s.nis, s]));
-
-        const dataPayload = [
-          {
-            range: 'Siswa!A1',
-            values: [
-              ['NIS', 'Nama Siswa', 'Kelas', 'Jenis Kelamin', 'RFID UID', 'Kode Kartu/NIS', 'Nama Orang Tua', 'Email Orang Tua', 'Status Keaktifan'],
-              ...students.map((s: any) => [s.nis, s.name, s.class_id, s.gender === 'L' ? 'Laki-laki' : 'Perempuan', s.rfid_uid || '-', s.card_code || s.nis, s.parent_name || '-', s.parent_email || '-', 'Aktif']),
-            ],
-          },
-          {
-            range: 'Kelas!A1',
-            values: [
-              ['ID Kelas', 'Nama Kelas', 'Tingkat', 'Jurusan', 'Nama Wali Kelas', 'Email Wali Kelas'],
-              ...classes.map((c: any) => [c.id, c.name, c.grade, c.major, c.homeroom_teacher_name || '-', c.homeroom_teacher_email || '-']),
-            ],
-          },
-          {
-            range: 'Sesi_Presensi!A1',
-            values: [
-              ['ID Sesi', 'Nama Sesi', 'Jam Mulai', 'Batas Tepat Waktu', 'Jam Selesai', 'Toleransi Terlambat (Menit)', 'Hari Aktif (0=Min,1=Sen..)', 'Status'],
-              ...sessions.map((sess: any) => [sess.id, sess.name, sess.start_time, sess.on_time_limit, sess.end_time, sess.late_tolerance_minutes ?? 0, (sess.active_days || [1, 2, 3, 4, 5]).join(', '), sess.is_active ? 'Aktif' : 'Nonaktif']),
-            ],
-          },
-          {
-            range: 'Presensi!A1',
-            values: [
-              ['ID Presensi', 'Tanggal', 'Jam', 'NIS', 'Nama Siswa', 'Kelas', 'ID Sesi', 'Status', 'Terlambat (Menit)', 'Metode', 'Perangkat', 'Catatan'],
-              ...attendance.slice(0, 1500).map((a: any) => {
-                const st = studentMap.get(a.student_id);
-                return [a.id, a.date, a.timestamp ? new Date(a.timestamp).toLocaleTimeString('id-ID') : '-', a.student_id, st?.name || '-', st?.class_id || '-', a.session_id, a.status, a.late_minutes || 0, a.method || 'rfid', a.device_id || 'utama', a.notes || ''];
-              }),
-            ],
-          },
-          {
-            range: 'Izin_Keluar!A1',
-            values: [
-              ['ID Izin', 'NIS', 'Nama Siswa', 'Kelas', 'Jenis', 'Mulai', 'Batas', 'Kembali', 'Durasi', 'Terlambat', 'Status', 'Metode', 'Catatan'],
-              ...outOfClass.slice(0, 1000).map((o: any) => {
-                const st = studentMap.get(o.student_id);
-                return [o.id, o.student_id, st?.name || '-', o.class_id, o.type, new Date(o.started_at).toLocaleString('id-ID'), new Date(o.due_at).toLocaleTimeString('id-ID'), o.returned_at ? new Date(o.returned_at).toLocaleTimeString('id-ID') : '-', o.duration_minutes, o.late_return_minutes || 0, o.status, o.return_method || '-', o.return_notes || ''];
-              }),
-            ],
-          },
-          {
-            range: 'Pelanggaran!A1',
-            values: [
-              ['ID', 'Waktu', 'NIS', 'Nama Siswa', 'Kelas', 'Pelanggaran', 'Kategori', 'Poin', 'Lokasi', 'Petugas', 'Catatan'],
-              ...violations.slice(0, 1000).map((v: any) => {
-                const st = studentMap.get(v.student_id);
-                return [v.id, new Date(v.recorded_at).toLocaleString('id-ID'), v.student_id, st?.name || '-', v.class_id, v.type_name, v.category, v.points, v.location || '-', v.recorded_by || 'Admin', v.notes || ''];
-              }),
-            ],
-          },
-          {
-            range: 'Izin_Tidak_Masuk!A1',
-            values: [
-              ['ID', 'NIS', 'Nama Siswa', 'Kelas', 'Jenis', 'Mulai', 'Selesai', 'Alasan', 'Status', 'Diproses Oleh'],
-              ...leaveRequests.slice(0, 1000).map((lr: any) => {
-                const st = studentMap.get(lr.student_id);
-                return [lr.id, lr.student_id, st?.name || '-', lr.class_id, lr.type, lr.start_date, lr.end_date, lr.reason, lr.status, lr.approved_by || '-'];
-              }),
-            ],
-          },
-          {
-            range: 'Jenis_Pelanggaran!A1',
-            values: [
-              ['ID', 'Kode', 'Nama', 'Kategori', 'Poin Default', 'Status', 'Keterangan'],
-              ...violationTypes.map((vt: any) => [vt.id, vt.code, vt.name, vt.category, vt.default_points, vt.is_active ? 'Aktif' : 'Nonaktif', vt.description || '']),
-            ],
-          },
-          {
-            range: 'Pengaturan!A1',
-            values: [
-              ['Parameter Sistem', 'Nilai Saat Ini', 'Keterangan'],
-              ['ID Cloud Console (Client ID)', settings.google_client_id || '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com', 'OAuth 2.0 Web Client ID tersimpan otomatis di aplikasi & sheet'],
-              ['Nama Sekolah', settings.school_name || 'SMP Puncak Darussalam', 'Identitas sekolah'],
-              ['Email Google Terhubung (OAuth 2.0)', settings.google_account_email || '-', 'Akun Google Drive & Sheets sekolah'],
-              ['Nama Akun Google', settings.google_account_name || '-', 'Nama profil akun Google OAuth 2.0'],
-              ['ID Folder Google Drive', targetFolderId || settings.google_drive_folder_id || '-', 'Folder penyimpanan otomatis database JSON'],
-              ['ID Google Spreadsheet', targetSheetId || '-', 'ID Google Spreadsheet database 9 lembar kerja'],
-              ['Total Siswa Terdaftar', students.length, 'Jumlah siswa terdaftar'],
-              ['Total Kelas', classes.length, 'Jumlah kelas'],
-              ['Total Sesi Presensi', sessions.length, 'Jumlah sesi jadwal presensi'],
-              ['Total Jenis Pelanggaran', violationTypes.length, 'Jumlah master aturan pelanggaran/prestasi'],
-              ['Total Catatan Presensi', attendance.length, 'Presensi tercatat di sistem'],
-              ['Total Izin Keluar', outOfClass.length, 'Izin keluar kelas tercatat'],
-              ['Total Pelanggaran & Prestasi', violations.length, 'Catatan kedisiplinan'],
-              ['Notifikasi Email Orang Tua', settings.toggle_email_notifications !== false && db.notification_settings?.email_enabled !== false ? 'Aktif (Otomatis)' : 'Nonaktif', 'Pengiriman pemberitahuan otomatis tanpa klik manual'],
-              ['Rekap Mingguan Wali Kelas', db.notification_settings?.weekly_recap_enabled !== false ? `Aktif (Hari ${db.notification_settings?.weekly_recap_day ?? 5}, Jam ${db.notification_settings?.weekly_recap_time || '15:00'})` : 'Nonaktif', 'Pengiriman otomatis ke wali kelas per sesi'],
-              ['Sinkron Terakhir', new Date().toLocaleString('id-ID'), 'Otomatis real-time server'],
-              ['Mode Database', 'Google OAuth 2.0 + Drive & Sheets Otomatis Real-Time', 'Sinkronisasi otomatis setiap perubahan data'],
-            ],
-          },
-        ];
+        const dataPayload = buildDataPayload();
 
         await this.sheetsService.spreadsheets.values.batchClear({
           spreadsheetId: targetSheetId,

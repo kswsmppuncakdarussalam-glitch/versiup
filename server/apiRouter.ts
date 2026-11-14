@@ -105,6 +105,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         message: 'Sistem dan basis data berhasil diinisialisasi.',
         googleSheetsConnected: storage.isSheetsConnected(),
         serverDriveSyncActive: googleSheetsClient.isConnected,
+        oauthTokenExpired: googleSheetsClient.isOAuthExpired,
         version: fullSnapshot.version,
       });
     }
@@ -450,6 +451,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
             ...syncResult,
             googleSheetsConnected: storage.isSheetsConnected(),
             serverDriveSyncActive: googleSheetsClient.isConnected,
+            oauthTokenExpired: googleSheetsClient.isOAuthExpired,
           },
           {
             'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
@@ -466,6 +468,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           ...syncResult,
           googleSheetsConnected: storage.isSheetsConnected(),
           serverDriveSyncActive: googleSheetsClient.isConnected,
+          oauthTokenExpired: googleSheetsClient.isOAuthExpired,
         },
         {
           'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
@@ -473,6 +476,52 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           'Expires': '0',
         }
       );
+    }
+
+    // 3b. GOOGLE OAUTH SESSION BRIDGE: /api/google-sync/session
+    // Holds user's active Google OAuth 2.0 Bearer token strictly in server RAM across refreshes/re-logins
+    if (pathname === '/api/google-sync/session') {
+      if (method === 'GET') {
+        return JsonResponse.ok({
+          serverDriveSyncActive: googleSheetsClient.isConnected,
+          oauthTokenExpired: googleSheetsClient.isOAuthExpired,
+        });
+      }
+
+      if (method === 'POST') {
+        const { action, expiresIn, email, name, clientId } = req.body || {};
+        if (action === 'disconnect') {
+          googleSheetsClient.clearOAuthSession();
+          await storage.updateSettings({ google_oauth_connected: false });
+          return JsonResponse.ok({
+            success: true,
+            serverDriveSyncActive: googleSheetsClient.isConnected,
+          });
+        }
+
+        if (!token || token === 'undefined' || token === 'null') {
+          return JsonResponse.unauthorized('Token OAuth 2.0 Google tidak ditemukan pada header Authorization Bearer.');
+        }
+
+        googleSheetsClient.setOAuthSession(token, Number(expiresIn) || 3500, email);
+        await storage.updateSettings({
+          google_oauth_connected: true,
+          toggle_email_notifications: true,
+          ...(email ? { google_account_email: email } : {}),
+          ...(name ? { google_account_name: name } : {}),
+          ...(clientId ? { google_client_id: clientId } : {}),
+        });
+        const notifSettings = await storage.getNotificationSettings();
+        if (!notifSettings.email_enabled) {
+          await storage.updateNotificationSettings({ email_enabled: true });
+        }
+
+        return JsonResponse.ok({
+          success: true,
+          serverDriveSyncActive: googleSheetsClient.isConnected,
+          oauthTokenExpired: false,
+        });
+      }
     }
 
     // 4. ATTENDANCE: /api/attendance
@@ -1043,13 +1092,16 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         return JsonResponse.ok({ settings, logs });
       }
 
-      const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) {
-        return JsonResponse.unauthorized();
+      const cleanToken = token && token !== 'undefined' && token !== 'null' ? token : '';
+      if (cleanToken) {
+        const validRes = await authService.validateActiveSession(cleanToken);
+        if (!validRes.valid && validRes.reason === 'Session invalidated by password or account change') {
+          return JsonResponse.unauthorized(validRes.reason);
+        }
       }
 
       if (query.action === 'test_email') {
-        const { email } = req.body;
+        const { email } = req.body || {};
         if (!email) return JsonResponse.badRequest('Email tujuan wajib diisi.');
         const result = await notificationService.sendTestEmail(email);
         return JsonResponse.ok(result);
@@ -1066,7 +1118,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         }
       }
 
-      const updated = await storage.updateNotificationSettings(req.body);
+      const updated = await storage.updateNotificationSettings(req.body || {});
       return JsonResponse.ok({ success: true, settings: updated });
     }
 

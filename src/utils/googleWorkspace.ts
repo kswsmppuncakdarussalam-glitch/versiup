@@ -22,9 +22,8 @@ import {
   NotificationSettings,
 } from '../types/index.js';
 
-// Required Google Workspace scopes
+// Standard non-restricted Google Workspace scopes (avoids OAuth restricted-scope verification blocks)
 export const SCOPES = [
-  'https://www.googleapis.com/auth/drive',
   'https://www.googleapis.com/auth/drive.file',
   'https://www.googleapis.com/auth/spreadsheets',
   'https://www.googleapis.com/auth/userinfo.email',
@@ -32,34 +31,102 @@ export const SCOPES = [
 ];
 
 /**
+ * Normalize & clean a pasted Google Cloud Console OAuth 2.0 Web Client ID
+ */
+export const normalizeGoogleClientId = (rawClientId: string): string => {
+  return (rawClientId || '').replace(/[\s"'`]+/g, '').trim();
+};
+
+/**
  * Returns Google Cloud Console OAuth 2.0 Web Client ID
- * Priority: Custom configured -> Env var -> firebase-applet-config -> Fallback
+ * Priority: Explicit arg -> Window/LocalStorage registered JS ID -> Env var -> firebase-applet-config -> Fallback
  */
 export const getGoogleClientId = (fallbackFromSettings?: string): string => {
   if (fallbackFromSettings && fallbackFromSettings.trim()) {
-    return fallbackFromSettings.trim();
+    return normalizeGoogleClientId(fallbackFromSettings);
   }
   if (typeof window !== 'undefined') {
     const custom = (window as any).__DKB_GOOGLE_CLIENT_ID__ || localStorage.getItem('dkb_google_client_id');
-    if (custom && custom.trim()) return custom.trim();
+    if (custom && custom.trim()) return normalizeGoogleClientId(custom);
   }
   const envId = (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID;
-  if (envId && envId.trim()) return envId.trim();
+  if (envId && envId.trim()) return normalizeGoogleClientId(envId);
   const configId = (firebaseConfig as any)?.oAuthClientId;
-  if (configId && configId.trim()) return configId.trim();
+  if (configId && configId.trim()) return normalizeGoogleClientId(configId);
   return '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com';
 };
 
 export const setCustomGoogleClientId = (clientId: string) => {
   if (typeof window !== 'undefined') {
-    if (clientId && clientId.trim()) {
-      localStorage.setItem('dkb_google_client_id', clientId.trim());
-      (window as any).__DKB_GOOGLE_CLIENT_ID__ = clientId.trim();
+    const cleaned = normalizeGoogleClientId(clientId);
+    if (cleaned) {
+      localStorage.setItem('dkb_google_client_id', cleaned);
+      (window as any).__DKB_GOOGLE_CLIENT_ID__ = cleaned;
+      (window as any).__DKB_REGISTERED_JS_ORIGIN__ = window.location.origin;
     } else {
       localStorage.removeItem('dkb_google_client_id');
       delete (window as any).__DKB_GOOGLE_CLIENT_ID__;
     }
   }
+};
+
+/**
+ * Automatically registers any pasted/saved Google Cloud Console Client ID into the browser
+ * JavaScript runtime & Google Identity Services (GIS) client immediately (0ms).
+ */
+export const registerGoogleClientIdToJs = (
+  rawClientId: string
+): { clientId: string; origin: string; registeredInJs: boolean } => {
+  const cleaned = normalizeGoogleClientId(rawClientId);
+  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+
+  setCustomGoogleClientId(cleaned);
+
+  if (typeof window !== 'undefined' && cleaned) {
+    (window as any).__DKB_GOOGLE_CLIENT_ID__ = cleaned;
+    (window as any).__DKB_REGISTERED_JS_ORIGIN__ = origin;
+
+    const tryBindGis = () => {
+      const g = (window as any).google;
+      if (g?.accounts?.oauth2) {
+        try {
+          (window as any).__DKB_GIS_TOKEN_CLIENT__ = g.accounts.oauth2.initTokenClient({
+            client_id: cleaned,
+            scope: SCOPES.join(' '),
+            include_granted_scopes: true,
+            callback: () => {},
+          });
+          (window as any).__DKB_GIS_REGISTERED_CLIENT_ID__ = cleaned;
+        } catch {
+          // Safe: actual signInWithGoogle call re-initializes cleanly with live callback
+        }
+      }
+    };
+
+    if ((window as any).google?.accounts?.oauth2) {
+      tryBindGis();
+    } else {
+      ensureGisLoaded().then((loaded) => {
+        if (loaded) tryBindGis();
+      });
+    }
+  }
+
+  return {
+    clientId: cleaned,
+    origin,
+    registeredInJs: Boolean(cleaned),
+  };
+};
+
+export const getJsRegisteredInfo = (): { clientId: string; origin: string; gisReady: boolean } => {
+  if (typeof window === 'undefined') {
+    return { clientId: '', origin: '', gisReady: false };
+  }
+  const clientId = (window as any).__DKB_GOOGLE_CLIENT_ID__ || localStorage.getItem('dkb_google_client_id') || '';
+  const origin = (window as any).__DKB_REGISTERED_JS_ORIGIN__ || window.location.origin;
+  const gisReady = Boolean(clientId) && Boolean((window as any).__DKB_GIS_REGISTERED_CLIENT_ID__ === clientId || (window as any).google?.accounts?.oauth2);
+  return { clientId, origin, gisReady };
 };
 
 // Initialize Firebase App singleton
@@ -92,6 +159,11 @@ export const hasValidGoogleToken = (): boolean => {
     return false;
   }
   return true;
+};
+
+export const getTokenExpiresInSeconds = (): number => {
+  if (!inMemoryAccessToken || !inMemoryTokenExpiresAt) return 3500;
+  return Math.max(60, Math.floor((inMemoryTokenExpiresAt - Date.now()) / 1000));
 };
 
 export const setInMemoryToken = (token: string | null, expiresInSeconds?: number) => {
@@ -175,15 +247,19 @@ export const requestGoogleIdentityToken = async (
 ): Promise<{
   accessToken: string;
   accountInfo: ConnectedGoogleAccount;
+  expiresIn?: number;
   cancelled?: boolean;
 }> => {
   const curOrig = typeof window !== 'undefined' ? window.location.origin : '';
   const effectiveHint = loginHint || 'kswsmp.puncakdarussalam@gmail.com';
-  const clientId = (customClientId && customClientId.trim()) || getGoogleClientId();
+  const clientId = (customClientId && normalizeGoogleClientId(customClientId)) || getGoogleClientId();
 
   if (!clientId) {
     throw new Error('ID Cloud Console (OAuth 2.0 Web Client ID) belum diisi. Simpan ID Cloud di menu Admin terlebih dahulu.');
   }
+
+  // Ensure Client ID is registered in browser JS runtime
+  registerGoogleClientIdToJs(clientId);
 
   await ensureGisLoaded();
 
@@ -199,6 +275,7 @@ export const requestGoogleIdentityToken = async (
       const client = google.accounts.oauth2.initTokenClient({
         client_id: clientId,
         scope: SCOPES.join(' '),
+        include_granted_scopes: true,
         prompt: promptSelectAccount ? 'select_account' : '',
         hint: effectiveHint,
         callback: async (tokenResponse: any) => {
@@ -254,7 +331,8 @@ export const requestGoogleIdentityToken = async (
             return reject(new Error('Gagal menerima Access Token OAuth 2.0 dari Google.'));
           }
 
-          setInMemoryToken(token, Number(tokenResponse.expires_in) || 3500);
+          const expiresIn = Number(tokenResponse.expires_in) || 3500;
+          setInMemoryToken(token, expiresIn);
 
           // Bridge to Firebase Auth safely without blocking OAuth 2.0 token usage
           try {
@@ -276,10 +354,11 @@ export const requestGoogleIdentityToken = async (
               uid: userData.sub || `g_${Date.now()}`,
               connectedAt: new Date().toISOString(),
             };
-            resolve({ accessToken: token, accountInfo });
+            resolve({ accessToken: token, accountInfo, expiresIn });
           } catch {
             resolve({
               accessToken: token,
+              expiresIn,
               accountInfo: {
                 email: effectiveHint,
                 name: 'Kesiswaan SMP Puncak Darussalam',
@@ -336,7 +415,13 @@ export const signInWithGoogle = async (
   promptSelectAccount: boolean = true,
   customClientId?: string,
   loginHint?: string
-): Promise<{ user?: User; accessToken: string; accountInfo: ConnectedGoogleAccount; cancelled?: boolean }> => {
+): Promise<{
+  user?: User;
+  accessToken: string;
+  accountInfo: ConnectedGoogleAccount;
+  expiresIn?: number;
+  cancelled?: boolean;
+}> => {
   try {
     isSigningIn = true;
     const gisResult = await requestGoogleIdentityToken(promptSelectAccount, customClientId, loginHint);
@@ -353,6 +438,7 @@ export const signInWithGoogle = async (
       user: firebaseAuth.currentUser || undefined,
       accessToken: gisResult.accessToken,
       accountInfo: gisResult.accountInfo,
+      expiresIn: gisResult.expiresIn,
       cancelled: false,
     };
   } finally {

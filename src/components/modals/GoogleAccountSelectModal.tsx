@@ -22,7 +22,11 @@ import {
   FileSpreadsheet,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
-import { getGoogleClientId, setCustomGoogleClientId } from '../../utils/googleWorkspace.js';
+import {
+  getGoogleClientId,
+  normalizeGoogleClientId,
+  registerGoogleClientIdToJs,
+} from '../../utils/googleWorkspace.js';
 
 interface GoogleAccountSelectModalProps {
   isOpen: boolean;
@@ -108,23 +112,31 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
   };
 
   const persistClientId = async (rawValue: string, showFeedback = false) => {
-    const cleaned = rawValue.trim();
+    const cleaned = normalizeGoogleClientId(rawValue);
     setClientIdSavedIndicator('saving');
-    setCustomGoogleClientId(cleaned);
+    registerGoogleClientIdToJs(cleaned);
     await updateSettings({ google_client_id: cleaned }, { silent: !showFeedback });
     setClientIdSavedIndicator('saved');
     if (showFeedback) {
-      showToast(cleaned ? 'Client ID Google Cloud Console tersimpan ke database!' : 'Client ID dikembalikan ke bawaan.', 'success');
+      showToast(
+        cleaned
+          ? 'ID Cloud Console otomatis terdaftar ke JavaScript & tersimpan ke database!'
+          : 'Client ID dikembalikan ke bawaan.',
+        'success'
+      );
     }
   };
 
   const handleClientIdChange = (val: string) => {
-    setCustomIdInput(val);
+    const cleaned = normalizeGoogleClientId(val);
+    setCustomIdInput(cleaned);
+    // 0ms immediate JavaScript runtime + GIS registration
+    registerGoogleClientIdToJs(cleaned);
     setClientIdSavedIndicator('saving');
     if (clientIdDebounceRef.current) clearTimeout(clientIdDebounceRef.current);
     clientIdDebounceRef.current = setTimeout(() => {
-      persistClientId(val, false);
-    }, 500);
+      persistClientId(cleaned, false);
+    }, 350);
   };
 
   const handleSaveClientId = async () => {
@@ -284,10 +296,10 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                 <div className="p-2.5 rounded-lg bg-emerald-50/80 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 text-[11px] space-y-1">
                   <div className="flex items-center gap-1.5 font-bold text-emerald-800 dark:text-emerald-300">
                     <CheckCircle className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                    <span>Autentikasi Resmi Google OAuth 2.0 &amp; Sinkron Email Otomatis</span>
+                    <span>OAuth 2.0 Izin Standar (Bebas Pelanggaran) &amp; Koneksi Permanen</span>
                   </div>
                   <p className="text-emerald-700 dark:text-emerald-400 leading-relaxed">
-                    Pastikan URL asal di bawah ini terdaftar pada <strong>Authorized JavaScript origins</strong> di Google Cloud Console. Setelah terhubung via OAuth 2.0, akun email sekolah &amp; ID Cloud tersimpan otomatis di aplikasi, database, serta tab <strong>Pengaturan</strong> Google Sheets.
+                    Menggunakan ruang lingkup resmi non-terbatas (<code>drive.file</code>, <code>spreadsheets</code>, <code>userinfo.email</code>). ID Cloud yang Anda tempel otomatis terdaftar ke <strong>JavaScript Runtime</strong> (<code className="font-mono">{currentOrigin}</code>), dan sekali terhubung, sinkronisasi Email, DB, Drive &amp; Sheets tetap aktif meski halaman di-refresh atau keluar-masuk aplikasi.
                   </p>
                 </div>
 
@@ -359,27 +371,34 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
 
               {/* Client ID Input */}
               <div className="space-y-2 bg-white dark:bg-slate-900 p-3 rounded-xl border border-slate-200 dark:border-slate-800">
-                <div className="flex items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <label className="block text-[11px] font-bold text-slate-800 dark:text-slate-200">
                     ID Cloud Console (OAuth 2.0 Web Client ID):
                   </label>
                   <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
                     {clientIdSavedIndicator === 'saving'
-                      ? 'Menyimpan otomatis...'
-                      : 'Tersimpan di Aplikasi & Sheet'}
+                      ? 'Mendaftarkan ke JavaScript & menyimpan...'
+                      : 'Terdaftar Otomatis ke JavaScript & Sheet'}
                   </span>
                 </div>
                 <div className="flex flex-col sm:flex-row gap-2">
                   <input
                     type="text"
                     value={customIdInput}
+                    onPaste={(e) => {
+                      const pasted = e.clipboardData.getData('text');
+                      if (pasted) {
+                        e.preventDefault();
+                        handleClientIdChange(pasted);
+                      }
+                    }}
                     onChange={(e) => handleClientIdChange(e.target.value)}
                     onBlur={() => {
-                      if (customIdInput.trim() !== (settings.google_client_id || '').trim()) {
+                      if (normalizeGoogleClientId(customIdInput) !== normalizeGoogleClientId(settings.google_client_id || '')) {
                         persistClientId(customIdInput, false);
                       }
                     }}
-                    placeholder="contoh: 1049823447787-xxxx.apps.googleusercontent.com"
+                    placeholder="Tempel Client ID: 1049823447787-xxxx.apps.googleusercontent.com"
                     className="flex-1 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-mono text-[11px] text-slate-900 dark:text-white"
                   />
                   <button
@@ -391,7 +410,7 @@ export const GoogleAccountSelectModal: React.FC<GoogleAccountSelectModalProps> =
                   </button>
                 </div>
                 <p className="text-[10px] text-slate-500">
-                  Setelah tersimpan, perangkat lain otomatis menerima ID Cloud tanpa mengetik ulang, dan ditulis ke sheet <strong>Pengaturan</strong>.
+                  ID Cloud yang ditempel langsung terdaftar otomatis ke runtime JavaScript (<code className="font-mono">{currentOrigin}</code>), database, serta lembar <strong>Pengaturan</strong> Google Sheet.
                 </p>
               </div>
 

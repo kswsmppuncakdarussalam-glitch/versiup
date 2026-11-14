@@ -42,9 +42,10 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
 
   const isAutoDriveActive = googleOAuthActive || serverDriveSyncActive;
   const isCloudConfiguredInDb = Boolean(
-    settings.google_client_id?.trim() &&
-      settings.google_account_email?.trim() &&
-      (settings.google_sheet_id?.trim() || settings.google_drive_folder_id?.trim())
+    settings.google_oauth_connected ||
+      (settings.google_client_id?.trim() &&
+        settings.google_account_email?.trim() &&
+        (settings.google_sheet_id?.trim() || settings.google_drive_folder_id?.trim()))
   );
 
   const isLockedMenuOpen = Boolean(session?.lockedMenuRole);
@@ -184,21 +185,21 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
           </div>
         ) : isAutoDriveActive ? (
           <div
-            title={`Auto-Sync Google Drive & Google Sheets Aktif (${settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}). Setiap perubahan langsung tersinkron otomatis.`}
+            title={`Koneksi Permanen Aktif (${settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}). Email, Database, Google Drive & Sheets tetap terhubung meski refresh atau keluar-masuk aplikasi.`}
             className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800"
           >
             <Database className="w-3 h-3" />
-            <span>Auto-Sync Drive & Sheets</span>
+            <span>Email, DB, Drive &amp; Sheets Aktif</span>
           </div>
-        ) : isCloudConfiguredInDb ? (
+        ) : settings.google_oauth_connected || isCloudConfiguredInDb ? (
           <button
             type="button"
             onClick={() => syncGoogleSheetsNow()}
-            title={`ID Cloud & email sekolah (${settings.google_account_email}) sudah tersinkron di database. Klik 1x untuk verifikasi OAuth 2.0 di browser ini agar perubahan langsung menulis ke Google Drive & Sheets.`}
+            title={`Konfigurasi Cloud & email (${settings.google_account_email}) tersimpan permanen. Klik 1x untuk menyegarkan sesi OAuth 2.0 Google jika masa berlaku token berakhir.`}
             className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/30 dark:hover:bg-amber-950/50 text-amber-800 dark:text-amber-300 border-amber-200 dark:border-amber-800 transition-colors"
           >
             <Database className="w-3 h-3" />
-            <span>Hubungkan OAuth 2.0</span>
+            <span>Perbarui Sesi Google (1x)</span>
           </button>
         ) : (
           <button
@@ -206,7 +207,7 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
             onClick={() => syncGoogleSheetsNow()}
             title={
               googleSheetsConnected
-                ? 'Klik 1x untuk mengaktifkan sesi OAuth 2.0 Google di tab browser ini agar setiap perubahan otomatis tersinkron ke Drive & Sheets'
+                ? 'Klik 1x untuk mengaktifkan koneksi permanen OAuth 2.0 (Email, Database, Drive & Sheets)'
                 : 'Klik untuk menghubungkan Google OAuth 2.0 & mengaktifkan Auto-Sync Drive & Sheets'
             }
             className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/30 dark:hover:bg-amber-950/50 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800 transition-colors"

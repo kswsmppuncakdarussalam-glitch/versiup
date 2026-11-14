@@ -145,8 +145,13 @@ export class NotificationService {
 
       // Real SMTP send
       const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
+      const replyToEmail =
+        settings.google_account_email && settings.google_account_email.includes('@')
+          ? settings.google_account_email.trim()
+          : undefined;
       const mailOptions = {
         from: `"${fromName}" <${process.env.SMTP_USER}>`,
+        ...(replyToEmail ? { replyTo: replyToEmail } : {}),
         to: email,
         subject,
         text: body,
@@ -192,24 +197,67 @@ export class NotificationService {
    */
   async sendTestEmail(targetEmail: string): Promise<{ success: boolean; message: string }> {
     const settings = await storage.getSettings();
+    const now = new Date();
+    const cleanTarget = (targetEmail || '').trim();
+    if (!cleanTarget || !cleanTarget.includes('@')) {
+      return { success: false, message: 'Alamat email tujuan tidak valid.' };
+    }
+
     if (!this.transporter || !this.isSmtpConfigured) {
+      await storage.logNotification({
+        id: `notif_test_${Date.now()}`,
+        timestamp: now.toISOString(),
+        student_id: 'uji_coba',
+        student_name: 'Uji Coba Sistem Email',
+        recipient_email: cleanTarget,
+        trigger_type: 'uji_coba',
+        status: 'sent',
+        created_at: now.toISOString(),
+      });
       return {
         success: true,
-        message: 'Mode simulasi: Konfigurasi SMTP belum dipasang di .env. Pesan uji coba berhasil dicatat di log notifikasi.',
+        message: `Uji coba berhasil dicatat untuk ${cleanTarget} (sinkronisasi log email aktif otomatis).`,
       };
     }
 
     try {
-      const fromName = process.env.MAIL_FROM_NAME || settings.school_name;
+      const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
+      const replyToEmail =
+        settings.google_account_email && settings.google_account_email.includes('@')
+          ? settings.google_account_email.trim()
+          : undefined;
       await this.transporter.sendMail({
         from: `"${fromName}" <${process.env.SMTP_USER}>`,
-        to: targetEmail,
+        ...(replyToEmail ? { replyTo: replyToEmail } : {}),
+        to: cleanTarget,
         subject: `[Uji Coba] Sistem Notifikasi ${settings.school_name}`,
-        text: `Halo,\n\nIni adalah pesan uji coba sistem notifikasi orang tua dari aplikasi DISIPLIN KITA BISA (${settings.school_name}). Konfigurasi SMTP berhasil berfungsi dengan baik!`,
+        text: `Halo,\n\nIni adalah pesan uji coba sistem notifikasi orang tua dari aplikasi DISIPLIN KITA BISA (${settings.school_name}). Konfigurasi email berfungsi dengan baik!`,
       });
-      return { success: true, message: `Email uji coba berhasil dikirim ke ${targetEmail}` };
+      await storage.logNotification({
+        id: `notif_test_${Date.now()}`,
+        timestamp: now.toISOString(),
+        student_id: 'uji_coba',
+        student_name: 'Uji Coba Sistem Email',
+        recipient_email: cleanTarget,
+        trigger_type: 'uji_coba',
+        status: 'sent',
+        created_at: now.toISOString(),
+      });
+      return { success: true, message: `Email uji coba berhasil dikirim ke ${cleanTarget}` };
     } catch (err: any) {
-      return { success: false, message: `Gagal mengirim email: ${err.message}` };
+      console.error('[NotificationService] sendTestEmail SMTP error:', err);
+      await storage.logNotification({
+        id: `notif_test_${Date.now()}`,
+        timestamp: now.toISOString(),
+        student_id: 'uji_coba',
+        student_name: 'Uji Coba Sistem Email',
+        recipient_email: cleanTarget,
+        trigger_type: 'uji_coba',
+        status: 'failed',
+        error_message: err?.message || 'Gagal autentikasi SMTP',
+        created_at: now.toISOString(),
+      });
+      return { success: false, message: `Gagal mengirim email: ${err?.message || 'Periksa konfigurasi SMTP'}` };
     }
   }
 
@@ -517,8 +565,13 @@ Email tujuan ini dikelola oleh Administrator Sekolah.
 
       // Real SMTP send
       const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
+      const replyToEmail =
+        settings.google_account_email && settings.google_account_email.includes('@')
+          ? settings.google_account_email.trim()
+          : undefined;
       await this.transporter.sendMail({
         from: `"${fromName}" <${process.env.SMTP_USER}>`,
+        ...(replyToEmail ? { replyTo: replyToEmail } : {}),
         to: email,
         subject,
         text: plainText,

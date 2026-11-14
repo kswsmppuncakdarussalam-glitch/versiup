@@ -27,7 +27,9 @@ import {
   syncAllDataToDriveAndSheets,
   getAccessToken,
   hasValidGoogleToken,
+  getTokenExpiresInSeconds,
   setCustomGoogleClientId,
+  registerGoogleClientIdToJs,
   ConnectedGoogleAccount,
 } from '../utils/googleWorkspace.js';
 
@@ -228,7 +230,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }));
   const [googleSyncing, setGoogleSyncing] = useState<boolean>(false);
   const [googleOAuthActive, setGoogleOAuthActive] = useState<boolean>(() => hasValidGoogleToken());
-  const [serverDriveSyncActive, setServerDriveSyncActive] = useState<boolean>(false);
+  const [serverDriveSyncActive, setServerDriveSyncActive] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('dkb_cache_server_drive_active') === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [isKioskFullscreen, setIsKioskFullscreen] = useState<boolean>(false);
 
   // Core Data States with Instant Offline Persistence
@@ -608,8 +616,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (data) {
             setSettings(data);
             settingsRef.current = data;
-            setCustomGoogleClientId((data.google_client_id || '').trim());
-            setGoogleSheetsConnected(Boolean(data.google_account_email || hasValidGoogleToken() || serverDriveSyncActive));
+            registerGoogleClientIdToJs((data.google_client_id || '').trim());
+            setGoogleSheetsConnected(
+              Boolean(data.google_account_email || data.google_oauth_connected || hasValidGoogleToken() || serverDriveSyncActive)
+            );
             if (data.google_account_email) {
               setGoogleAccount((prev) => ({
                 email: data.google_account_email,
@@ -734,7 +744,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       if (data.serverDriveSyncActive !== undefined) {
-        setServerDriveSyncActive((prev) => (prev !== data.serverDriveSyncActive ? data.serverDriveSyncActive : prev));
+        const active = Boolean(data.serverDriveSyncActive);
+        setServerDriveSyncActive((prev) => (prev !== active ? active : prev));
+        try {
+          localStorage.setItem('dkb_cache_server_drive_active', String(active));
+        } catch {}
       }
 
       const hasVersionChanged = data.version !== versionRef.current;
@@ -744,8 +758,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const nextSettings = data.data.settings || defaultSettings;
         setSettings(nextSettings);
         settingsRef.current = nextSettings;
-        setGoogleSheetsConnected(Boolean(nextSettings.google_account_email || hasValidGoogleToken() || data.serverDriveSyncActive));
-        setCustomGoogleClientId((nextSettings.google_client_id || '').trim());
+        setGoogleSheetsConnected(
+          Boolean(
+            nextSettings.google_account_email ||
+              nextSettings.google_oauth_connected ||
+              hasValidGoogleToken() ||
+              data.serverDriveSyncActive
+          )
+        );
+        registerGoogleClientIdToJs((nextSettings.google_client_id || '').trim());
         setClasses(data.data.classes || []);
         setSessions(data.data.sessions || []);
         setStudents(data.data.students || []);
@@ -1392,6 +1413,41 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     notificationSettings,
   ]);
 
+  const registerGoogleSessionOnServer = useCallback(
+    async (
+      accessToken: string,
+      info?: { email?: string; name?: string; clientId?: string; expiresIn?: number }
+    ) => {
+      if (!accessToken) return;
+      try {
+        const res = await fetch('/api/google-sync/session', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${accessToken}`,
+          },
+          body: JSON.stringify({
+            expiresIn: info?.expiresIn || getTokenExpiresInSeconds(),
+            email: info?.email,
+            name: info?.name,
+            clientId: info?.clientId,
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json().catch(() => ({}));
+          const active = Boolean(data.serverDriveSyncActive ?? true);
+          setServerDriveSyncActive(active);
+          try {
+            localStorage.setItem('dkb_cache_server_drive_active', String(active));
+          } catch {}
+        }
+      } catch (e) {
+        console.warn('[Google Session Bridge Warning]:', e);
+      }
+    },
+    []
+  );
+
   // Google Workspace Integration Actions (Strict Google OAuth 2.0)
   const connectGoogle = async (promptSelect: boolean = true, emailHint?: string, overrideClientId?: string) => {
     try {
@@ -1402,19 +1458,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         overrideClientId !== undefined
           ? overrideClientId.trim()
           : (latestSettings.google_client_id || '').trim();
+      if (targetClientId) {
+        registerGoogleClientIdToJs(targetClientId);
+      }
       showToast(`Membuka Google OAuth 2.0 untuk ${targetHint}...`, 'info');
       const res = await signInWithGoogle(promptSelect, targetClientId, targetHint);
       if (res.cancelled || !res.accessToken) {
         showToast('Otorisasi Google OAuth 2.0 dibatalkan.', 'info');
         return { success: false };
       }
-      const { accessToken, accountInfo } = res;
+      const { accessToken, accountInfo, expiresIn } = res;
       setGoogleAccount(accountInfo);
       setGoogleSheetsConnected(true);
       setGoogleOAuthActive(hasValidGoogleToken());
-      showToast(`OAuth 2.0 terverifikasi (${accountInfo.email}). Menyinkronkan Drive + Sheets + Email...`, 'info');
+      showToast(`OAuth 2.0 terverifikasi (${accountInfo.email}). Menghubungkan sinkron permanen...`, 'info');
 
       const resolvedClientId = targetClientId || latestSettings.google_client_id || '';
+      await registerGoogleSessionOnServer(accessToken, {
+        email: accountInfo.email,
+        name: accountInfo.name,
+        clientId: resolvedClientId,
+        expiresIn,
+      });
+
       const nextNotifSettings: NotificationSettings = {
         ...notificationSettings,
         email_enabled: true,
@@ -1426,6 +1492,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         google_account_email: accountInfo.email,
         google_account_name: accountInfo.name,
         google_account_photo: accountInfo.photo,
+        google_oauth_connected: true,
         toggle_email_notifications: true,
       };
 
@@ -1458,6 +1525,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           google_sheet_id: syncRes.spreadsheetId,
           google_sheet_url: syncRes.spreadsheetUrl,
           google_last_synced_at: nowIso,
+          google_oauth_connected: true,
           toggle_email_notifications: true,
         },
         { silent: true }
@@ -1468,7 +1536,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       showToast(
-        `OAuth 2.0 (${accountInfo.email}) terhubung! ID Cloud, Email & Drive/Sheets otomatis tersinkron (${syncRes.rowsUpdated} baris).`,
+        `OAuth 2.0 (${accountInfo.email}) terhubung permanen! Email, DB, Drive & Sheets sinkron (${syncRes.rowsUpdated} baris).`,
         'success'
       );
       return { success: true };
@@ -1485,9 +1553,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const disconnectGoogle = async () => {
     try {
       await disconnectGoogleAccount();
+      await fetch('/api/google-sync/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'disconnect' }),
+      }).catch(() => {});
       setGoogleAccount(null);
       setGoogleSheetsConnected(false);
       setGoogleOAuthActive(false);
+      setServerDriveSyncActive(false);
+      try {
+        localStorage.removeItem('dkb_cache_server_drive_active');
+      } catch {}
       lastAutoSheetSigRef.current = '';
       await updateSettings({
         google_account_email: '',
@@ -1500,6 +1577,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         google_sheet_id: '',
         google_sheet_url: '',
         google_last_synced_at: '',
+        google_oauth_connected: false,
       });
       showToast('Akun Google berhasil diputuskan. Database lokal tetap aktif.', 'info');
     } catch (err: any) {
@@ -1551,7 +1629,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         overrideClientId !== undefined
           ? overrideClientId.trim()
           : (latestSettings.google_client_id || '').trim();
+      if (targetClientId) {
+        registerGoogleClientIdToJs(targetClientId);
+      }
       let oauthAccountInfo: ConnectedGoogleAccount | null = null;
+      let tokenExpiresIn = getTokenExpiresInSeconds();
       if (!token) {
         showToast(`Meminta otorisasi OAuth 2.0 Google untuk ${targetHint}...`, 'info');
         const res = await signInWithGoogle(false, targetClientId, targetHint);
@@ -1561,10 +1643,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
         token = res.accessToken;
         oauthAccountInfo = res.accountInfo;
+        tokenExpiresIn = res.expiresIn || 3500;
         setGoogleAccount(res.accountInfo);
         setGoogleSheetsConnected(true);
         setGoogleOAuthActive(hasValidGoogleToken());
       }
+
+      await registerGoogleSessionOnServer(token, {
+        email: oauthAccountInfo?.email || targetHint,
+        name: oauthAccountInfo?.name || latestSettings.google_account_name,
+        clientId: targetClientId || latestSettings.google_client_id,
+        expiresIn: tokenExpiresIn,
+      });
 
       showToast('Menyinkronkan seluruh data (ID Cloud, Sesi, Siswa, Kelas, Presensi) ke Drive & Sheets...', 'info');
       const sigBeforeSync = driveSheetSignature;
@@ -1578,6 +1668,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               google_account_photo: oauthAccountInfo.photo,
             }
           : {}),
+        google_oauth_connected: true,
         toggle_email_notifications: true,
       };
       const nextNotifForSync: NotificationSettings = {
@@ -1617,6 +1708,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           google_sheet_id: syncRes.spreadsheetId,
           google_sheet_url: syncRes.spreadsheetUrl,
           google_last_synced_at: nowIso,
+          google_oauth_connected: true,
           toggle_email_notifications: true,
         },
         { silent: true }
@@ -2510,7 +2602,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return next;
       });
       if (updates.google_client_id !== undefined) {
-        setCustomGoogleClientId(updates.google_client_id || '');
+        registerGoogleClientIdToJs(updates.google_client_id || '');
       }
       // Do not re-trigger background Drive/Sheets auto-sync for pure sync-metadata updates
       const syncMetaKeys = new Set([
@@ -2616,7 +2708,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ email }),
       });
@@ -2632,7 +2724,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
         body: JSON.stringify({ classId }),
       });
@@ -2702,17 +2794,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  // Keep local Client ID mirror strictly synchronized with authoritative server DB settings
+  // Keep local JS Client ID runtime strictly synchronized with authoritative server DB settings
   useEffect(() => {
     if (!hasSyncedOnce) return;
     const dbClientId = (settings.google_client_id || '').trim();
-    const localClientId =
-      typeof window !== 'undefined'
-        ? (localStorage.getItem('dkb_google_client_id') || '').trim()
-        : '';
-
-    if (localClientId !== dbClientId) {
-      setCustomGoogleClientId(dbClientId);
+    if (dbClientId) {
+      registerGoogleClientIdToJs(dbClientId);
+    } else {
+      setCustomGoogleClientId('');
     }
   }, [hasSyncedOnce, settings.google_client_id]);
 

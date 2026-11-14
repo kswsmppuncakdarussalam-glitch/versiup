@@ -54,7 +54,8 @@ import {
 import { GoogleAccountSelectModal } from '../components/modals/GoogleAccountSelectModal.js';
 import {
   getGoogleClientId,
-  setCustomGoogleClientId,
+  normalizeGoogleClientId,
+  registerGoogleClientIdToJs,
 } from '../utils/googleWorkspace.js';
 import {
   SCHOOL_NAME_PRESETS,
@@ -148,9 +149,10 @@ export const AdminView: React.FC = () => {
   const [showClientIdConfig, setShowClientIdConfig] = useState(false);
 
   const isCloudConfiguredInDb = Boolean(
-    settings.google_client_id?.trim() &&
-      settings.google_account_email?.trim() &&
-      (settings.google_sheet_id?.trim() || settings.google_drive_folder_id?.trim())
+    settings.google_oauth_connected ||
+      (settings.google_client_id?.trim() &&
+        settings.google_account_email?.trim() &&
+        (settings.google_sheet_id?.trim() || settings.google_drive_folder_id?.trim()))
   );
   const [isEditingDriveIds, setIsEditingDriveIds] = useState(false);
   const [inlineSheetIdInput, setInlineSheetIdInput] = useState('');
@@ -803,15 +805,15 @@ export const AdminView: React.FC = () => {
                 </>
               ) : googleOAuthActive || serverDriveSyncActive ? (
                 <>
-                  <strong>Google OAuth 2.0 &amp; Auto-Sync Drive/Sheets Aktif:</strong> Setiap perubahan Sesi, Data Siswa, Kelas, Presensi, Izin, Pelanggaran, Email &amp; ID Cloud otomatis tersinkron ke Database, Google Drive, dan Google Sheets tanpa klik manual.
+                  <strong>Terhubung Permanen (Email, Database, Drive &amp; Sheets Aktif):</strong> Koneksi tetap tersambung meski halaman di-refresh atau keluar-masuk aplikasi. Setiap perubahan Sesi, Data Siswa, Kelas, Presensi, Izin, Pelanggaran, Email &amp; ID Cloud langsung tersinkron otomatis.
                 </>
               ) : isCloudConfiguredInDb ? (
                 <>
-                  <strong>ID Cloud &amp; Multi-Perangkat Tersinkron:</strong> ID Cloud Console, akun sekolah, folder Drive &amp; Spreadsheet sudah tersimpan otomatis di Database &amp; Google Sheet. Hubungkan OAuth 2.0 di tab ini agar perubahan langsung menulis ke Drive &amp; Sheets.
+                  <strong>ID Cloud &amp; Multi-Perangkat Tersinkron:</strong> ID Cloud Console sudah terdaftar ke JavaScript &amp; Google Sheet. Klik 1x untuk menyegarkan sesi OAuth 2.0 jika masa berlaku token berakhir.
                 </>
               ) : (
                 <>
-                  <strong>Database Multi-Perangkat Aktif:</strong> Atur ID Cloud Console &amp; hubungkan Google OAuth 2.0 di menu Basis Data Google Drive &amp; Sheets agar setiap perubahan otomatis tersinkron ke Drive, Sheets &amp; seluruh perangkat.
+                  <strong>Database Multi-Perangkat Aktif:</strong> Tempel ID Cloud Console (terdaftar otomatis ke JavaScript) &amp; hubungkan Google OAuth 2.0 di menu Basis Data Google Drive &amp; Sheets agar Email, Drive, Sheets &amp; seluruh perangkat sinkron permanen.
                 </>
               )}
             </span>
@@ -827,7 +829,7 @@ export const AdminView: React.FC = () => {
                   : 'bg-amber-600 hover:bg-amber-700'
               }`}
             >
-              {isCloudConfiguredInDb ? 'Hubungkan OAuth 2.0 Tab Ini' : 'Hubungkan Google OAuth 2.0'}
+              {isCloudConfiguredInDb ? 'Perbarui Sesi OAuth 2.0 (1x)' : 'Hubungkan Google OAuth 2.0'}
             </button>
           )}
         </div>
@@ -3218,7 +3220,7 @@ export const AdminView: React.FC = () => {
                     <span className="font-bold text-slate-900 dark:text-white flex flex-wrap items-center gap-2">
                       ID Cloud Console (Google OAuth 2.0 Web Client ID)
                       <span className="px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 text-[10px] font-semibold">
-                        Tersimpan di Aplikasi &amp; Sheet
+                        Terdaftar Otomatis ke JavaScript &amp; Sheet
                       </span>
                     </span>
                     <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400 break-all block mt-0.5">
@@ -3279,60 +3281,76 @@ export const AdminView: React.FC = () => {
                   </div>
 
                   <div>
-                    <div className="flex items-center justify-between mb-1">
+                    <div className="flex flex-wrap items-center justify-between mb-1 gap-1">
                       <label className="block font-semibold text-slate-700 dark:text-slate-300 text-[11px]">
                         OAuth 2.0 Web Client ID (dari console.cloud.google.com):
                       </label>
                       <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
                         {clientIdAutoStatus === 'saving'
-                          ? 'Menyimpan otomatis...'
-                          : 'Tersimpan otomatis di Aplikasi, Google Sheet (Pengaturan) & semua perangkat'}
+                          ? 'Mendaftarkan ke JavaScript & menyimpan...'
+                          : 'Terdaftar Otomatis di JavaScript Runtime, Aplikasi & Sheet (Pengaturan)'}
                       </span>
                     </div>
                     <input
                       type="text"
                       value={customClientIdInput}
+                      onPaste={(e) => {
+                        const pasted = e.clipboardData.getData('text');
+                        if (pasted) {
+                          e.preventDefault();
+                          const cleaned = normalizeGoogleClientId(pasted);
+                          setCustomClientIdInput(cleaned);
+                          registerGoogleClientIdToJs(cleaned);
+                          setClientIdAutoStatus('saving');
+                          if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
+                          clientIdTimerRef.current = setTimeout(async () => {
+                            await updateSettings({ google_client_id: cleaned }, { silent: true });
+                            setClientIdAutoStatus('saved');
+                            showToast('ID Cloud Console otomatis terdaftar ke JavaScript & database!', 'success');
+                          }, 250);
+                        }
+                      }}
                       onChange={(e) => {
-                        const val = e.target.value;
-                        setCustomClientIdInput(val);
+                        const cleaned = normalizeGoogleClientId(e.target.value);
+                        setCustomClientIdInput(cleaned);
+                        // 0ms registration into browser JS runtime & GIS client
+                        registerGoogleClientIdToJs(cleaned);
                         setClientIdAutoStatus('saving');
                         if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
                         clientIdTimerRef.current = setTimeout(async () => {
-                          const cleaned = val.trim();
-                          setCustomGoogleClientId(cleaned);
                           await updateSettings({ google_client_id: cleaned }, { silent: true });
                           setClientIdAutoStatus('saved');
-                        }, 500);
+                        }, 350);
                       }}
                       onBlur={async () => {
                         if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
-                        const cleaned = customClientIdInput.trim();
-                        if (cleaned !== (settings.google_client_id || '').trim()) {
+                        const cleaned = normalizeGoogleClientId(customClientIdInput);
+                        if (cleaned !== normalizeGoogleClientId(settings.google_client_id || '')) {
                           setClientIdAutoStatus('saving');
-                          setCustomGoogleClientId(cleaned);
+                          registerGoogleClientIdToJs(cleaned);
                           await updateSettings({ google_client_id: cleaned }, { silent: true });
                           setClientIdAutoStatus('saved');
                         }
                       }}
-                      placeholder="contoh: 1050818791896-xxxx.apps.googleusercontent.com"
+                      placeholder="Tempel ID Cloud Console: 1050818791896-xxxx.apps.googleusercontent.com"
                       className="w-full px-3 py-1.5 text-xs font-mono bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-800 dark:text-slate-100 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
                     />
                   </div>
 
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                     <p className="text-[11px] text-slate-500">
-                      Cukup simpan ID Cloud 1x — otomatis tersinkron ke seluruh perangkat dan tercatat di lembar <code>Pengaturan</code> Google Sheet tanpa mengetik ulang.
+                      ID Cloud yang ditempel langsung terdaftar ke JavaScript runtime (<code className="font-mono">{typeof window !== 'undefined' ? window.location.origin : ''}</code>), tersinkron ke seluruh perangkat &amp; tercatat di lembar <code>Pengaturan</code>.
                     </p>
                     <div className="flex flex-wrap items-center gap-2 shrink-0">
                       <button
                         type="button"
                         onClick={async () => {
                           const defaultId = '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com';
-                          setCustomGoogleClientId(defaultId);
+                          registerGoogleClientIdToJs(defaultId);
                           await updateSettings({ google_client_id: defaultId }, { silent: true });
                           setCustomClientIdInput(defaultId);
                           setClientIdAutoStatus('saved');
-                          showToast('Client ID dikembalikan ke bawaan & disimpan ke database.', 'info');
+                          showToast('Client ID dikembalikan ke bawaan, terdaftar di JavaScript & disimpan ke database.', 'info');
                         }}
                         className="px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
                       >
@@ -3342,12 +3360,12 @@ export const AdminView: React.FC = () => {
                         type="button"
                         onClick={async () => {
                           if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
-                          const cleaned = customClientIdInput.trim();
+                          const cleaned = normalizeGoogleClientId(customClientIdInput);
                           if (!cleaned) {
                             showToast('Masukkan ID Cloud Console terlebih dahulu.', 'error');
                             return;
                           }
-                          setCustomGoogleClientId(cleaned);
+                          registerGoogleClientIdToJs(cleaned);
                           await updateSettings({ google_client_id: cleaned });
                           setClientIdAutoStatus('saved');
                           setShowClientIdConfig(false);
@@ -3361,18 +3379,18 @@ export const AdminView: React.FC = () => {
                         disabled={googleSyncing}
                         onClick={async () => {
                           if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
-                          const cleaned = customClientIdInput.trim();
+                          const cleaned = normalizeGoogleClientId(customClientIdInput);
                           if (!cleaned) {
                             showToast('Masukkan ID Cloud Console terlebih dahulu.', 'error');
                             return;
                           }
                           setClientIdAutoStatus('saving');
-                          setCustomGoogleClientId(cleaned);
+                          registerGoogleClientIdToJs(cleaned);
                           await updateSettings({ google_client_id: cleaned }, { silent: true });
                           setClientIdAutoStatus('saved');
                           setShowClientIdConfig(false);
                           const targetEmail = settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com';
-                          if (googleOAuthActive) {
+                          if (googleOAuthActive || serverDriveSyncActive) {
                             await syncGoogleSheetsNow(targetEmail, cleaned);
                           } else {
                             await connectGoogle(false, targetEmail, cleaned);
@@ -3418,12 +3436,12 @@ export const AdminView: React.FC = () => {
                         {googleAccount?.name || settings.google_account_name || 'Kesiswaan SMP Puncak Darussalam'}
                       </span>
                       <span className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2.5 py-0.5 rounded-full border ${
-                        googleOAuthActive
+                        googleOAuthActive || serverDriveSyncActive
                           ? 'text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800'
                           : 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-800'
                       }`}>
                         <Check className="w-3 h-3" />
-                        {googleOAuthActive ? 'OAuth 2.0 Terhubung' : 'Email Tersimpan (Aktifkan OAuth 2.0)'}
+                        {googleOAuthActive || serverDriveSyncActive ? 'OAuth 2.0 Terhubung Permanen' : 'Email Tersimpan (Aktifkan OAuth 2.0 1x)'}
                       </span>
                     </div>
                     <p className="text-slate-700 dark:text-slate-300 font-mono text-[11px] font-semibold flex items-center gap-1.5">
@@ -3431,7 +3449,7 @@ export const AdminView: React.FC = () => {
                       <span>{googleAccount?.email || settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}</span>
                     </p>
                     <p className="text-[10px] text-slate-500">
-                      Email akun Google &amp; notifikasi orang tua aktif otomatis saat OAuth 2.0 terhubung tanpa klik sinkronisasi manual.
+                      Menggunakan ruang lingkup resmi non-terbatas (bebas pelanggaran). Sekali dihubungkan, Email, DB, Drive &amp; Sheets tetap tersambung terus meski refresh atau keluar-masuk aplikasi.
                     </p>
                     {settings.google_last_synced_at && (
                       <p className="text-[10px] text-slate-400">
@@ -3481,7 +3499,7 @@ export const AdminView: React.FC = () => {
                         title="Sinkronisasi Drive & Sheets otomatis aktif setelah sesi OAuth 2.0 diotorisasi"
                       >
                         <RefreshCw className={`w-3.5 h-3.5 ${googleSyncing ? 'animate-spin' : ''}`} />
-                        <span>{googleSyncing ? 'Menyinkronkan...' : googleOAuthActive ? 'Perbarui Drive & Sheets' : 'Aktifkan Sesi OAuth 2.0'}</span>
+                        <span>{googleSyncing ? 'Menyinkronkan...' : googleOAuthActive || serverDriveSyncActive ? 'Perbarui Drive & Sheets' : 'Aktifkan Sesi OAuth 2.0'}</span>
                       </button>
 
                       <button

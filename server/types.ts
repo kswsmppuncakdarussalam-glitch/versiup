@@ -181,6 +181,7 @@ export interface AppSettings {
   toggle_kiosk_mode: boolean;
   // Google Drive & Sheets Integration
   google_client_id?: string;
+  google_oauth_connected?: boolean;
   google_account_email?: string;
   google_account_name?: string;
   google_account_photo?: string;
