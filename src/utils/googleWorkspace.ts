@@ -21,6 +21,7 @@ import {
   AppSettings,
   NotificationSettings,
 } from '../types/index.js';
+import { buildSessionRecapData } from './sessionHelper.js';
 
 // Standard non-restricted Google Workspace scopes (avoids OAuth restricted-scope verification blocks)
 export const SCOPES = [
@@ -619,6 +620,7 @@ export const getOrCreateSpreadsheet = async (
     'Siswa',
     'Kelas',
     'Sesi_Presensi',
+    'Rekap_Per_Sesi',
     'Presensi',
     'Izin_Keluar',
     'Pelanggaran',
@@ -896,6 +898,7 @@ export const syncAllDataToGoogleSheets = async (
     'Siswa',
     'Kelas',
     'Sesi_Presensi',
+    'Rekap_Per_Sesi',
     'Presensi',
     'Izin_Keluar',
     'Pelanggaran',
@@ -962,7 +965,7 @@ export const syncAllDataToGoogleSheets = async (
 
   // 3. Format Sesi rows
   const sesiRows = [
-    ['ID Sesi', 'Nama Sesi', 'Jam Mulai', 'Batas Tepat Waktu', 'Jam Selesai', 'Toleransi Terlambat (Menit)', 'Hari Aktif (0=Min,1=Sen..)', 'Status'],
+    ['ID Sesi', 'Nama Sesi', 'Jam Mulai', 'Batas Tepat Waktu', 'Jam Selesai', 'Toleransi Terlambat (Menit)', 'Hari Aktif (0=Min,1=Sen..)', 'Status', 'Peralihan Otomatis'],
     ...data.sessions.map((sess) => [
       sess.id,
       sess.name,
@@ -972,15 +975,64 @@ export const syncAllDataToGoogleSheets = async (
       sess.late_tolerance_minutes ?? 0,
       (sess.active_days || [1, 2, 3, 4, 5]).join(', '),
       sess.is_active ? 'Aktif' : 'Nonaktif',
+      data.settings.auto_session_switch !== false ? 'Otomatis (Aktif)' : 'Manual',
+    ]),
+  ];
+
+  // 3b. Format Rekap Per Sesi rows
+  const recapData = buildSessionRecapData({
+    sessions: data.sessions,
+    classes: data.classes,
+    students: data.students,
+    attendance: data.attendance,
+  });
+  const rekapPerSesiRows: any[][] = [
+    ['RINGKASAN REKAPITULASI PRESENSI PER SESI (SELURUH SEKOLAH)', `Tanggal Rekap: ${recapData.targetDate}`],
+    ['ID Sesi', 'Nama Sesi', 'Rentang Jam', 'Batas Tepat Waktu', 'Status Sesi', 'Total Siswa', 'Hadir Tepat Waktu', 'Terlambat', 'Izin', 'Sakit', 'Alpha', 'Belum Presensi', 'Total Tercatat', 'Persentase Kehadiran (%)'],
+    ...recapData.sessionSummaries.map((row) => [
+      row.sessionId,
+      row.sessionName,
+      row.timeRange,
+      row.onTimeLimit,
+      row.statusLabel,
+      row.totalStudents,
+      row.hadir,
+      row.terlambat,
+      row.izin,
+      row.sakit,
+      row.alpha,
+      row.belumPresensi,
+      row.totalRecorded,
+      `${row.attendancePercent}%`,
+    ]),
+    [],
+    ['RINCIAN REKAP PRESENSI PER SESI DAN PER KELAS', `Tanggal Rekap: ${recapData.targetDate}`],
+    ['ID Sesi', 'Nama Sesi', 'ID Kelas', 'Nama Kelas', 'Total Siswa Kelas', 'Hadir', 'Terlambat', 'Izin', 'Sakit', 'Alpha', 'Belum Presensi', 'Total Hadir+Terlambat', 'Persentase Kehadiran (%)'],
+    ...recapData.classSessionSummaries.map((cRow) => [
+      cRow.sessionId,
+      cRow.sessionName,
+      cRow.classId,
+      cRow.className,
+      cRow.totalStudents,
+      cRow.hadir,
+      cRow.terlambat,
+      cRow.izin,
+      cRow.sakit,
+      cRow.alpha,
+      cRow.belumPresensi,
+      cRow.totalAttended,
+      `${cRow.attendancePercent}%`,
     ]),
   ];
 
   // 4. Format Presensi rows (most recent first)
   const studentMap = new Map(data.students.map((s) => [s.nis, s]));
+  const sessionMap = new Map(data.sessions.map((s) => [s.id, s]));
   const presensiRows = [
-    ['ID Presensi', 'Tanggal', 'Jam Pemindaian', 'NIS', 'Nama Siswa', 'Kelas', 'ID Sesi', 'Status Kehadiran', 'Terlambat (Menit)', 'Metode Scan', 'ID Perangkat', 'Catatan'],
+    ['ID Presensi', 'Tanggal', 'Jam Pemindaian', 'NIS', 'Nama Siswa', 'Kelas', 'ID Sesi', 'Nama Sesi', 'Status Kehadiran', 'Terlambat (Menit)', 'Metode Scan', 'ID Perangkat', 'Catatan'],
     ...data.attendance.slice(0, 1500).map((a) => {
       const student = studentMap.get(a.student_id);
+      const sess = sessionMap.get(a.session_id);
       return [
         a.id,
         a.date,
@@ -989,6 +1041,7 @@ export const syncAllDataToGoogleSheets = async (
         student?.name || '-',
         student?.class_id || '-',
         a.session_id,
+        sess?.name || a.session_id,
         a.status,
         a.late_minutes || 0,
         a.method || 'rfid',
@@ -1087,7 +1140,8 @@ export const syncAllDataToGoogleSheets = async (
     ['Email Google Terhubung (OAuth 2.0)', data.settings.google_account_email || '-', 'Akun Google Drive & Sheets sekolah'],
     ['Nama Akun Google', data.settings.google_account_name || '-', 'Nama profil akun Google OAuth 2.0'],
     ['ID Folder Google Drive', data.settings.google_drive_folder_id || '-', 'Folder penyimpanan otomatis database JSON'],
-    ['ID Google Spreadsheet', spreadsheetId, 'ID Google Spreadsheet database 9 lembar kerja'],
+    ['ID Google Spreadsheet', spreadsheetId, 'ID Google Spreadsheet database 10 lembar kerja'],
+    ['Peralihan Sesi Otomatis', data.settings.auto_session_switch !== false ? 'Aktif (Otomatis)' : 'Manual', 'Pergantian sesi otomatis sesuai jadwal & jam server'],
     ['Total Siswa Terdaftar', data.students.length, 'Jumlah siswa aktif & terdaftar'],
     ['Total Kelas', data.classes.length, 'Jumlah rombel kelas'],
     ['Total Sesi Presensi', data.sessions.length, 'Jumlah sesi jadwal presensi'],
@@ -1145,6 +1199,7 @@ export const syncAllDataToGoogleSheets = async (
           { range: 'Siswa!A1', values: siswaRows },
           { range: 'Kelas!A1', values: kelasRows },
           { range: 'Sesi_Presensi!A1', values: sesiRows },
+          { range: 'Rekap_Per_Sesi!A1', values: rekapPerSesiRows },
           { range: 'Presensi!A1', values: presensiRows },
           { range: 'Izin_Keluar!A1', values: izinRows },
           { range: 'Pelanggaran!A1', values: pelanggaranRows },

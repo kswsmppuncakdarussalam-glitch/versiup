@@ -2,6 +2,7 @@ import { storage } from './storage.ts';
 import { authService } from './auth.ts';
 import { notificationService } from './emailer.ts';
 import { googleSheetsClient } from './sheets.ts';
+import { resolveSessionSchedule } from './sessionHelper.ts';
 import * as XLSX from 'xlsx';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
@@ -524,6 +525,36 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       }
     }
 
+    // 3c. SERVER-SIDE GOOGLE DRIVE & SHEETS PUSH: /api/google-sync/push
+    if (pathname === '/api/google-sync/push' && method === 'POST') {
+      if (!googleSheetsClient.isConnected) {
+        return JsonResponse.ok({
+          success: false,
+          needsReauth: true,
+          serverDriveSyncActive: false,
+          oauthTokenExpired: googleSheetsClient.isOAuthExpired,
+        });
+      }
+      const snap = await storage.getFullSnapshot();
+      await googleSheetsClient.syncFullDatabase(snap.db);
+      if (googleSheetsClient.isOAuthExpired || !googleSheetsClient.isConnected) {
+        return JsonResponse.ok({
+          success: false,
+          needsReauth: true,
+          serverDriveSyncActive: false,
+          oauthTokenExpired: true,
+        });
+      }
+      const nowIso = new Date().toISOString();
+      await storage.updateSettings({ google_last_synced_at: nowIso });
+      return JsonResponse.ok({
+        success: true,
+        serverDriveSyncActive: googleSheetsClient.isConnected,
+        oauthTokenExpired: false,
+        syncedAt: nowIso,
+      });
+    }
+
     // 4. ATTENDANCE: /api/attendance
     if (pathname === '/api/attendance') {
       if (method === 'GET') {
@@ -547,25 +578,35 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           return JsonResponse.badRequest('Kartu atau NIS tidak terdaftar dalam database siswa.');
         }
 
-        // Determine session
+        // Determine session with authoritative automatic session switching
         const sessions = await storage.getSessions();
-        let session = sessions.find((s) => s.id === sessionId && s.is_active);
+        const settings = await storage.getSettings();
+        const autoSwitchEnabled = settings.auto_session_switch !== false;
+        const { manualOverride } = req.body;
 
         const now = new Date();
         const currentTimeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
         const currentDateStr = now.toISOString().split('T')[0];
 
-        if (!session) {
-          // Find currently active session by time
-          session = sessions.find((s) => {
-            if (!s.is_active) return false;
-            return currentTimeStr >= s.start_time && currentTimeStr <= s.end_time;
-          });
+        const scheduleState = resolveSessionSchedule(
+          sessions,
+          now,
+          autoSwitchEnabled,
+          manualOverride ? sessionId : undefined
+        );
+
+        let session = undefined;
+        if (manualOverride && sessionId) {
+          session = sessions.find((s) => s.id === sessionId);
+        } else if (autoSwitchEnabled && scheduleState.liveWindowSession) {
+          // Always follow authoritative live window when auto-switch is enabled
+          session = scheduleState.liveWindowSession;
+        } else if (sessionId) {
+          session = sessions.find((s) => s.id === sessionId && s.is_active);
         }
 
-        // If no session matches exact time window, fallback gracefully to active session or first session
         if (!session) {
-          session = sessions.find((s) => s.is_active) || sessions[0];
+          session = scheduleState.activeSession || sessions.find((s) => s.is_active) || sessions[0];
         }
 
         const activeSession = session || sessions[0];
@@ -590,17 +631,15 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         let attStatus = status || 'Hadir';
         let lateMinutes = 0;
 
-        if (!status) {
-          // Automatic status based on session on_time_limit
-          if (currentTimeStr > activeSession.on_time_limit) {
-            const [limitH, limitM] = activeSession.on_time_limit.split(':').map(Number);
-            const [currH, currM] = currentTimeStr.split(':').map(Number);
-            const diffMinutes = (currH * 60 + currM) - (limitH * 60 + limitM);
+        if (!status && activeSession?.on_time_limit) {
+          const [limitH, limitM] = activeSession.on_time_limit.split(':').map(Number);
+          const curMinTotal = now.getHours() * 60 + now.getMinutes();
+          const limitMinTotal = (limitH || 0) * 60 + (limitM || 0);
+          const diffMinutes = curMinTotal - limitMinTotal;
 
-            if (diffMinutes > 0) {
-              lateMinutes = diffMinutes;
-              attStatus = 'Terlambat';
-            }
+          if (diffMinutes > 0) {
+            lateMinutes = diffMinutes;
+            attStatus = 'Terlambat';
           }
         }
 

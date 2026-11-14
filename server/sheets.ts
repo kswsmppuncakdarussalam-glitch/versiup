@@ -1,5 +1,12 @@
+import fs from 'fs';
+import path from 'path';
 import { google } from 'googleapis';
 import { writeQueue } from './queue.ts';
+import { buildSessionRecapData } from './sessionHelper.ts';
+
+const IS_VERCEL_SHEETS = Boolean(process.env.VERCEL || process.env.NOW_REGION || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const SHEETS_DATA_DIR = IS_VERCEL_SHEETS ? path.join('/tmp', 'dkb_data') : path.resolve(process.cwd(), '.data');
+const OAUTH_SESSION_FILE = path.join(SHEETS_DATA_DIR, 'oauth_session.json');
 
 /**
  * Google Sheets API Integration with Service Account credentials
@@ -16,7 +23,62 @@ export class GoogleSheetsClient {
     this.init();
   }
 
+  private loadPersistedOAuthSession(): void {
+    try {
+      if (!fs.existsSync(OAUTH_SESSION_FILE)) return;
+      const raw = fs.readFileSync(OAUTH_SESSION_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed?.accessToken && typeof parsed.expiresAt === 'number') {
+        if (Date.now() < parsed.expiresAt - 30000) {
+          this.oauthAccessToken = parsed.accessToken;
+          this.oauthExpiresAt = parsed.expiresAt;
+          this.oauthEmail = parsed.email || '';
+          this.oauthTokenExpired = false;
+        } else {
+          this.oauthAccessToken = '';
+          this.oauthExpiresAt = 0;
+          this.oauthEmail = parsed.email || '';
+          this.oauthTokenExpired = true;
+        }
+      }
+    } catch {
+      // Ignore corrupt or unavailable oauth_session cache
+    }
+  }
+
+  private savePersistedOAuthSession(): void {
+    try {
+      if (!fs.existsSync(SHEETS_DATA_DIR)) {
+        fs.mkdirSync(SHEETS_DATA_DIR, { recursive: true });
+      }
+      const tmp = `${OAUTH_SESSION_FILE}.tmp.${Date.now()}`;
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({
+          accessToken: this.oauthAccessToken,
+          expiresAt: this.oauthExpiresAt,
+          email: this.oauthEmail,
+          updatedAt: new Date().toISOString(),
+        }),
+        'utf-8'
+      );
+      fs.renameSync(tmp, OAUTH_SESSION_FILE);
+    } catch (err) {
+      console.warn('[GoogleSheetsClient] Failed to persist OAuth session:', err);
+    }
+  }
+
+  private removePersistedOAuthSession(): void {
+    try {
+      if (fs.existsSync(OAUTH_SESSION_FILE)) {
+        fs.unlinkSync(OAUTH_SESSION_FILE);
+      }
+    } catch {}
+  }
+
   private init() {
+    this.loadPersistedOAuthSession();
+
     const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
     const rawKey = process.env.GOOGLE_PRIVATE_KEY;
     this.spreadsheetId = process.env.SPREADSHEET_ID || '';
@@ -85,6 +147,7 @@ export class GoogleSheetsClient {
     this.oauthExpiresAt = Date.now() + ttl * 1000;
     this.oauthEmail = email || this.oauthEmail;
     this.oauthTokenExpired = false;
+    this.savePersistedOAuthSession();
   }
 
   public clearOAuthSession(): void {
@@ -92,6 +155,7 @@ export class GoogleSheetsClient {
     this.oauthExpiresAt = 0;
     this.oauthEmail = '';
     this.oauthTokenExpired = false;
+    this.removePersistedOAuthSession();
   }
 
   /**
@@ -211,6 +275,7 @@ export class GoogleSheetsClient {
         'Siswa',
         'Kelas',
         'Sesi_Presensi',
+        'Rekap_Per_Sesi',
         'Presensi',
         'Izin_Keluar',
         'Pelanggaran',
@@ -218,6 +283,13 @@ export class GoogleSheetsClient {
         'Jenis_Pelanggaran',
         'Pengaturan',
       ];
+      const sessionMap = new Map<string, any>(sessions.map((s: any) => [s.id, s]));
+      const recapData = buildSessionRecapData({
+        sessions,
+        classes,
+        students,
+        attendance,
+      });
 
       const buildDataPayload = () => [
         {
@@ -237,17 +309,69 @@ export class GoogleSheetsClient {
         {
           range: 'Sesi_Presensi!A1',
           values: [
-            ['ID Sesi', 'Nama Sesi', 'Jam Mulai', 'Batas Tepat Waktu', 'Jam Selesai', 'Toleransi Terlambat (Menit)', 'Hari Aktif (0=Min,1=Sen..)', 'Status'],
-            ...sessions.map((sess: any) => [sess.id, sess.name, sess.start_time, sess.on_time_limit, sess.end_time, sess.late_tolerance_minutes ?? 0, (sess.active_days || [1, 2, 3, 4, 5]).join(', '), sess.is_active ? 'Aktif' : 'Nonaktif']),
+            ['ID Sesi', 'Nama Sesi', 'Jam Mulai', 'Batas Tepat Waktu', 'Jam Selesai', 'Toleransi Terlambat (Menit)', 'Hari Aktif (0=Min,1=Sen..)', 'Status', 'Peralihan Otomatis'],
+            ...sessions.map((sess: any) => [
+              sess.id,
+              sess.name,
+              sess.start_time,
+              sess.on_time_limit,
+              sess.end_time,
+              sess.late_tolerance_minutes ?? 0,
+              (sess.active_days || [1, 2, 3, 4, 5]).join(', '),
+              sess.is_active ? 'Aktif' : 'Nonaktif',
+              settings.auto_session_switch !== false ? 'Otomatis (Aktif)' : 'Manual',
+            ]),
+          ],
+        },
+        {
+          range: 'Rekap_Per_Sesi!A1',
+          values: [
+            ['RINGKASAN REKAPITULASI PRESENSI PER SESI (SELURUH SEKOLAH)', `Tanggal Rekap: ${recapData.targetDate}`, '', '', '', '', '', '', '', '', '', '', '', ''],
+            ['ID Sesi', 'Nama Sesi', 'Rentang Jam', 'Batas Tepat Waktu', 'Status Sesi', 'Total Siswa', 'Hadir Tepat Waktu', 'Terlambat', 'Izin', 'Sakit', 'Alpha', 'Belum Presensi', 'Total Tercatat', 'Persentase Kehadiran (%)'],
+            ...recapData.sessionSummaries.map((row) => [
+              row.sessionId,
+              row.sessionName,
+              row.timeRange,
+              row.onTimeLimit,
+              row.statusLabel,
+              row.totalStudents,
+              row.hadir,
+              row.terlambat,
+              row.izin,
+              row.sakit,
+              row.alpha,
+              row.belumPresensi,
+              row.totalRecorded,
+              `${row.attendancePercent}%`,
+            ]),
+            [],
+            ['RINCIAN REKAP PRESENSI PER SESI DAN PER KELAS', `Tanggal Rekap: ${recapData.targetDate}`, '', '', '', '', '', '', '', '', '', ''],
+            ['ID Sesi', 'Nama Sesi', 'ID Kelas', 'Nama Kelas', 'Total Siswa Kelas', 'Hadir', 'Terlambat', 'Izin', 'Sakit', 'Alpha', 'Belum Presensi', 'Total Hadir+Terlambat', 'Persentase Kehadiran (%)'],
+            ...recapData.classSessionSummaries.map((cRow) => [
+              cRow.sessionId,
+              cRow.sessionName,
+              cRow.classId,
+              cRow.className,
+              cRow.totalStudents,
+              cRow.hadir,
+              cRow.terlambat,
+              cRow.izin,
+              cRow.sakit,
+              cRow.alpha,
+              cRow.belumPresensi,
+              cRow.totalAttended,
+              `${cRow.attendancePercent}%`,
+            ]),
           ],
         },
         {
           range: 'Presensi!A1',
           values: [
-            ['ID Presensi', 'Tanggal', 'Jam', 'NIS', 'Nama Siswa', 'Kelas', 'ID Sesi', 'Status', 'Terlambat (Menit)', 'Metode', 'Perangkat', 'Catatan'],
+            ['ID Presensi', 'Tanggal', 'Jam', 'NIS', 'Nama Siswa', 'Kelas', 'ID Sesi', 'Nama Sesi', 'Status', 'Terlambat (Menit)', 'Metode', 'Perangkat', 'Catatan'],
             ...attendance.slice(0, 1500).map((a: any) => {
               const st = studentMap.get(a.student_id);
-              return [a.id, a.date, a.timestamp ? new Date(a.timestamp).toLocaleTimeString('id-ID') : '-', a.student_id, st?.name || '-', st?.class_id || '-', a.session_id, a.status, a.late_minutes || 0, a.method || 'rfid', a.device_id || 'utama', a.notes || ''];
+              const sess = sessionMap.get(a.session_id);
+              return [a.id, a.date, a.timestamp ? new Date(a.timestamp).toLocaleTimeString('id-ID') : '-', a.student_id, st?.name || '-', st?.class_id || '-', a.session_id, sess?.name || a.session_id, a.status, a.late_minutes || 0, a.method || 'rfid', a.device_id || 'utama', a.notes || ''];
             }),
           ],
         },
@@ -297,7 +421,8 @@ export class GoogleSheetsClient {
             ['Email Google Terhubung (OAuth 2.0)', settings.google_account_email || this.oauthEmail || '-', 'Akun Google Drive & Sheets sekolah'],
             ['Nama Akun Google', settings.google_account_name || '-', 'Nama profil akun Google OAuth 2.0'],
             ['ID Folder Google Drive', targetFolderId || settings.google_drive_folder_id || '-', 'Folder penyimpanan otomatis database JSON'],
-            ['ID Google Spreadsheet', targetSheetId || '-', 'ID Google Spreadsheet database 9 lembar kerja'],
+            ['ID Google Spreadsheet', targetSheetId || '-', 'ID Google Spreadsheet database 10 lembar kerja'],
+            ['Peralihan Sesi Otomatis', settings.auto_session_switch !== false ? 'Aktif (Otomatis)' : 'Manual', 'Pergantian sesi otomatis sesuai jam server'],
             ['Total Siswa Terdaftar', students.length, 'Jumlah siswa terdaftar'],
             ['Total Kelas', classes.length, 'Jumlah kelas'],
             ['Total Sesi Presensi', sessions.length, 'Jumlah sesi jadwal presensi'],
@@ -316,6 +441,37 @@ export class GoogleSheetsClient {
       if (useOAuthToken && this.oauthAccessToken) {
         const token = this.oauthAccessToken;
         if (targetSheetId) {
+          // Ensure all 10 sheet tabs (including Rekap_Per_Sesi) exist before clearing/writing
+          const metaRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${targetSheetId}?fields=sheets.properties.title`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (metaRes.status === 401) {
+            this.oauthAccessToken = '';
+            this.oauthExpiresAt = 0;
+            this.oauthTokenExpired = true;
+            this.removePersistedOAuthSession();
+            return;
+          }
+          if (metaRes.ok) {
+            const metaJson = await metaRes.json().catch(() => ({}));
+            const existingTitles: string[] = (metaJson.sheets || []).map((s: any) => s.properties?.title);
+            const missing = requiredSheets.filter((t) => !existingTitles.includes(t));
+            if (missing.length > 0) {
+              await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${targetSheetId}:batchUpdate`, {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  requests: missing.map((title) => ({
+                    addSheet: { properties: { title, gridProperties: { frozenRowCount: 1 } } },
+                  })),
+                }),
+              });
+            }
+          }
+
           const clearRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${targetSheetId}/values:batchClear`, {
             method: 'POST',
             headers: {
@@ -328,6 +484,7 @@ export class GoogleSheetsClient {
             this.oauthAccessToken = '';
             this.oauthExpiresAt = 0;
             this.oauthTokenExpired = true;
+            this.removePersistedOAuthSession();
             return;
           }
           const writeRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${targetSheetId}/values:batchUpdate`, {
@@ -342,6 +499,7 @@ export class GoogleSheetsClient {
             this.oauthAccessToken = '';
             this.oauthExpiresAt = 0;
             this.oauthTokenExpired = true;
+            this.removePersistedOAuthSession();
             return;
           }
         }
@@ -383,6 +541,7 @@ export class GoogleSheetsClient {
             this.oauthAccessToken = '';
             this.oauthExpiresAt = 0;
             this.oauthTokenExpired = true;
+            this.removePersistedOAuthSession();
           }
         }
         return;

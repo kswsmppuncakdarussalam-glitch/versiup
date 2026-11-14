@@ -26,8 +26,13 @@ import { Student, AttendanceRecord, AttendanceStatus } from '../types/index.js';
 export const AttendanceView: React.FC = () => {
   const {
     students,
+    sessions,
     attendance,
     activeSession,
+    sessionSchedule,
+    lastSessionTransition,
+    dismissSessionTransition,
+    setManualSessionOverride,
     currentServerTime,
     settings,
     recordAttendance,
@@ -38,6 +43,9 @@ export const AttendanceView: React.FC = () => {
     speak,
     showToast,
   } = useApp();
+
+  const [counterScope, setCounterScope] = useState<'session' | 'today'>('session');
+  const [manualTargetSessionId, setManualTargetSessionId] = useState<string>('');
 
   const [scanInput, setScanInput] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -176,9 +184,10 @@ export const AttendanceView: React.FC = () => {
     e.preventDefault();
     if (!selectedStudent) return;
 
+    const chosenSessionId = manualTargetSessionId || activeSession?.id;
     const res = await recordAttendance({
       studentId: selectedStudent.nis,
-      sessionId: activeSession?.id,
+      sessionId: chosenSessionId,
       status: manualStatus,
       notes: manualNotes,
       method: 'manual',
@@ -188,8 +197,9 @@ export const AttendanceView: React.FC = () => {
       setShowManualModal(false);
       const studentName = selectedStudent.name;
       const studentClass = selectedStudent.class_id;
+      const targetSessName = sessions.find((s) => s.id === res.record?.session_id)?.name || activeSession?.name || 'presensi';
       const speechMsg = `${studentName}, kelas ${studentClass}, Tercatat ${manualStatus}.`;
-      const displayMsg = `Presensi manual ${studentName} (${studentClass}) berhasil disimpan dengan status ${manualStatus}.`;
+      const displayMsg = `Presensi manual ${studentName} (${studentClass}) pada sesi ${targetSessName} berhasil disimpan dengan status ${manualStatus}.`;
       setModalStudent(selectedStudent);
       setModalRecord(res.record);
       setModalMessage(displayMsg);
@@ -206,18 +216,22 @@ export const AttendanceView: React.FC = () => {
     }
   };
 
-  // Today's attendance calculation
+  // Today's attendance calculation (auto-switches cleanly with activeSession when counterScope === 'session')
   const todayStr = currentServerTime.toISOString().split('T')[0];
-  const todayAttendance = attendance.filter((a) => a.date === todayStr);
+  const todayAttendanceAll = attendance.filter((a) => a.date === todayStr);
+  const activeSessionAttendance = activeSession
+    ? todayAttendanceAll.filter((a) => a.session_id === activeSession.id)
+    : todayAttendanceAll;
+  const scopedAttendance = counterScope === 'session' ? activeSessionAttendance : todayAttendanceAll;
 
   const totalStudents = students.length;
-  const hadirCount = todayAttendance.filter((a) => a.status === 'Hadir').length;
-  const terlambatCount = todayAttendance.filter((a) => a.status === 'Terlambat').length;
-  const sudahPresensiCount = todayAttendance.length;
-  const belumPresensiCount = Math.max(0, totalStudents - sudahPresensiCount);
+  const hadirCount = scopedAttendance.filter((a) => a.status === 'Hadir').length;
+  const terlambatCount = scopedAttendance.filter((a) => a.status === 'Terlambat').length;
+  const uniquePresensiCount = new Set(scopedAttendance.map((a) => a.student_id)).size;
+  const belumPresensiCount = Math.max(0, totalStudents - uniquePresensiCount);
 
   // Recent attendance list
-  const recentAttendance = todayAttendance.slice(0, 10);
+  const recentAttendance = scopedAttendance.slice(0, 12);
 
   // Filter students for manual modal autocomplete (instantly shows students)
   const filteredStudents = manualSearch.trim()
@@ -258,62 +272,222 @@ export const AttendanceView: React.FC = () => {
             </div>
           </div>
 
-          {/* Active Session Info */}
-          <div className="text-center md:text-right">
-            <div className="inline-flex items-center gap-2 px-3 py-1 rounded bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+          {/* Active Session Info & Auto-Switch Status */}
+          <div className="text-center md:text-right space-y-1">
+            <div className="inline-flex flex-wrap items-center justify-center md:justify-end gap-2 px-3 py-1 rounded bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+              <span
+                className={`w-2.5 h-2.5 rounded-full ${
+                  sessionSchedule.status === 'active'
+                    ? 'bg-emerald-500 animate-pulse'
+                    : sessionSchedule.status === 'override'
+                    ? 'bg-indigo-500'
+                    : 'bg-amber-500'
+                }`}
+              />
               <span className="text-xs font-bold text-slate-900 dark:text-white">
                 {activeSession ? activeSession.name : 'Tidak Ada Sesi Terjadwal'}
               </span>
+              <span
+                className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                  sessionSchedule.manualSessionId
+                    ? 'bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-300'
+                    : sessionSchedule.isAutoSwitchEnabled
+                    ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                    : 'bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-300'
+                }`}
+              >
+                {sessionSchedule.manualSessionId
+                  ? 'Manual Override'
+                  : sessionSchedule.isAutoSwitchEnabled
+                  ? 'Peralihan Otomatis'
+                  : 'Mode Manual'}
+              </span>
             </div>
             {activeSession && (
-              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                Batas Tepat Waktu: <span className="font-semibold text-slate-800 dark:text-slate-200">{activeSession.on_time_limit}</span> (Toleransi: {activeSession.late_tolerance_minutes}m)
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Jadwal: <span className="font-mono font-semibold text-slate-700 dark:text-slate-300">{activeSession.start_time} - {activeSession.end_time}</span> • Tepat Waktu s/d{' '}
+                <span className="font-semibold text-slate-800 dark:text-slate-200">{activeSession.on_time_limit}</span>
+                {sessionSchedule.status === 'active' && sessionSchedule.minutesRemaining > 0 && (
+                  <span className="ml-1.5 text-emerald-600 dark:text-emerald-400 font-semibold">
+                    (Sisa {sessionSchedule.minutesRemaining}m)
+                  </span>
+                )}
+                {sessionSchedule.status === 'upcoming' && sessionSchedule.nextSession && (
+                  <span className="ml-1.5 text-amber-600 dark:text-amber-400 font-semibold">
+                    (Mulai dlm {sessionSchedule.minutesUntilNext}m)
+                  </span>
+                )}
               </p>
             )}
           </div>
         </div>
 
-        {/* Quick Counters */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-4">
-          <div className="p-3 rounded border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/40">
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-slate-500 dark:text-slate-400">Total Siswa</span>
-              <Users className="w-4 h-4 text-slate-400" />
+        {/* Live Session Transition Banner */}
+        {lastSessionTransition && (
+          <div className="mt-4 p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 flex items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2.5 text-emerald-900 dark:text-emerald-200">
+              <Clock className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0 animate-pulse" />
+              <div>
+                <span className="font-bold">Peralihan Sesi Otomatis: </span>
+                <span>
+                  {lastSessionTransition.fromName
+                    ? `Sesi berganti otomatis dari "${lastSessionTransition.fromName}" ke `
+                    : 'Memasuki sesi '}
+                  <strong>"{lastSessionTransition.toSession.name}"</strong> ({lastSessionTransition.toSession.start_time} - {lastSessionTransition.toSession.end_time}). Pemindaian kartu kini tercatat ke sesi baru.
+                </span>
+              </div>
             </div>
-            <p className="text-xl font-bold text-slate-900 dark:text-white mt-1">
-              {totalStudents}
-            </p>
+            <button
+              type="button"
+              onClick={dismissSessionTransition}
+              className="text-emerald-700 hover:text-emerald-900 dark:text-emerald-300 p-1"
+              title="Tutup info peralihan"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {/* Today's Automatic Session Timeline Strip */}
+        {sessionSchedule.todayTimeline.length > 0 && (
+          <div className="mt-4 pt-3 border-t border-slate-100 dark:border-slate-800">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+              <span className="text-[11px] font-semibold text-slate-600 dark:text-slate-300 flex items-center gap-1.5">
+                <Clock className="w-3.5 h-3.5 text-slate-400" />
+                Jadwal Sesi Hari Ini ({sessionSchedule.manualSessionId ? 'Dikunci Manual' : sessionSchedule.isAutoSwitchEnabled ? 'Beralih Otomatis Sesuai Jam Server' : 'Mode Manual'}):
+              </span>
+              {sessionSchedule.manualSessionId && (
+                <button
+                  type="button"
+                  onClick={() => setManualSessionOverride(null)}
+                  className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-400 hover:underline"
+                >
+                  Kembali ke Peralihan Otomatis
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {sessionSchedule.todayTimeline.map((item) => {
+                const isSelected = activeSession?.id === item.session.id;
+                const isLive = item.status === 'active';
+                const isDone = item.status === 'completed';
+                return (
+                  <button
+                    key={item.session.id}
+                    type="button"
+                    onClick={() =>
+                      setManualSessionOverride(
+                        sessionSchedule.manualSessionId === item.session.id ? null : item.session.id
+                      )
+                    }
+                    title={
+                      sessionSchedule.manualSessionId === item.session.id
+                        ? 'Klik untuk kembali ke mode otomatis'
+                        : `Klik jika ingin mengunci presensi sementara ke sesi ${item.session.name}`
+                    }
+                    className={`px-2.5 py-1.5 rounded-md border text-left transition-all text-[11px] flex items-center gap-2 ${
+                      isSelected
+                        ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 border-slate-900 dark:border-white shadow-xs'
+                        : isDone
+                        ? 'bg-slate-50 dark:bg-slate-800/40 text-slate-400 border-slate-200 dark:border-slate-800'
+                        : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    <span
+                      className={`w-2 h-2 rounded-full shrink-0 ${
+                        isLive
+                          ? 'bg-emerald-400 animate-pulse'
+                          : isDone
+                          ? 'bg-slate-400'
+                          : 'bg-amber-400'
+                      }`}
+                    />
+                    <div>
+                      <span className="font-bold block leading-tight">{item.session.name}</span>
+                      <span className={`font-mono text-[10px] ${isSelected ? 'opacity-85' : 'text-slate-400'}`}>
+                        {item.session.start_time}-{item.session.end_time}
+                        {isLive ? ' • Aktif' : isDone ? ' • Selesai' : item.minutesUntilStart > 0 ? ` • ${item.minutesUntilStart}m lagi` : ''}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Quick Counters with Automatic Session vs Today Scope */}
+        <div className="pt-4 space-y-2">
+          <div className="flex items-center justify-between text-[11px]">
+            <span className="text-slate-500 dark:text-slate-400 font-medium">
+              Statistik {counterScope === 'session' && activeSession ? `Sesi "${activeSession.name}"` : 'Semua Sesi Hari Ini'}:
+            </span>
+            <div className="inline-flex rounded border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 p-0.5">
+              <button
+                type="button"
+                onClick={() => setCounterScope('session')}
+                className={`px-2 py-0.5 rounded font-medium ${
+                  counterScope === 'session'
+                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-500'
+                }`}
+              >
+                Sesi Aktif
+              </button>
+              <button
+                type="button"
+                onClick={() => setCounterScope('today')}
+                className={`px-2 py-0.5 rounded font-medium ${
+                  counterScope === 'today'
+                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-500'
+                }`}
+              >
+                Semua Sesi Hari Ini
+              </button>
+            </div>
           </div>
 
-          <div className="p-3 rounded border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/40 dark:bg-emerald-950/20">
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-emerald-700 dark:text-emerald-400 font-medium">Tepat Waktu</span>
-              <UserCheck className="w-4 h-4 text-emerald-500" />
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="p-3 rounded border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/40">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-slate-500 dark:text-slate-400">Total Siswa</span>
+                <Users className="w-4 h-4 text-slate-400" />
+              </div>
+              <p className="text-xl font-bold text-slate-900 dark:text-white mt-1">
+                {totalStudents}
+              </p>
             </div>
-            <p className="text-xl font-bold text-emerald-900 dark:text-emerald-300 mt-1">
-              {hadirCount}
-            </p>
-          </div>
 
-          <div className="p-3 rounded border border-amber-200 dark:border-amber-900/60 bg-amber-50/40 dark:bg-amber-950/20">
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-amber-700 dark:text-amber-400 font-medium">Terlambat</span>
-              <Clock className="w-4 h-4 text-amber-500" />
+            <div className="p-3 rounded border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/40 dark:bg-emerald-950/20">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-emerald-700 dark:text-emerald-400 font-medium">Tepat Waktu</span>
+                <UserCheck className="w-4 h-4 text-emerald-500" />
+              </div>
+              <p className="text-xl font-bold text-emerald-900 dark:text-emerald-300 mt-1">
+                {hadirCount}
+              </p>
             </div>
-            <p className="text-xl font-bold text-amber-900 dark:text-amber-300 mt-1">
-              {terlambatCount}
-            </p>
-          </div>
 
-          <div className="p-3 rounded border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/40">
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-slate-500 dark:text-slate-400">Belum Hadir</span>
-              <UserX className="w-4 h-4 text-slate-400" />
+            <div className="p-3 rounded border border-amber-200 dark:border-amber-900/60 bg-amber-50/40 dark:bg-amber-950/20">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-amber-700 dark:text-amber-400 font-medium">Terlambat</span>
+                <Clock className="w-4 h-4 text-amber-500" />
+              </div>
+              <p className="text-xl font-bold text-amber-900 dark:text-amber-300 mt-1">
+                {terlambatCount}
+              </p>
             </div>
-            <p className="text-xl font-bold text-slate-900 dark:text-white mt-1">
-              {belumPresensiCount}
-            </p>
+
+            <div className="p-3 rounded border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/40">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-slate-500 dark:text-slate-400">Belum Hadir</span>
+                <UserX className="w-4 h-4 text-slate-400" />
+              </div>
+              <p className="text-xl font-bold text-slate-900 dark:text-white mt-1">
+                {belumPresensiCount}
+              </p>
+            </div>
           </div>
         </div>
       </div>
@@ -456,7 +630,7 @@ export const AttendanceView: React.FC = () => {
           <div className="flex items-center gap-2">
             <CheckCircle className="w-4 h-4 text-slate-500" />
             <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
-              Presensi Terbaru Real-Time ({todayAttendance.length} siswa hari ini)
+              Presensi Terbaru Real-Time ({scopedAttendance.length} catatan {counterScope === 'session' && activeSession ? `di sesi ${activeSession.name}` : 'hari ini'})
             </h3>
           </div>
           <span className="text-[11px] text-slate-400">Diperbarui otomatis</span>
@@ -464,12 +638,13 @@ export const AttendanceView: React.FC = () => {
 
         {recentAttendance.length === 0 ? (
           <div className="py-8 text-center text-slate-400 text-xs">
-            Belum ada siswa yang melakukan presensi hari ini.
+            Belum ada siswa yang melakukan presensi pada sesi ini hari ini.
           </div>
         ) : (
           <div className="divide-y divide-slate-100 dark:divide-slate-800 mt-2">
             {recentAttendance.map((rec) => {
               const student = students.find((s) => s.nis === rec.student_id);
+              const sessName = sessions.find((s) => s.id === rec.session_id)?.name || rec.session_id;
               return (
                 <div
                   key={rec.id}
@@ -491,7 +666,7 @@ export const AttendanceView: React.FC = () => {
                         {student?.name || rec.student_id}
                       </p>
                       <p className="text-[11px] text-slate-400">
-                        Kelas {student?.class_id || '-'} • NIS: {rec.student_id} • Metode: {rec.method}
+                        Kelas {student?.class_id || '-'} • NIS: {rec.student_id} • Sesi: <span className="font-semibold text-slate-600 dark:text-slate-300">{sessName}</span> • {rec.method}
                       </p>
                     </div>
                   </div>
@@ -705,6 +880,24 @@ export const AttendanceView: React.FC = () => {
                   </div>
                 </div>
               )}
+
+              {/* Target Session Selector inside Manual Modal */}
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1 text-xs">
+                  Sesi Presensi Target:
+                </label>
+                <select
+                  value={manualTargetSessionId || activeSession?.id || ''}
+                  onChange={(e) => setManualTargetSessionId(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                >
+                  {sessions.filter((s) => s.is_active).map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name} ({s.start_time} - {s.end_time}){activeSession?.id === s.id ? ' — [Sesi Aktif Otomatis]' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
               {/* Notes */}
               <div>

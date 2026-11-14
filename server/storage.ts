@@ -142,8 +142,24 @@ class StorageManager {
             this.db.settings.google_client_id = '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com';
             modified = true;
           }
-          if (this.db.settings.google_oauth_connected === undefined) {
-            this.db.settings.google_oauth_connected = false;
+          if (
+            this.db.settings.google_oauth_connected === undefined ||
+            (!this.db.settings.google_oauth_connected &&
+              Boolean(this.db.settings.google_account_email?.trim()) &&
+              Boolean(this.db.settings.google_sheet_id?.trim() || this.db.settings.google_drive_folder_id?.trim()))
+          ) {
+            this.db.settings.google_oauth_connected = Boolean(
+              this.db.settings.google_account_email?.trim() &&
+                (this.db.settings.google_sheet_id?.trim() || this.db.settings.google_drive_folder_id?.trim())
+            );
+            modified = true;
+          }
+          if (this.db.settings.auto_session_switch === undefined) {
+            this.db.settings.auto_session_switch = true;
+            modified = true;
+          }
+          if (this.db.settings.auto_session_switch_notify === undefined) {
+            this.db.settings.auto_session_switch_notify = true;
             modified = true;
           }
         }
@@ -1611,6 +1627,8 @@ class StorageManager {
         toggle_allow_edit_violation_points: true,
         toggle_email_notifications: true,
         toggle_kiosk_mode: false,
+        auto_session_switch: true,
+        auto_session_switch_notify: true,
         google_account_email: 'kswsmp.puncakdarussalam@gmail.com',
         google_account_name: 'Kesiswaan SMP Puncak Darussalam',
         google_client_id: '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com',

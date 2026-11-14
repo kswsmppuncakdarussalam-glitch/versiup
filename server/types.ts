@@ -179,6 +179,9 @@ export interface AppSettings {
   toggle_allow_edit_violation_points: boolean;
   toggle_email_notifications: boolean;
   toggle_kiosk_mode: boolean;
+  // Auto Session Switching (Peralihan Sesi Otomatis)
+  auto_session_switch?: boolean;
+  auto_session_switch_notify?: boolean;
   // Google Drive & Sheets Integration
   google_client_id?: string;
   google_oauth_connected?: boolean;

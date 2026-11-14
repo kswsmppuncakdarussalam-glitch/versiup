@@ -19,7 +19,8 @@ const HomeroomTrendChart = React.lazy(
 );
 import { useApp } from '../context/AppContext.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
-import { exportToExcel } from '../utils/excel.js';
+import { exportToExcel, exportSessionRecapToExcel } from '../utils/excel.js';
+import { buildSessionRecapData } from '../utils/sessionHelper.js';
 import { Student, LeaveRequest } from '../types/index.js';
 
 export const HomeroomView: React.FC = () => {
@@ -27,6 +28,7 @@ export const HomeroomView: React.FC = () => {
     session,
     classes,
     sessions,
+    activeSession,
     students,
     attendance,
     outOfClass,
@@ -51,12 +53,13 @@ export const HomeroomView: React.FC = () => {
   const currentClass = classes.find((c) => c.id === classId) || classes[0];
 
   const [activeTab, setActiveTab] = useState<
-    'student' | 'daily' | 'weekly' | 'monthly' | 'semester' | 'ranking' | 'discipline' | 'leave_approval'
+    'student' | 'session_recap' | 'daily' | 'weekly' | 'monthly' | 'semester' | 'ranking' | 'discipline' | 'leave_approval'
   >('student');
 
   const [selectedDate, setSelectedDate] = useState<string>(
     new Date().toISOString().split('T')[0]
   );
+  const [selectedSessionFilter, setSelectedSessionFilter] = useState<string>(activeSession?.id || sessions[0]?.id || 'all');
   const [profileStudent, setProfileStudent] = useState<Student | null>(null);
 
   // Students belonging to this homeroom class
@@ -255,17 +258,18 @@ export const HomeroomView: React.FC = () => {
           </button>
         </div>
 
-        {/* 8 Tabs Navigation (Bagian 8) */}
+        {/* Tabs Navigation (Bagian 8 + Rekap Per Sesi) */}
         <div className="flex overflow-x-auto gap-2 pt-4 text-xs font-medium border-slate-100 dark:border-slate-800">
           {[
             ['student', '1. Rekap Siswa'],
-            ['daily', '2. Rekap Hari'],
-            ['weekly', '3. Rekap Pekan'],
-            ['monthly', '4. Rekap Bulan'],
-            ['semester', '5. Semester'],
-            ['ranking', '6. Ranking'],
-            ['discipline', '7. Izin & Pelanggaran'],
-            ['leave_approval', `8. Persetujuan (${classLeaveRequests.filter((l) => l.status === 'pending').length})`],
+            ['session_recap', '2. Rekap Per Sesi'],
+            ['daily', '3. Rekap Hari'],
+            ['weekly', '4. Rekap Pekan'],
+            ['monthly', '5. Rekap Bulan'],
+            ['semester', '6. Semester'],
+            ['ranking', '7. Ranking'],
+            ['discipline', '8. Izin & Pelanggaran'],
+            ['leave_approval', `9. Persetujuan (${classLeaveRequests.filter((l) => l.status === 'pending').length})`],
           ].map(([id, label]) => (
             <button
               key={id}
@@ -281,6 +285,162 @@ export const HomeroomView: React.FC = () => {
           ))}
         </div>
       </div>
+
+      {/* TAB 2: REKAP PER SESI KELAS */}
+      {activeTab === 'session_recap' && (() => {
+        const recap = buildSessionRecapData({
+          sessions,
+          classes: currentClass ? [currentClass] : classes.filter((c) => c.id === classId),
+          students: classStudents,
+          attendance: classAttendance,
+          targetDate: selectedDate,
+        });
+        const targetSessId =
+          selectedSessionFilter !== 'all' && sessions.some((s) => s.id === selectedSessionFilter)
+            ? selectedSessionFilter
+            : sessions[0]?.id || 'all';
+        const filteredRecs = classAttendance.filter(
+          (a) => a.date === selectedDate && (targetSessId === 'all' || a.session_id === targetSessId)
+        );
+        return (
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+                  Rekapitulasi Presensi Per Sesi — Kelas {currentClass?.name || classId}
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Pantau kehadiran per sesi (Masuk Pagi, Salat Dhuha, Zuhur, Pulang, dll.) atau ekspor ke Excel.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <input
+                  type="date"
+                  value={selectedDate}
+                  onChange={(e) => setSelectedDate(e.target.value)}
+                  className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                />
+                <select
+                  value={targetSessId}
+                  onChange={(e) => setSelectedSessionFilter(e.target.value)}
+                  className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-semibold"
+                >
+                  <option value="all">Semua Sesi</option>
+                  {sessions.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name} ({s.start_time}-{s.end_time})
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const detailRows = classStudents.map((st, idx) => {
+                      const rec = filteredRecs.find((a) => a.student_id === st.nis);
+                      const sess = sessions.find((s) => s.id === (rec?.session_id || targetSessId));
+                      return {
+                        No: idx + 1,
+                        Tanggal: selectedDate,
+                        NIS: st.nis,
+                        Nama: st.name,
+                        Kelas: currentClass?.name || classId,
+                        Sesi: sess?.name || '-',
+                        Status: rec?.status || 'Belum Presensi',
+                        Jam_Scan: rec?.timestamp ? new Date(rec.timestamp).toLocaleTimeString('id-ID') : '-',
+                        Terlambat_Menit: rec?.late_minutes || 0,
+                      };
+                    });
+                    exportSessionRecapToExcel({
+                      fileName: `Rekap_Sesi_${currentClass?.name || classId}_${selectedDate}`,
+                      targetDate: selectedDate,
+                      sessionSummaries: recap.sessionSummaries,
+                      classSessionSummaries: recap.classSessionSummaries,
+                      detailRows,
+                    });
+                    showToast('Rekap per sesi kelas berhasil diekspor ke Excel.', 'success');
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-semibold"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  <span>Ekspor Excel Sesi</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+              {recap.sessionSummaries.map((row) => (
+                <div
+                  key={row.sessionId}
+                  onClick={() => setSelectedSessionFilter(row.sessionId)}
+                  className={`p-3 rounded-lg border cursor-pointer transition-all ${
+                    targetSessId === row.sessionId
+                      ? 'border-slate-900 dark:border-white bg-slate-50 dark:bg-slate-800 shadow-xs'
+                      : 'border-slate-200 dark:border-slate-800 hover:bg-slate-50/70 dark:hover:bg-slate-800/40'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-bold text-slate-900 dark:text-white">{row.sessionName}</span>
+                    <span className="font-mono font-bold text-emerald-600">{row.attendancePercent}%</span>
+                  </div>
+                  <p className="text-[11px] font-mono text-slate-400 mb-2">{row.timeRange}</p>
+                  <div className="flex flex-wrap gap-2 text-[11px] font-semibold">
+                    <span className="text-emerald-600">H:{row.hadir}</span>
+                    <span className="text-amber-600">T:{row.terlambat}</span>
+                    <span className="text-blue-600">I:{row.izin}</span>
+                    <span className="text-yellow-600">S:{row.sakit}</span>
+                    <span className="text-rose-600">A:{row.alpha}</span>
+                    <span className="text-slate-500">Belum:{row.belumPresensi}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="overflow-x-auto text-xs border border-slate-200 dark:border-slate-800 rounded-lg">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="bg-slate-50 dark:bg-slate-800/70 border-b border-slate-200 dark:border-slate-700 text-slate-500 font-semibold">
+                    <th className="py-2 px-3">NIS</th>
+                    <th className="py-2 px-3">Nama Siswa</th>
+                    <th className="py-2 px-3">Sesi</th>
+                    <th className="py-2 px-3">Status</th>
+                    <th className="py-2 px-3">Jam Scan</th>
+                    <th className="py-2 px-3">Catatan</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {classStudents.map((s) => {
+                    const rec = filteredRecs.find((a) => a.student_id === s.nis);
+                    const sessObj = sessions.find((x) => x.id === (rec?.session_id || targetSessId));
+                    const status = rec?.status || 'Belum Presensi';
+                    return (
+                      <tr key={s.nis} onClick={() => setProfileStudent(s)} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/40 cursor-pointer">
+                        <td className="py-2 px-3 font-mono text-[11px] text-slate-400">{s.nis}</td>
+                        <td className="py-2 px-3 font-medium text-slate-900 dark:text-white">{s.name}</td>
+                        <td className="py-2 px-3 text-slate-500">{sessObj?.name || 'Semua Sesi'}</td>
+                        <td className="py-2 px-3">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                            status === 'Hadir' ? 'bg-emerald-100 text-emerald-800' :
+                            status === 'Terlambat' ? 'bg-amber-100 text-amber-800' :
+                            status === 'Izin' ? 'bg-blue-100 text-blue-800' :
+                            status === 'Sakit' ? 'bg-yellow-100 text-yellow-800' :
+                            status === 'Alpha' ? 'bg-rose-100 text-rose-800' : 'bg-slate-100 text-slate-600'
+                          }`}>
+                            {status} {rec?.late_minutes ? `(+${rec.late_minutes}m)` : ''}
+                          </span>
+                        </td>
+                        <td className="py-2 px-3 font-mono text-[11px] text-slate-500">
+                          {rec?.timestamp ? new Date(rec.timestamp).toLocaleTimeString('id-ID') : '-'}
+                        </td>
+                        <td className="py-2 px-3 text-slate-400">{rec?.notes || '-'}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* TAB 1: REKAP PER SISWA */}
       {activeTab === 'student' && (

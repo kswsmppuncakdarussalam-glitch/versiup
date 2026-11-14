@@ -18,13 +18,16 @@ const StudentAffairsComparisonChart = React.lazy(
 );
 import { useApp } from '../context/AppContext.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
-import { exportToExcel } from '../utils/excel.js';
+import { exportToExcel, exportSessionRecapToExcel } from '../utils/excel.js';
+import { buildSessionRecapData } from '../utils/sessionHelper.js';
 import { Student } from '../types/index.js';
 
 export const StudentAffairsView: React.FC = () => {
   const {
     students,
     classes,
+    sessions,
+    activeSession,
     attendance,
     outOfClass,
     violations,
@@ -33,7 +36,9 @@ export const StudentAffairsView: React.FC = () => {
     showToast,
   } = useApp();
 
-  const [activeTab, setActiveTab] = useState<'students' | 'rankings' | 'violations' | 'comparison' | 'official_report'>('students');
+  const [activeTab, setActiveTab] = useState<'students' | 'session_recap' | 'rankings' | 'violations' | 'comparison' | 'official_report'>('students');
+  const [recapDate, setRecapDate] = useState<string>(() => new Date().toISOString().split('T')[0]);
+  const [recapSessionId, setRecapSessionId] = useState<string>('all');
   const [filterClass, setFilterClass] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedStudentForLetter, setSelectedStudentForLetter] = useState<Student | null>(null);
@@ -208,10 +213,11 @@ export const StudentAffairsView: React.FC = () => {
         <div className="flex overflow-x-auto gap-2 pt-4 text-xs font-medium">
           {[
             ['students', `1. Seluruh Siswa (${students.length})`],
-            ['rankings', '2. Ranking Kedisiplinan'],
-            ['violations', `3. Surat Peringatan / SP (${rankings.needWarningLetter.length})`],
-            ['comparison', '4. Perbandingan Antar Kelas'],
-            ['official_report', '5. Cetak Laporan Resmi'],
+            ['session_recap', `2. Rekap Per Sesi (${sessions.length})`],
+            ['rankings', '3. Ranking Kedisiplinan'],
+            ['violations', `4. Surat Peringatan / SP (${rankings.needWarningLetter.length})`],
+            ['comparison', '5. Perbandingan Antar Kelas'],
+            ['official_report', '6. Cetak Laporan Resmi'],
           ].map(([id, label]) => (
             <button
               key={id}
@@ -227,6 +233,144 @@ export const StudentAffairsView: React.FC = () => {
           ))}
         </div>
       </div>
+
+      {/* TAB 2: REKAP PER SESI SEKOLAH */}
+      {activeTab === 'session_recap' && (() => {
+        const recap = buildSessionRecapData({
+          sessions,
+          classes,
+          students,
+          attendance,
+          targetDate: recapDate,
+        });
+        const classRows = recapSessionId === 'all'
+          ? recap.classSessionSummaries
+          : recap.classSessionSummaries.filter((r) => r.sessionId === recapSessionId);
+
+        return (
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+                  Rekapitulasi Kehadiran Seluruh Sekolah Per Sesi
+                </h2>
+                <p className="text-xs text-slate-500">
+                  Data rekap per sesi tersinkronisasi otomatis ke Google Sheets lembar kerja <strong>Rekap_Per_Sesi</strong>.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <input
+                  type="date"
+                  value={recapDate}
+                  onChange={(e) => setRecapDate(e.target.value)}
+                  className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800"
+                />
+                <select
+                  value={recapSessionId}
+                  onChange={(e) => setRecapSessionId(e.target.value)}
+                  className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 font-medium"
+                >
+                  <option value="all">Semua Sesi ({sessions.length})</option>
+                  {sessions.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name} ({s.start_time}-{s.end_time})
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => {
+                    exportSessionRecapToExcel({
+                      fileName: `Rekap_Kesiswaan_Per_Sesi_${recapDate}`,
+                      targetDate: recapDate,
+                      sessionSummaries: recap.sessionSummaries,
+                      classSessionSummaries: classRows,
+                    });
+                    showToast('Rekap per sesi sekolah berhasil diekspor ke Excel.', 'success');
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-semibold"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  <span>Ekspor Excel Per Sesi</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto text-xs border border-slate-200 dark:border-slate-800 rounded-lg">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="bg-slate-50 dark:bg-slate-800/70 border-b border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 font-semibold">
+                    <th className="py-2.5 px-3">Nama Sesi</th>
+                    <th className="py-2.5 px-3">Jam Sesi</th>
+                    <th className="py-2.5 px-3 text-center">Hadir</th>
+                    <th className="py-2.5 px-3 text-center">Terlambat</th>
+                    <th className="py-2.5 px-3 text-center">Izin</th>
+                    <th className="py-2.5 px-3 text-center">Sakit</th>
+                    <th className="py-2.5 px-3 text-center">Alpha</th>
+                    <th className="py-2.5 px-3 text-center">Belum Scan</th>
+                    <th className="py-2.5 px-3 text-center">% Hadir</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {recap.sessionSummaries.map((row) => (
+                    <tr key={row.sessionId} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/40">
+                      <td className="py-2.5 px-3 font-bold text-slate-900 dark:text-white">
+                        {row.sessionName}
+                        {activeSession?.id === row.sessionId && (
+                          <span className="ml-1.5 px-1.5 py-0.5 rounded text-[9px] bg-emerald-100 text-emerald-800">AKTIF</span>
+                        )}
+                      </td>
+                      <td className="py-2.5 px-3 font-mono text-slate-500">{row.timeRange}</td>
+                      <td className="py-2.5 px-3 text-center font-bold text-emerald-600">{row.hadir}</td>
+                      <td className="py-2.5 px-3 text-center font-bold text-amber-600">{row.terlambat}</td>
+                      <td className="py-2.5 px-3 text-center text-blue-600">{row.izin}</td>
+                      <td className="py-2.5 px-3 text-center text-yellow-600">{row.sakit}</td>
+                      <td className="py-2.5 px-3 text-center text-rose-600 font-bold">{row.alpha}</td>
+                      <td className="py-2.5 px-3 text-center font-mono text-slate-500">{row.belumPresensi}</td>
+                      <td className="py-2.5 px-3 text-center font-mono font-bold text-slate-900 dark:text-white">{row.attendancePercent}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {classes.length > 0 && (
+              <div className="overflow-x-auto max-h-64 border border-slate-200 dark:border-slate-800 rounded-lg text-xs">
+                <table className="w-full text-left border-collapse">
+                  <thead className="sticky top-0 bg-slate-50 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 font-semibold">
+                    <tr>
+                      <th className="py-2 px-3">Sesi</th>
+                      <th className="py-2 px-3">Kelas</th>
+                      <th className="py-2 px-3 text-center">Siswa</th>
+                      <th className="py-2 px-3 text-center">Hadir</th>
+                      <th className="py-2 px-3 text-center">Terlambat</th>
+                      <th className="py-2 px-3 text-center">Izin</th>
+                      <th className="py-2 px-3 text-center">Sakit</th>
+                      <th className="py-2 px-3 text-center">Alpha</th>
+                      <th className="py-2 px-3 text-center">% Hadir</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                    {classRows.map((cRow) => (
+                      <tr key={`${cRow.sessionId}_${cRow.classId}`}>
+                        <td className="py-2 px-3 font-medium">{cRow.sessionName}</td>
+                        <td className="py-2 px-3 font-bold">{cRow.className}</td>
+                        <td className="py-2 px-3 text-center font-mono">{cRow.totalStudents}</td>
+                        <td className="py-2 px-3 text-center font-bold text-emerald-600">{cRow.hadir}</td>
+                        <td className="py-2 px-3 text-center font-bold text-amber-600">{cRow.terlambat}</td>
+                        <td className="py-2 px-3 text-center text-blue-600">{cRow.izin}</td>
+                        <td className="py-2 px-3 text-center text-yellow-600">{cRow.sakit}</td>
+                        <td className="py-2 px-3 text-center font-bold text-rose-600">{cRow.alpha}</td>
+                        <td className="py-2 px-3 text-center font-mono font-bold">{cRow.attendancePercent}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* TAB 1: REKAP PER SISWA SELURUH SEKOLAH */}
       {activeTab === 'students' && (
@@ -497,6 +641,47 @@ export const StudentAffairsView: React.FC = () => {
               })}
             </tbody>
           </table>
+
+          {/* Ringkasan Per Sesi di Laporan Resmi */}
+          <div className="space-y-2 pt-2">
+            <h3 className="text-xs font-bold uppercase text-slate-800">
+              Rekapitulasi Kehadiran Per Sesi ({recapDate})
+            </h3>
+            <table className="w-full text-left text-xs border border-slate-300">
+              <thead className="bg-slate-100 border-b border-slate-300">
+                <tr>
+                  <th className="p-2 border-r border-slate-300">Nama Sesi</th>
+                  <th className="p-2 border-r border-slate-300">Jam Sesi</th>
+                  <th className="p-2 border-r border-slate-300 text-center">Hadir</th>
+                  <th className="p-2 border-r border-slate-300 text-center">Terlambat</th>
+                  <th className="p-2 border-r border-slate-300 text-center">Izin</th>
+                  <th className="p-2 border-r border-slate-300 text-center">Sakit</th>
+                  <th className="p-2 border-r border-slate-300 text-center">Alpha</th>
+                  <th className="p-2 text-center">Kehadiran (%)</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-200">
+                {buildSessionRecapData({
+                  sessions,
+                  classes,
+                  students,
+                  attendance,
+                  targetDate: recapDate,
+                }).sessionSummaries.map((row) => (
+                  <tr key={row.sessionId}>
+                    <td className="p-2 border-r border-slate-300 font-semibold">{row.sessionName}</td>
+                    <td className="p-2 border-r border-slate-300 font-mono">{row.timeRange}</td>
+                    <td className="p-2 border-r border-slate-300 text-center">{row.hadir}</td>
+                    <td className="p-2 border-r border-slate-300 text-center">{row.terlambat}</td>
+                    <td className="p-2 border-r border-slate-300 text-center">{row.izin}</td>
+                    <td className="p-2 border-r border-slate-300 text-center">{row.sakit}</td>
+                    <td className="p-2 border-r border-slate-300 text-center">{row.alpha}</td>
+                    <td className="p-2 text-center font-bold">{row.attendancePercent}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
           {/* Tanda Tangan */}
           <div className="pt-8 flex justify-between text-xs text-center">

@@ -7,8 +7,6 @@ import {
   GraduationCap,
   ShieldAlert,
   Sliders,
-  Lock,
-  Unlock,
   LogOut,
   RefreshCw,
   WifiOff,
@@ -22,10 +20,9 @@ import { PWAInstallButton } from '../pwa/PWAInstallButton.js';
 interface SidebarProps {
   isOpen: boolean;
   onClose: () => void;
-  onOpenUnlockModal?: (role: 'homeroom' | 'student_affairs' | 'admin') => void;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose, onOpenUnlockModal }) => {
+export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
   const {
     session,
     activeTab,
@@ -37,63 +34,34 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose, onOpenUnlockM
     settings,
   } = useApp();
 
-  const isHomeroomUnlocked = session?.lockedMenuRole === 'homeroom';
-  const isStudentAffairsUnlocked = session?.lockedMenuRole === 'student_affairs';
-  const isAdminUnlocked = session?.lockedMenuRole === 'admin';
-
   const handleMenuClick = (tab: ActiveTab) => {
     onClose();
-
-    // If clicking current active tab, keep current state
     if (tab === activeTab) return;
-
-    // Protected menus require password authentication only if not already unlocked
-    if (tab === 'homeroom' && session?.lockedMenuRole !== 'homeroom') {
-      onOpenUnlockModal?.('homeroom');
-      return;
-    }
-
-    if (tab === 'student_affairs' && session?.lockedMenuRole !== 'student_affairs') {
-      onOpenUnlockModal?.('student_affairs');
-      return;
-    }
-
-    if (tab === 'admin' && session?.lockedMenuRole !== 'admin') {
-      onOpenUnlockModal?.('admin');
-      return;
-    }
-
     setActiveTab(tab);
   };
 
   const menuItems = [
-    { id: 'dashboard' as ActiveTab, label: '1. Dasbor & Rekap Kelas', icon: LayoutDashboard, locked: false },
-    { id: 'attendance' as ActiveTab, label: '2. Presensi Siswa', icon: UserCheck, locked: false },
-    { id: 'out_of_class' as ActiveTab, label: '3. Izin Keluar Kelas', icon: DoorOpen, locked: false },
-    { id: 'violations' as ActiveTab, label: '4. Pelanggaran', icon: AlertTriangle, locked: false },
-    {
-      id: 'homeroom' as ActiveTab,
-      label: '5. Wali Kelas',
-      icon: GraduationCap,
-      locked: true,
-      isUnlocked: isHomeroomUnlocked,
-      extraText: isHomeroomUnlocked ? session?.lockedMenuClassId : undefined,
-    },
-    {
-      id: 'student_affairs' as ActiveTab,
-      label: '6. Kesiswaan',
-      icon: ShieldAlert,
-      locked: true,
-      isUnlocked: isStudentAffairsUnlocked,
-    },
-    {
-      id: 'admin' as ActiveTab,
-      label: '7. Admin',
-      icon: Sliders,
-      locked: true,
-      isUnlocked: isAdminUnlocked,
-    },
+    { id: 'dashboard' as ActiveTab, label: '1. Dasbor & Rekap Kelas', icon: LayoutDashboard },
+    { id: 'attendance' as ActiveTab, label: '2. Presensi Siswa', icon: UserCheck },
+    { id: 'out_of_class' as ActiveTab, label: '3. Izin Keluar Kelas', icon: DoorOpen },
+    { id: 'violations' as ActiveTab, label: '4. Pelanggaran', icon: AlertTriangle },
   ];
+
+  const lockedRoleLabel =
+    session?.lockedMenuRole === 'admin'
+      ? 'Menu Admin'
+      : session?.lockedMenuRole === 'student_affairs'
+      ? 'Menu Kesiswaan'
+      : session?.lockedMenuRole === 'homeroom'
+      ? `Wali Kelas ${session.lockedMenuClassId || ''}`.trim()
+      : null;
+
+  const LockedRoleIcon =
+    session?.lockedMenuRole === 'admin'
+      ? Sliders
+      : session?.lockedMenuRole === 'student_affairs'
+      ? ShieldAlert
+      : GraduationCap;
 
   return (
     <>
@@ -160,21 +128,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose, onOpenUnlockM
                   <Icon className="w-4 h-4 shrink-0 text-slate-500 dark:text-slate-400" />
                   <span className="truncate">{item.label}</span>
                 </div>
-
-                {item.locked && (
-                  <div className="flex items-center gap-1 shrink-0 ml-1">
-                    {item.extraText && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 font-mono font-bold">
-                        {item.extraText}
-                      </span>
-                    )}
-                    {item.isUnlocked ? (
-                      <Unlock className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                    ) : (
-                      <Lock className="w-3.5 h-3.5 text-slate-400 dark:text-slate-500" />
-                    )}
-                  </div>
-                )}
               </button>
             );
           })}
@@ -182,6 +135,20 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose, onOpenUnlockM
 
         {/* Footer / Sync Status & User Profile */}
         <div className="p-3 border-t border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 space-y-2">
+          {session?.lockedMenuRole && lockedRoleLabel && activeTab !== session.lockedMenuRole && (
+            <button
+              type="button"
+              onClick={() => {
+                onClose();
+                if (session.lockedMenuRole) setActiveTab(session.lockedMenuRole);
+              }}
+              className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md text-xs font-semibold bg-slate-900 text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 transition-colors"
+            >
+              <LockedRoleIcon className="w-3.5 h-3.5 shrink-0" />
+              <span className="truncate">Kembali ke {lockedRoleLabel}</span>
+            </button>
+          )}
+
           {/* Real-time Sync Status indicator (Bagian 1 & 13) */}
           <div className="flex items-center justify-between px-2 py-1.5 rounded text-[11px] bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
             <div className="flex items-center gap-2">
@@ -248,7 +215,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose, onOpenUnlockM
             </div>
             <button
               onClick={logout}
-              title="Keluar Sesi"
+              title="Keluar ke Menu Awal Login"
               className="p-1.5 rounded text-slate-500 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors"
             >
               <LogOut className="w-4 h-4" />

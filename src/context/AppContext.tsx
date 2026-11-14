@@ -18,6 +18,7 @@ import {
   DeltaChange,
 } from '../types/index.js';
 import { setServerClockOffset, getServerNow } from '../utils/time.js';
+import { resolveSessionSchedule, SessionScheduleState } from '../utils/sessionHelper.js';
 import { soundEffects } from '../utils/audio.js';
 import { ttsService } from '../utils/tts.js';
 import {
@@ -49,6 +50,14 @@ interface AppContextType {
   lastSyncTime: Date | null;
   currentServerTime: Date;
   activeSession: AttendanceSession | null;
+  sessionSchedule: SessionScheduleState;
+  lastSessionTransition: {
+    fromName?: string;
+    toSession: AttendanceSession;
+    at: string;
+  } | null;
+  dismissSessionTransition: () => void;
+  setManualSessionOverride: (sessionId: string | null) => void;
   isKioskFullscreen: boolean;
   toggleKioskFullscreen: () => void;
 
@@ -154,6 +163,8 @@ const defaultSettings: AppSettings = {
   toggle_allow_edit_violation_points: true,
   toggle_email_notifications: true,
   toggle_kiosk_mode: false,
+  auto_session_switch: true,
+  auto_session_switch_notify: true,
   google_account_email: 'kswsmp.puncakdarussalam@gmail.com',
   google_account_name: 'Kesiswaan SMP Puncak Darussalam',
   google_client_id: '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com',
@@ -202,15 +213,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const [activeTab, setActiveTabState] = useState<ActiveTab>(() => {
     try {
-      const savedTab = localStorage.getItem('dkb_active_tab');
+      const savedTab = localStorage.getItem('dkb_active_tab') as ActiveTab | null;
+      const savedSessionRaw = localStorage.getItem('dkb_session');
+      const savedSession: AuthSession | null = savedSessionRaw ? JSON.parse(savedSessionRaw) : null;
       if (savedTab && ['dashboard', 'attendance', 'out_of_class', 'violations', 'homeroom', 'student_affairs', 'admin'].includes(savedTab)) {
-        return savedTab as ActiveTab;
+        if (['homeroom', 'student_affairs', 'admin'].includes(savedTab) && savedSession?.lockedMenuRole !== savedTab) {
+          return 'attendance';
+        }
+        return savedTab;
       }
     } catch {}
     return 'attendance';
   });
 
-  // Preserve activeTab in localStorage; only clear lock when user explicitly finishes via lockCurrentMenu / logout
+  // Preserve activeTab in localStorage; protected role routes require matching role from initial login
   const setActiveTab = useCallback((newTab: ActiveTab) => {
     try {
       localStorage.setItem('dkb_active_tab', newTab);
@@ -221,13 +237,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(new Date());
   const [currentServerTime, setCurrentServerTime] = useState<Date>(getServerNow());
   const [serverVersion, setServerVersion] = useState<number>(() => getCachedData('dkb_cache_version', 0));
-  const [googleSheetsConnected, setGoogleSheetsConnected] = useState<boolean>(true);
-  const [googleAccount, setGoogleAccount] = useState<ConnectedGoogleAccount | null>(() => ({
-    email: 'kswsmp.puncakdarussalam@gmail.com',
-    name: 'Kesiswaan SMP Puncak Darussalam',
-    uid: 'saved_google_account',
-    connectedAt: '2026-11-10T09:38:00.000Z',
-  }));
+  const [googleSheetsConnected, setGoogleSheetsConnected] = useState<boolean>(() => {
+    const cached = getCachedData<AppSettings>('dkb_cache_settings', defaultSettings);
+    return Boolean(
+      cached.google_oauth_connected ||
+        cached.google_account_email ||
+        cached.google_sheet_id ||
+        cached.google_drive_folder_id ||
+        hasValidGoogleToken()
+    );
+  });
+  const [googleAccount, setGoogleAccount] = useState<ConnectedGoogleAccount | null>(() => {
+    const cached = getCachedData<AppSettings>('dkb_cache_settings', defaultSettings);
+    if (!cached.google_account_email) return null;
+    return {
+      email: cached.google_account_email,
+      name: cached.google_account_name || 'Kesiswaan SMP Puncak Darussalam',
+      photo: cached.google_account_photo || undefined,
+      uid: 'saved_google_account',
+      connectedAt: cached.google_last_synced_at || '2026-11-10T09:38:00.000Z',
+    };
+  });
   const [googleSyncing, setGoogleSyncing] = useState<boolean>(false);
   const [googleOAuthActive, setGoogleOAuthActive] = useState<boolean>(() => hasValidGoogleToken());
   const [serverDriveSyncActive, setServerDriveSyncActive] = useState<boolean>(() => {
@@ -238,6 +268,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   });
   const [isKioskFullscreen, setIsKioskFullscreen] = useState<boolean>(false);
+  const [manualSessionOverrideId, setManualSessionOverrideId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('dkb_manual_session_override') || null;
+    } catch {
+      return null;
+    }
+  });
+  const [lastSessionTransition, setLastSessionTransition] = useState<{
+    fromName?: string;
+    toSession: AttendanceSession;
+    at: string;
+  } | null>(null);
+  const prevLiveSessionIdRef = useRef<string | null>(null);
+  const prevLiveSessionNameRef = useRef<string | null>(null);
 
   // Core Data States with Instant Offline Persistence
   const [settings, setSettings] = useState<AppSettings>(() => getCachedData('dkb_cache_settings', defaultSettings));
@@ -254,7 +298,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Initialize Google Auth state listener
   useEffect(() => {
     const unsub = initGoogleAuth(
-      (user, token) => {
+      (user) => {
         setGoogleAccount({
           email: user.email || settings.google_account_email || '',
           name: user.displayName || user.email || settings.google_account_name || 'Admin Google',
@@ -265,33 +309,52 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setGoogleSheetsConnected(true);
       },
       () => {
-        setGoogleAccount((prev) => prev || {
-          email: settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com',
-          name: settings.google_account_name || 'Kesiswaan SMP Puncak Darussalam',
-          uid: 'saved_google_account',
-          connectedAt: settings.google_last_synced_at || '2026-11-10T09:38:00.000Z',
-        });
-        setGoogleSheetsConnected(Boolean(settings.google_account_email || hasValidGoogleToken()));
+        if (settings.google_account_email) {
+          setGoogleAccount((prev) => prev || {
+            email: settings.google_account_email || '',
+            name: settings.google_account_name || 'Kesiswaan SMP Puncak Darussalam',
+            photo: settings.google_account_photo || undefined,
+            uid: 'saved_google_account',
+            connectedAt: settings.google_last_synced_at || '2026-11-10T09:38:00.000Z',
+          });
+        }
+        setGoogleSheetsConnected(
+          Boolean(
+            settings.google_oauth_connected ||
+              settings.google_account_email ||
+              settings.google_sheet_id ||
+              hasValidGoogleToken()
+          )
+        );
       }
     );
     return () => {
       unsub();
     };
-  }, [settings.google_account_email, settings.google_account_name, settings.google_account_photo]);
+  }, [settings.google_account_email, settings.google_account_name, settings.google_account_photo, settings.google_oauth_connected, settings.google_sheet_id, settings.google_last_synced_at]);
 
   // Hydrate Google account state from persistent settings
   useEffect(() => {
-    if (settings.google_account_email && !googleAccount) {
-      setGoogleAccount({
-        email: settings.google_account_email,
-        name: settings.google_account_name || 'Akun Google Sekolah',
-        photo: settings.google_account_photo || undefined,
-        uid: 'saved_google_account',
-        connectedAt: settings.google_last_synced_at || new Date().toISOString(),
+    if (settings.google_account_email) {
+      setGoogleAccount((prev) => {
+        if (
+          prev &&
+          prev.email === settings.google_account_email &&
+          prev.name === (settings.google_account_name || prev.name)
+        ) {
+          return prev;
+        }
+        return {
+          email: settings.google_account_email || '',
+          name: settings.google_account_name || 'Akun Google Sekolah',
+          photo: settings.google_account_photo || undefined,
+          uid: prev?.uid || 'saved_google_account',
+          connectedAt: settings.google_last_synced_at || prev?.connectedAt || new Date().toISOString(),
+        };
       });
       setGoogleSheetsConnected(true);
     }
-  }, [settings.google_account_email, settings.google_account_name, settings.google_account_photo, settings.google_last_synced_at, googleAccount]);
+  }, [settings.google_account_email, settings.google_account_name, settings.google_account_photo, settings.google_last_synced_at]);
   const [notificationLogs, setNotificationLogs] = useState<NotificationLog[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
 
@@ -365,44 +428,106 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [settings]
   );
 
-  // Clock effect: updates at 10-second intervals to calculate active session & dates smoothly
+  // Clock effect: checks every 1s for minute transitions so automatic session switching occurs right on time
   // (Individual ticking clocks use isolated LiveClockText to avoid 60fps frame drops / stuttering)
   useEffect(() => {
+    const updateClockIfNeeded = () => {
+      const now = getServerNow();
+      setCurrentServerTime((prev) => {
+        const prevMinute = Math.floor(prev.getTime() / 60000);
+        const curMinute = Math.floor(now.getTime() / 60000);
+        if (curMinute !== prevMinute || Math.abs(now.getTime() - prev.getTime()) >= 10000) {
+          return now;
+        }
+        return prev;
+      });
+    };
+
     setCurrentServerTime(getServerNow());
-    const timer = setInterval(() => {
-      setCurrentServerTime(getServerNow());
-    }, 10000);
+    const timer = setInterval(updateClockIfNeeded, 1000);
     return () => clearInterval(timer);
   }, []);
 
-  // Compute Active Session based on server time & day
-  const activeSession = React.useMemo(() => {
-    if (!sessions || sessions.length === 0) return null;
-    const now = currentServerTime;
-    const currentDay = now.getDay();
-    const currentH = now.getHours();
-    const currentM = now.getMinutes();
-    const currentTimeMinutes = currentH * 60 + currentM;
+  const setManualSessionOverride = useCallback((sessionId: string | null) => {
+    setManualSessionOverrideId(sessionId);
+    try {
+      if (sessionId) {
+        localStorage.setItem('dkb_manual_session_override', sessionId);
+      } else {
+        localStorage.removeItem('dkb_manual_session_override');
+      }
+    } catch {}
+    if (sessionId) {
+      const found = sessions.find((s) => s.id === sessionId);
+      showToast(`Mode Manual: Sesi presensi dikunci ke "${found?.name || sessionId}".`, 'info');
+    } else {
+      showToast('Peralihan Sesi Otomatis aktif kembali mengikuti jadwal server.', 'success');
+    }
+  }, [sessions, showToast]);
 
-    // Filter active sessions for today
-    const validToday = sessions.filter(
-      (s) => s.is_active && (s.active_days ? s.active_days.includes(currentDay) : true)
-    );
+  const dismissSessionTransition = useCallback(() => {
+    setLastSessionTransition(null);
+  }, []);
 
-    // Find session where currentTime is between start and end
-    for (const s of validToday) {
-      const [sh, sm] = s.start_time.split(':').map(Number);
-      const [eh, em] = s.end_time.split(':').map(Number);
-      const startMinutes = sh * 60 + sm;
-      const endMinutes = eh * 60 + em;
-      if (currentTimeMinutes >= startMinutes && currentTimeMinutes <= endMinutes) {
-        return s;
+  // Compute Active Session & Full Schedule State based on authoritative server time & day
+  const autoSessionSwitchEnabled = settings.auto_session_switch !== false;
+  const sessionSchedule = React.useMemo(
+    () =>
+      resolveSessionSchedule(
+        sessions,
+        currentServerTime,
+        autoSessionSwitchEnabled,
+        manualSessionOverrideId
+      ),
+    [sessions, currentServerTime, autoSessionSwitchEnabled, manualSessionOverrideId]
+  );
+
+  const activeSession = sessionSchedule.activeSession;
+
+  // Detect automatic session transitions in real-time and notify kiosk + staff
+  useEffect(() => {
+    if (!autoSessionSwitchEnabled || manualSessionOverrideId) {
+      prevLiveSessionIdRef.current = sessionSchedule.liveWindowSession?.id || null;
+      prevLiveSessionNameRef.current = sessionSchedule.liveWindowSession?.name || null;
+      return;
+    }
+
+    const currentLive = sessionSchedule.liveWindowSession;
+    const prevId = prevLiveSessionIdRef.current;
+    const prevName = prevLiveSessionNameRef.current;
+
+    if (currentLive && prevId !== null && prevId !== currentLive.id) {
+      const msg = `Peralihan Sesi Otomatis: Beralih ke "${currentLive.name}" (${currentLive.start_time} - ${currentLive.end_time})`;
+      setLastSessionTransition({
+        fromName: prevName || undefined,
+        toSession: currentLive,
+        at: new Date().toISOString(),
+      });
+      showToast(msg, 'info');
+      if (settingsRef.current.tts_enabled !== false && settingsRef.current.auto_session_switch_notify !== false) {
+        speak(`Perhatian, sesi presensi otomatis beralih ke ${currentLive.name}.`);
       }
     }
 
-    // Default to the first session if within tolerance or upcoming
-    return validToday[0] || sessions[0] || null;
-  }, [sessions, currentServerTime]);
+    prevLiveSessionIdRef.current = currentLive?.id || (prevId === null && sessions.length > 0 ? '__none__' : prevId);
+    prevLiveSessionNameRef.current = currentLive?.name || null;
+  }, [
+    sessionSchedule.liveWindowSession,
+    autoSessionSwitchEnabled,
+    manualSessionOverrideId,
+    sessions.length,
+    showToast,
+    speak,
+  ]);
+
+  // Auto-dismiss transition banner after 45 seconds
+  useEffect(() => {
+    if (!lastSessionTransition) return;
+    const t = setTimeout(() => {
+      setLastSessionTransition(null);
+    }, 45000);
+    return () => clearTimeout(t);
+  }, [lastSessionTransition]);
 
   // Apply Delta Changes to state without interrupting user interactions
   const applyDeltaChanges = useCallback((changes: DeltaChange[]) => {
@@ -1072,7 +1197,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const unlockHomeroom = async (name: string, password: string, classId?: string) => {
-    const targetClassId = classId || '10-RPL-1';
+    const targetClassId = classId || classes[0]?.id || '10-RPL-1';
     try {
       let serverJson: any = null;
       let serverOk = false;
@@ -1085,7 +1210,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             'Content-Type': 'application/json',
             ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
           },
-          body: JSON.stringify({ action: 'unlock_homeroom', name, password, classId: targetClassId }),
+          body: JSON.stringify({ action: 'unlock_homeroom', name, password, ...(classId ? { classId } : {}) }),
         });
 
         const contentType = res.headers.get('content-type') || '';
@@ -1325,24 +1450,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const lockCurrentMenu = () => {
-    if (!session) return;
-    const updated: AuthSession = {
-      ...session,
-      lockedMenuRole: undefined,
-      lockedMenuClassId: undefined,
-      lockedMenuExpiresAt: undefined,
-    };
-    setSession(updated);
-    localStorage.setItem('dkb_session', JSON.stringify(updated));
-    showToast('Menu berhasil dikunci kembali.', 'info');
-    setActiveTab('attendance');
-  };
-
   const logout = () => {
     setSession(null);
     localStorage.removeItem('dkb_session');
-    showToast('Anda telah keluar dari aplikasi.', 'info');
+    setActiveTab('attendance');
+    showToast('Anda telah keluar ke menu awal login.', 'info');
+  };
+
+  const lockCurrentMenu = () => {
+    if (!session) return;
+    setSession(null);
+    localStorage.removeItem('dkb_session');
+    setActiveTab('attendance');
+    showToast('Menu dikunci. Silakan masuk kembali melalui menu awal login.', 'info');
   };
 
   const updateSessionToken = (newToken: string) => {
@@ -1592,7 +1712,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         showToast('Masukkan alamat email yang valid (contoh: kswsmp.puncakdarussalam@gmail.com)', 'error');
         return { success: false, error: 'Email tidak valid' };
       }
-      const displayName = (name && name.trim()) || cleanEmail.split('@')[0].toUpperCase();
+      const displayName = (name && name.trim()) || settingsRef.current.google_account_name || cleanEmail.split('@')[0];
       const nowIso = new Date().toISOString();
 
       const accountInfo: ConnectedGoogleAccount = {
@@ -1609,9 +1729,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         google_account_email: cleanEmail,
         google_account_name: displayName,
         google_last_synced_at: nowIso,
+        toggle_email_notifications: true,
       });
 
-      showToast(`Email ${cleanEmail} berhasil ditautkan & disinkronkan otomatis!`, 'success');
+      if (!notificationSettings.email_enabled) {
+        await updateNotificationSettings({ email_enabled: true }, { silent: true });
+      }
+
+      showToast(`Email ${cleanEmail} tersimpan permanen & otomatis sinkron meski refresh atau tutup aplikasi!`, 'success');
       return { success: true };
     } catch (err: any) {
       showToast(err.message || 'Gagal menautkan email', 'error');
@@ -1632,6 +1757,35 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (targetClientId) {
         registerGoogleClientIdToJs(targetClientId);
       }
+
+      // If browser in-memory token was cleared after refresh/reopen, reuse persisted server OAuth session first (no popup)
+      if (!token && serverDriveSyncActive) {
+        try {
+          const pushRes = await fetch('/api/google-sync/push', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+          });
+          if (pushRes.ok) {
+            const pushData = await pushRes.json().catch(() => ({}));
+            if (pushData.success && !pushData.oauthTokenExpired) {
+              lastAutoSheetSigRef.current = driveSheetSignature;
+              setServerDriveSyncActive(true);
+              try {
+                localStorage.setItem('dkb_cache_server_drive_active', 'true');
+              } catch {}
+              showToast('Sinkronisasi Google Drive & Sheets berhasil melalui koneksi OAuth tersimpan!', 'success');
+              return { success: true };
+            }
+            if (pushData.oauthTokenExpired) {
+              setServerDriveSyncActive(false);
+              try {
+                localStorage.setItem('dkb_cache_server_drive_active', 'false');
+              } catch {}
+            }
+          }
+        } catch {}
+      }
+
       let oauthAccountInfo: ConnectedGoogleAccount | null = null;
       let tokenExpiresIn = getTokenExpiresInSeconds();
       if (!token) {
@@ -1870,7 +2024,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           'Content-Type': 'application/json',
           ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
-        body: JSON.stringify(params),
+        body: JSON.stringify({
+          ...params,
+          manualOverride: Boolean(manualSessionOverrideId || (params.sessionId && params.sessionId !== activeSession?.id)),
+        }),
       });
 
       const data = await res.json();
@@ -2939,6 +3096,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         lastSyncTime,
         currentServerTime,
         activeSession,
+        sessionSchedule,
+        lastSessionTransition,
+        dismissSessionTransition,
+        setManualSessionOverride,
         isKioskFullscreen,
         toggleKioskFullscreen,
         settings,

@@ -3,7 +3,7 @@ import { AppProvider, useApp } from './context/AppContext.js';
 import { Sidebar } from './components/layout/Sidebar.js';
 import { Header } from './components/layout/Header.js';
 import { OfflineIndicatorBanner } from './components/pwa/OfflineIndicatorBanner.js';
-import { DutyLoginScreen, SecondaryUnlockModal } from './components/modals/AuthLoginModal.js';
+import { DutyLoginScreen } from './components/modals/AuthLoginModal.js';
 import { CheckCircle2, AlertCircle, Info, X, Lock } from 'lucide-react';
 
 // Lazy-loaded views for instant initial load time and code-splitting
@@ -32,17 +32,17 @@ const ViewLoadingSkeleton: React.FC = () => (
 
 const LockedRolePlaceholder: React.FC<{
   role: 'homeroom' | 'student_affairs' | 'admin';
-  onUnlock: () => void;
-}> = ({ role, onUnlock }) => {
+  onGoToLogin: () => void;
+}> = ({ role, onGoToLogin }) => {
   const titles = {
     homeroom: 'Menu Wali Kelas Terkunci',
     student_affairs: 'Menu Kesiswaan Terkunci',
     admin: 'Menu Administrator Terkunci',
   };
   const descriptions = {
-    homeroom: 'Menu Wali Kelas dilindungi kata sandi. Masukkan nama dan kata sandi Anda untuk mengakses kelas yang Anda ampu.',
-    student_affairs: 'Menu Kesiswaan dilindungi kata sandi khusus. Masukkan kata sandi kesiswaan untuk melanjutkan.',
-    admin: 'Menu Administrator berisi data dan konfigurasi sensitif. Masukkan kata sandi admin untuk mengakses.',
+    homeroom: 'Akses Wali Kelas hanya dibuka melalui Menu Awal Login dengan memilih peran Wali Kelas.',
+    student_affairs: 'Akses Kesiswaan hanya dibuka melalui Menu Awal Login dengan memilih peran Kesiswaan.',
+    admin: 'Akses Administrator hanya dibuka melalui Menu Awal Login dengan memilih peran Admin.',
   };
 
   return (
@@ -57,20 +57,19 @@ const LockedRolePlaceholder: React.FC<{
         {descriptions[role]}
       </p>
       <button
-        onClick={onUnlock}
+        onClick={onGoToLogin}
         className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 transition-colors shadow-xs"
       >
         <Lock className="w-3.5 h-3.5" />
-        <span>Buka Akses dengan Kata Sandi</span>
+        <span>Masuk Lewat Menu Awal Login</span>
       </button>
     </div>
   );
 };
 
 const MainAppContent: React.FC = () => {
-  const { session, activeTab, setActiveTab, toasts, dismissToast } = useApp();
+  const { session, activeTab, logout, toasts, dismissToast } = useApp();
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [unlockRole, setUnlockRole] = useState<'homeroom' | 'student_affairs' | 'admin' | null>(null);
 
   // Bagian 3 Alur 1: If no session, show ONLY the Duty Login Screen
   if (!session) {
@@ -83,7 +82,6 @@ const MainAppContent: React.FC = () => {
       <Sidebar
         isOpen={isSidebarOpen}
         onClose={() => setIsSidebarOpen(false)}
-        onOpenUnlockModal={(role) => setUnlockRole(role)}
       />
 
       {/* Main Body Area */}
@@ -107,7 +105,7 @@ const MainAppContent: React.FC = () => {
               ) : (
                 <LockedRolePlaceholder
                   role="homeroom"
-                  onUnlock={() => setUnlockRole('homeroom')}
+                  onGoToLogin={logout}
                 />
               )
             )}
@@ -117,7 +115,7 @@ const MainAppContent: React.FC = () => {
               ) : (
                 <LockedRolePlaceholder
                   role="student_affairs"
-                  onUnlock={() => setUnlockRole('student_affairs')}
+                  onGoToLogin={logout}
                 />
               )
             )}
@@ -127,22 +125,13 @@ const MainAppContent: React.FC = () => {
               ) : (
                 <LockedRolePlaceholder
                   role="admin"
-                  onUnlock={() => setUnlockRole('admin')}
+                  onGoToLogin={logout}
                 />
               )
             )}
           </Suspense>
         </main>
       </div>
-
-      {/* Password Unlock Modal for Wali Kelas, Kesiswaan, Admin */}
-      <SecondaryUnlockModal
-        role={unlockRole}
-        onClose={() => setUnlockRole(null)}
-        onSuccess={() => {
-          if (unlockRole) setActiveTab(unlockRole);
-        }}
-      />
 
       {/* Toast Notifications */}
       <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm pointer-events-none">

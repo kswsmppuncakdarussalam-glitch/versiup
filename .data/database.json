@@ -290,7 +290,9 @@
     "google_sheet_url": "https://docs.google.com/spreadsheets/d/14MkgrDI6iFV4J8b5rS_LkUZrHtYX_zzuGJUihjKdxU4/edit?usp=drivesdk",
     "google_drive_backup_file_id": "13hTFsckpHofyz0vaRyh5aCFcsV9lzAC5",
     "google_drive_backup_file_url": "https://drive.google.com/file/d/13hTFsckpHofyz0vaRyh5aCFcsV9lzAC5/view?usp=drivesdk",
-    "google_oauth_connected": false
+    "google_oauth_connected": false,
+    "auto_session_switch": true,
+    "auto_session_switch_notify": true
   },
   "notification_settings": {
     "email_enabled": true,

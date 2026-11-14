@@ -28,7 +28,8 @@ const DashboardAttendanceCharts = React.lazy(
 import { useApp } from '../context/AppContext.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { Student, SchoolClass } from '../types/index.js';
-import { exportToExcel } from '../utils/excel.js';
+import { exportToExcel, exportSessionRecapToExcel } from '../utils/excel.js';
+import { buildSessionRecapData } from '../utils/sessionHelper.js';
 import { formatIndonesianDate } from '../utils/time.js';
 
 type DateFilter = 'today' | 'week' | 'month' | 'semester';
@@ -37,6 +38,8 @@ export const DashboardView: React.FC = () => {
   const {
     students,
     classes,
+    sessions,
+    activeSession,
     attendance,
     outOfClass,
     violations,
@@ -45,9 +48,12 @@ export const DashboardView: React.FC = () => {
     isInitialLoading,
     initialLoadError,
     syncNow,
+    showToast,
   } = useApp();
 
   const [dateFilter, setDateFilter] = useState<DateFilter>('today');
+  const [selectedRecapSessionId, setSelectedRecapSessionId] = useState<string>('all');
+  const [recapDate, setRecapDate] = useState<string>(() => currentServerTime.toISOString().split('T')[0]);
   const [profileStudent, setProfileStudent] = useState<Student | null>(null);
 
   // Drilldown state: breadcrumb path
@@ -122,6 +128,27 @@ export const DashboardView: React.FC = () => {
   const todayStr = useMemo(() => {
     return currentServerTime.toISOString().split('T')[0];
   }, [currentServerTime]);
+
+  const sessionRecap = useMemo(
+    () =>
+      buildSessionRecapData({
+        sessions,
+        classes,
+        students,
+        attendance,
+        targetDate: recapDate || todayStr,
+      }),
+    [sessions, classes, students, attendance, recapDate, todayStr]
+  );
+
+  const displayedClassSessionRows = useMemo(() => {
+    if (selectedRecapSessionId === 'all') {
+      return sessionRecap.classSessionSummaries;
+    }
+    return sessionRecap.classSessionSummaries.filter(
+      (r) => r.sessionId === selectedRecapSessionId
+    );
+  }, [sessionRecap.classSessionSummaries, selectedRecapSessionId]);
 
   // Real-time Class Attendance Breakdown for Today
   const classSummaries = useMemo(() => {
@@ -680,6 +707,189 @@ export const DashboardView: React.FC = () => {
                     </div>
                   </div>
                 ))}
+              </div>
+            )}
+          </div>
+
+          {/* REKAP KEHADIRAN PER SESI (SELURUH SEKOLAH & PER KELAS) */}
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-4">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <div className="w-7 h-7 rounded bg-emerald-600 text-white flex items-center justify-center font-bold">
+                    <Clock className="w-4 h-4" />
+                  </div>
+                  <h2 className="text-sm font-bold text-slate-900 dark:text-white">
+                    Rekap Kehadiran Per Sesi Presensi
+                  </h2>
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Ringkasan hadir, terlambat, izin, sakit, alpha, dan persentase per sesi presensi (terintegrasi otomatis ke sheet <strong>Rekap_Per_Sesi</strong>).
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <input
+                  type="date"
+                  value={recapDate}
+                  onChange={(e) => setRecapDate(e.target.value)}
+                  className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200"
+                />
+                <select
+                  value={selectedRecapSessionId}
+                  onChange={(e) => setSelectedRecapSessionId(e.target.value)}
+                  className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 font-medium"
+                >
+                  <option value="all">Semua Sesi ({sessions.length})</option>
+                  {sessions.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name} ({s.start_time}-{s.end_time})
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const targetDateVal = recapDate || todayStr;
+                    const detailRows = attendance
+                      .filter((a) => a.date === targetDateVal && (selectedRecapSessionId === 'all' || a.session_id === selectedRecapSessionId))
+                      .map((a, idx) => {
+                        const st = students.find((x) => x.nis === a.student_id);
+                        const sess = sessions.find((x) => x.id === a.session_id);
+                        return {
+                          No: idx + 1,
+                          Tanggal: a.date,
+                          Jam_Scan: a.timestamp ? new Date(a.timestamp).toLocaleTimeString('id-ID') : '-',
+                          NIS: a.student_id,
+                          Nama_Siswa: st?.name || '-',
+                          Kelas: st?.class_id || '-',
+                          Sesi: sess?.name || a.session_id,
+                          Status: a.status,
+                          Terlambat_Menit: a.late_minutes || 0,
+                          Metode: a.method,
+                        };
+                      });
+                    exportSessionRecapToExcel({
+                      fileName: `Rekap_Per_Sesi_${targetDateVal}`,
+                      targetDate: targetDateVal,
+                      sessionSummaries: sessionRecap.sessionSummaries,
+                      classSessionSummaries: displayedClassSessionRows,
+                      detailRows,
+                    });
+                    showToast('File Excel Rekap Per Sesi berhasil diunduh.', 'success');
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-semibold transition-colors shadow-xs"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  <span>Ekspor Excel Rekap Sesi</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Tabel 1: Ringkasan Seluruh Sekolah Per Sesi */}
+            <div className="overflow-x-auto text-xs border border-slate-200 dark:border-slate-800 rounded-lg">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="bg-slate-50 dark:bg-slate-800/70 border-b border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 font-semibold">
+                    <th className="py-2.5 px-3">Nama Sesi</th>
+                    <th className="py-2.5 px-3">Rentang Jam</th>
+                    <th className="py-2.5 px-3 text-center">Status</th>
+                    <th className="py-2.5 px-3 text-center">Hadir</th>
+                    <th className="py-2.5 px-3 text-center">Terlambat</th>
+                    <th className="py-2.5 px-3 text-center">Izin</th>
+                    <th className="py-2.5 px-3 text-center">Sakit</th>
+                    <th className="py-2.5 px-3 text-center">Alpha</th>
+                    <th className="py-2.5 px-3 text-center">Belum Scan</th>
+                    <th className="py-2.5 px-3 text-center">Kehadiran (%)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {sessionRecap.sessionSummaries.map((row) => {
+                    const isLive = activeSession?.id === row.sessionId;
+                    return (
+                      <tr
+                        key={row.sessionId}
+                        onClick={() =>
+                          setSelectedRecapSessionId(
+                            selectedRecapSessionId === row.sessionId ? 'all' : row.sessionId
+                          )
+                        }
+                        className={`cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/40 ${
+                          selectedRecapSessionId === row.sessionId ? 'bg-emerald-50/50 dark:bg-emerald-950/20' : ''
+                        }`}
+                      >
+                        <td className="py-2.5 px-3 font-bold text-slate-900 dark:text-white">
+                          <span>{row.sessionName}</span>
+                          {isLive && (
+                            <span className="ml-1.5 px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+                              AKTIF
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-3 font-mono text-slate-500">
+                          {row.timeRange} <span className="text-[10px]">(s/d {row.onTimeLimit})</span>
+                        </td>
+                        <td className="py-2.5 px-3 text-center">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${row.statusLabel === 'Aktif' ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-600'}`}>
+                            {row.statusLabel}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-3 text-center font-bold text-emerald-600">{row.hadir}</td>
+                        <td className="py-2.5 px-3 text-center font-bold text-amber-600">{row.terlambat}</td>
+                        <td className="py-2.5 px-3 text-center text-blue-600 font-semibold">{row.izin}</td>
+                        <td className="py-2.5 px-3 text-center text-yellow-600 font-semibold">{row.sakit}</td>
+                        <td className="py-2.5 px-3 text-center font-bold text-rose-600">{row.alpha}</td>
+                        <td className="py-2.5 px-3 text-center text-slate-500 font-mono">{row.belumPresensi}</td>
+                        <td className="py-2.5 px-3 text-center font-mono font-bold text-slate-900 dark:text-white">
+                          {row.attendancePercent}%
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Tabel 2: Rincian Per Kelas Untuk Sesi Terpilih */}
+            {classes.length > 0 && (
+              <div className="space-y-2 pt-2">
+                <h3 className="text-xs font-bold text-slate-700 dark:text-slate-300">
+                  Rincian Per Kelas ({selectedRecapSessionId === 'all' ? 'Semua Sesi' : sessions.find((s) => s.id === selectedRecapSessionId)?.name}) — {recapDate}
+                </h3>
+                <div className="overflow-x-auto max-h-64 border border-slate-200 dark:border-slate-800 rounded-lg text-xs">
+                  <table className="w-full text-left border-collapse">
+                    <thead className="sticky top-0 bg-slate-50 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 font-semibold">
+                      <tr>
+                        <th className="py-2 px-3">Sesi</th>
+                        <th className="py-2 px-3">Kelas</th>
+                        <th className="py-2 px-3 text-center">Siswa</th>
+                        <th className="py-2 px-3 text-center">Hadir</th>
+                        <th className="py-2 px-3 text-center">Terlambat</th>
+                        <th className="py-2 px-3 text-center">Izin</th>
+                        <th className="py-2 px-3 text-center">Sakit</th>
+                        <th className="py-2 px-3 text-center">Alpha</th>
+                        <th className="py-2 px-3 text-center">Belum Scan</th>
+                        <th className="py-2 px-3 text-center">% Hadir</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                      {displayedClassSessionRows.map((cRow) => (
+                        <tr key={`${cRow.sessionId}_${cRow.classId}`} className="hover:bg-slate-50/60 dark:hover:bg-slate-800/40">
+                          <td className="py-2 px-3 font-medium text-slate-800 dark:text-slate-200">{cRow.sessionName}</td>
+                          <td className="py-2 px-3 font-bold text-slate-900 dark:text-white">{cRow.className}</td>
+                          <td className="py-2 px-3 text-center font-mono text-slate-500">{cRow.totalStudents}</td>
+                          <td className="py-2 px-3 text-center font-bold text-emerald-600">{cRow.hadir}</td>
+                          <td className="py-2 px-3 text-center font-bold text-amber-600">{cRow.terlambat}</td>
+                          <td className="py-2 px-3 text-center text-blue-600">{cRow.izin}</td>
+                          <td className="py-2 px-3 text-center text-yellow-600">{cRow.sakit}</td>
+                          <td className="py-2 px-3 text-center text-rose-600 font-bold">{cRow.alpha}</td>
+                          <td className="py-2 px-3 text-center text-slate-500 font-mono">{cRow.belumPresensi}</td>
+                          <td className="py-2 px-3 text-center font-mono font-bold text-slate-900 dark:text-white">{cRow.attendancePercent}%</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             )}
           </div>

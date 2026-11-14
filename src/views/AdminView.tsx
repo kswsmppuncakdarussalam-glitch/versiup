@@ -92,6 +92,8 @@ export const AdminView: React.FC = () => {
     saveClass,
     deleteClass,
     sessions,
+    activeSession,
+    sessionSchedule,
     saveSession,
     deleteSession,
     violationTypes,
@@ -107,6 +109,7 @@ export const AdminView: React.FC = () => {
     googleOAuthActive,
     serverDriveSyncActive,
     connectGoogle,
+    linkEmailDirectly,
     disconnectGoogle,
     syncGoogleSheetsNow,
     lockCurrentMenu,
@@ -154,6 +157,16 @@ export const AdminView: React.FC = () => {
         settings.google_account_email?.trim() &&
         (settings.google_sheet_id?.trim() || settings.google_drive_folder_id?.trim()))
   );
+  const [directEmailInput, setDirectEmailInput] = useState(
+    () => settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'
+  );
+  const [savingDirectEmail, setSavingDirectEmail] = useState(false);
+
+  useEffect(() => {
+    if (settings.google_account_email) {
+      setDirectEmailInput(settings.google_account_email);
+    }
+  }, [settings.google_account_email]);
   const [isEditingDriveIds, setIsEditingDriveIds] = useState(false);
   const [inlineSheetIdInput, setInlineSheetIdInput] = useState('');
   const [inlineFolderIdInput, setInlineFolderIdInput] = useState('');
@@ -745,10 +758,10 @@ export const AdminView: React.FC = () => {
               type="button"
               onClick={lockCurrentMenu}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-900 hover:bg-rose-100 dark:hover:bg-rose-900/60 font-semibold text-xs transition-colors shadow-xs"
-              title="Kunci Akses Admin (Wajib Masukkan Password Kembali)"
+              title="Kunci Sesi & Kembali ke Menu Awal Login"
             >
               <Lock className="w-3.5 h-3.5" />
-              <span>Kunci & Keluar Admin</span>
+              <span>Kunci & Keluar ke Login</span>
             </button>
           </div>
         </div>
@@ -805,15 +818,15 @@ export const AdminView: React.FC = () => {
                 </>
               ) : googleOAuthActive || serverDriveSyncActive ? (
                 <>
-                  <strong>Terhubung Permanen (Email, Database, Drive &amp; Sheets Aktif):</strong> Koneksi tetap tersambung meski halaman di-refresh atau keluar-masuk aplikasi. Setiap perubahan Sesi, Data Siswa, Kelas, Presensi, Izin, Pelanggaran, Email &amp; ID Cloud langsung tersinkron otomatis.
+                  <strong>Terhubung Permanen (Email, Database, Drive &amp; Sheets Aktif):</strong> Koneksi tetap tersambung meski halaman di-refresh atau buka-tutup aplikasi. Setiap perubahan langsung tersinkron otomatis.
                 </>
               ) : isCloudConfiguredInDb ? (
                 <>
-                  <strong>ID Cloud &amp; Multi-Perangkat Tersinkron:</strong> ID Cloud Console sudah terdaftar ke JavaScript &amp; Google Sheet. Klik 1x untuk menyegarkan sesi OAuth 2.0 jika masa berlaku token berakhir.
+                  <strong>Email &amp; Cloud Tersimpan Permanen ({settings.google_account_email}):</strong> ID Cloud Console, email &amp; tautan Drive/Sheet tetap tersimpan meski refresh atau buka-tutup aplikasi tanpa perlu menautkan ulang.
                 </>
               ) : (
                 <>
-                  <strong>Database Multi-Perangkat Aktif:</strong> Tempel ID Cloud Console (terdaftar otomatis ke JavaScript) &amp; hubungkan Google OAuth 2.0 di menu Basis Data Google Drive &amp; Sheets agar Email, Drive, Sheets &amp; seluruh perangkat sinkron permanen.
+                  <strong>Database Multi-Perangkat Aktif:</strong> Tempel ID Cloud Console (terdaftar otomatis ke JavaScript) &amp; tautkan Google OAuth 2.0 1x di menu Basis Data Google Drive &amp; Sheets agar tersimpan permanen.
                 </>
               )}
             </span>
@@ -829,7 +842,7 @@ export const AdminView: React.FC = () => {
                   : 'bg-amber-600 hover:bg-amber-700'
               }`}
             >
-              {isCloudConfiguredInDb ? 'Perbarui Sesi OAuth 2.0 (1x)' : 'Hubungkan Google OAuth 2.0'}
+              {isCloudConfiguredInDb ? 'Sinkronkan Drive & Sheets' : 'Hubungkan OAuth 2.0 (1x)'}
             </button>
           )}
         </div>
@@ -1073,13 +1086,13 @@ export const AdminView: React.FC = () => {
       {/* SECTION 2: SESI ABSEN & PERALIHAN OTOMATIS (Bagian 10 Poin 1 & 2) */}
       {activeSection === 'sessions' && (
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-4">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-slate-900 dark:text-white">
                 Kelola Sesi Presensi & Peralihan Otomatis
               </h2>
               <p className="text-xs text-slate-500">
-                Sesi aktif berganti otomatis berdasarkan jam server tanpa perlu campur tangan petugas.
+                Sesi aktif berganti otomatis berdasarkan jam server pada menu Presensi maupun Google Sheets tanpa perlu campur tangan petugas.
               </p>
             </div>
 
@@ -1095,51 +1108,134 @@ export const AdminView: React.FC = () => {
                 late_tolerance_minutes: 15,
                 is_active: true,
               })}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 text-xs font-semibold"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 text-xs font-semibold shrink-0"
             >
               <Plus className="w-3.5 h-3.5" />
               <span>Tambah Sesi</span>
             </button>
           </div>
 
-          <div className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
-            {sessions.map((sess) => (
-              <div key={sess.id} className="py-3 flex items-center justify-between gap-3">
-                <div className="space-y-1">
-                  <div className="flex items-center gap-2">
-                    <span className="font-bold text-slate-900 dark:text-white text-sm">{sess.name}</span>
-                    <span className="font-mono text-slate-500">({sess.start_time} - {sess.end_time})</span>
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${sess.is_active ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-600'}`}>
-                      {sess.is_active ? 'Aktif' : 'Nonaktif'}
+          {/* Panel Pengaturan Peralihan Sesi Otomatis */}
+          <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 space-y-3 text-xs">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className={`w-2.5 h-2.5 rounded-full ${settings.auto_session_switch !== false ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
+                  <span className="font-bold text-slate-900 dark:text-white">
+                    Engine Peralihan Sesi Otomatis
+                  </span>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                    settings.auto_session_switch !== false
+                      ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                      : 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
+                  }`}>
+                    {settings.auto_session_switch !== false ? 'OTOMATIS AKTIF' : 'MODE MANUAL'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Sesi aktif saat ini: <strong className="text-slate-900 dark:text-white">{activeSession ? `${activeSession.name} (${activeSession.start_time} - ${activeSession.end_time})` : 'Tidak ada'}</strong>
+                  {sessionSchedule.status === 'active' && sessionSchedule.minutesRemaining > 0 && (
+                    <span className="ml-1.5 text-emerald-600 dark:text-emerald-400 font-semibold">
+                      • Sisa waktu {sessionSchedule.minutesRemaining} menit
                     </span>
-                  </div>
-                  <p className="text-slate-500">
-                    Batas Tepat Waktu: <span className="font-semibold">{sess.on_time_limit}</span> • Toleransi Terlambat: {sess.late_tolerance_minutes} Menit
-                  </p>
-                </div>
-
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => setEditingSession(sess)}
-                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-md border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs font-semibold transition-colors shadow-xs"
-                    title="Ubah Parameter & Waktu Sesi Ini"
-                  >
-                    <Edit2 className="w-3.5 h-3.5 text-blue-600" />
-                    <span>Ubah Sesi</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => deleteSession(sess.id)}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-rose-200 dark:border-rose-900/60 bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/40 dark:hover:bg-rose-900/60 text-rose-600 dark:text-rose-400 text-xs font-semibold transition-all shadow-xs active:scale-95 cursor-pointer"
-                    title="Hapus Sesi Ini (Sekali Klik Langsung Terhapus)"
-                  >
-                    <Trash2 className="w-3.5 h-3.5 text-rose-600 shrink-0" />
-                    <span>Hapus Sesi</span>
-                  </button>
-                </div>
+                  )}
+                  {sessionSchedule.nextSession && sessionSchedule.nextSession.id !== activeSession?.id && (
+                    <span className="ml-1.5 text-slate-500">
+                      • Berikutnya: <strong>{sessionSchedule.nextSession.name}</strong> ({sessionSchedule.nextSession.start_time})
+                    </span>
+                  )}
+                </p>
               </div>
-            ))}
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    updateSettings({ auto_session_switch: settings.auto_session_switch === false })
+                  }
+                  className={`px-3 py-1.5 rounded-lg font-semibold border transition-colors ${
+                    settings.auto_session_switch !== false
+                      ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
+                      : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 border-slate-300 dark:border-slate-700 hover:bg-slate-100'
+                  }`}
+                >
+                  {settings.auto_session_switch !== false ? 'Otomatis: ON' : 'Otomatis: OFF'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    updateSettings({
+                      auto_session_switch_notify: settings.auto_session_switch_notify === false,
+                    })
+                  }
+                  className={`px-3 py-1.5 rounded-lg font-semibold border transition-colors ${
+                    settings.auto_session_switch_notify !== false
+                      ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 border-slate-900'
+                      : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-400 border-slate-300 dark:border-slate-700'
+                  }`}
+                >
+                  {settings.auto_session_switch_notify !== false ? 'Suara & Banner Peralihan: ON' : 'Suara Peralihan: OFF'}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
+            {sessions.map((sess) => {
+              const isCurrentlyActive = activeSession?.id === sess.id;
+              const dayNames = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'];
+              const activeDayText = (sess.active_days || [1, 2, 3, 4, 5])
+                .map((d) => dayNames[d])
+                .filter(Boolean)
+                .join(', ');
+              return (
+                <div
+                  key={sess.id}
+                  className={`py-3 px-2 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                    isCurrentlyActive ? 'bg-emerald-50/50 dark:bg-emerald-950/20' : ''
+                  }`}
+                >
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-bold text-slate-900 dark:text-white text-sm">{sess.name}</span>
+                      <span className="font-mono text-slate-500">({sess.start_time} - {sess.end_time})</span>
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${sess.is_active ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-600'}`}>
+                        {sess.is_active ? 'Aktif' : 'Nonaktif'}
+                      </span>
+                      {isCurrentlyActive && (
+                        <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-900 text-white dark:bg-emerald-500 dark:text-slate-950">
+                          SEDANG BERJALAN
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-slate-500">
+                      Batas Tepat Waktu: <span className="font-semibold">{sess.on_time_limit}</span> • Toleransi Terlambat: {sess.late_tolerance_minutes} Menit • Hari: <span className="font-semibold">{activeDayText}</span>
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setEditingSession(sess)}
+                      className="flex items-center gap-1 px-2.5 py-1.5 rounded-md border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs font-semibold transition-colors shadow-xs"
+                      title="Ubah Parameter & Waktu Sesi Ini"
+                    >
+                      <Edit2 className="w-3.5 h-3.5 text-blue-600" />
+                      <span>Ubah Sesi</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deleteSession(sess.id)}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-rose-200 dark:border-rose-900/60 bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/40 dark:hover:bg-rose-900/60 text-rose-600 dark:text-rose-400 text-xs font-semibold transition-all shadow-xs active:scale-95 cursor-pointer"
+                      title="Hapus Sesi Ini (Sekali Klik Langsung Terhapus)"
+                    >
+                      <Trash2 className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                      <span>Hapus Sesi</span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -3168,16 +3264,16 @@ export const AdminView: React.FC = () => {
                 <div>
                   <h2 className="text-sm font-bold text-slate-900 dark:text-white flex flex-wrap items-center gap-2">
                     Basis Data Google Drive, Google Sheets &amp; OAuth 2.0
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${(googleOAuthActive || serverDriveSyncActive) ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300' : isCloudConfiguredInDb ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${(googleOAuthActive || serverDriveSyncActive || isCloudConfiguredInDb) ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
                       {googleOAuthActive || serverDriveSyncActive
                         ? 'OAuth 2.0 & Auto-Sync Real-Time Aktif'
                         : isCloudConfiguredInDb
-                        ? 'ID Cloud Tersimpan - Klik OAuth 2.0 di Tab Ini'
-                        : 'Siap Dihubungkan via Google OAuth 2.0'}
+                        ? 'Tersimpan Permanen (Refresh & Buka-Tutup Aman)'
+                        : 'Siap Dihubungkan 1x via Google OAuth 2.0'}
                     </span>
                   </h2>
                   <p className="text-slate-500">
-                    Alur teratur 4 langkah: ID Cloud Console tersimpan di Aplikasi &amp; Google Sheet (<code>Pengaturan</code>), akun &amp; email terhubung lewat Google OAuth 2.0, lalu setiap perubahan otomatis tersinkron ke Database, Drive, Sheets, dan seluruh perangkat.
+                    Cukup 1x penautan: ID Cloud Console, Email Sekolah &amp; status OAuth 2.0 tersimpan permanen di Aplikasi, Database Server &amp; Google Sheet sehingga tidak perlu menautkan ulang saat refresh maupun buka-tutup aplikasi.
                   </p>
                 </div>
               </div>
@@ -3188,14 +3284,14 @@ export const AdminView: React.FC = () => {
                 disabled={googleSyncing}
                 onClick={() => syncGoogleSheetsNow()}
                 className={`flex items-center gap-2 px-3.5 py-2 rounded-lg font-semibold disabled:opacity-50 transition-colors shrink-0 ${
-                  googleOAuthActive || serverDriveSyncActive
+                  googleOAuthActive || serverDriveSyncActive || isCloudConfiguredInDb
                     ? 'border border-emerald-200 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:hover:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
                     : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs'
                 }`}
                 title={
-                  googleOAuthActive || serverDriveSyncActive
-                    ? 'OAuth 2.0 aktif — setiap perubahan otomatis tersinkron ke Drive & Sheets'
-                    : 'Masuk dengan Google OAuth 2.0 untuk mengaktifkan auto-sync Drive & Sheets di tab ini'
+                  googleOAuthActive || serverDriveSyncActive || isCloudConfiguredInDb
+                    ? 'Tautan Google & email tersimpan permanen — klik untuk sinkron Drive & Sheets'
+                    : 'Masuk 1x dengan Google OAuth 2.0 untuk mengaktifkan auto-sync permanen'
                 }
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${googleSyncing ? 'animate-spin' : ''}`} />
@@ -3204,7 +3300,9 @@ export const AdminView: React.FC = () => {
                     ? 'Menyinkronkan Drive & Sheets...'
                     : googleOAuthActive || serverDriveSyncActive
                     ? 'OAuth 2.0 & Auto-Sync Aktif'
-                    : 'Hubungkan Google OAuth 2.0'}
+                    : isCloudConfiguredInDb
+                    ? 'Email & Cloud Tersambung'
+                    : 'Hubungkan Google OAuth 2.0 (1x)'}
                 </span>
               </button>
             </div>
@@ -3436,12 +3534,16 @@ export const AdminView: React.FC = () => {
                         {googleAccount?.name || settings.google_account_name || 'Kesiswaan SMP Puncak Darussalam'}
                       </span>
                       <span className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2.5 py-0.5 rounded-full border ${
-                        googleOAuthActive || serverDriveSyncActive
+                        googleOAuthActive || serverDriveSyncActive || isCloudConfiguredInDb || googleSheetsConnected
                           ? 'text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800'
                           : 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-800'
                       }`}>
                         <Check className="w-3 h-3" />
-                        {googleOAuthActive || serverDriveSyncActive ? 'OAuth 2.0 Terhubung Permanen' : 'Email Tersimpan (Aktifkan OAuth 2.0 1x)'}
+                        {googleOAuthActive || serverDriveSyncActive
+                          ? 'OAuth 2.0 & Server Aktif Permanen'
+                          : isCloudConfiguredInDb || googleSheetsConnected
+                          ? 'Tersimpan Permanen (Aman Refresh & Buka-Tutup)'
+                          : 'Perlu Ditautkan 1x'}
                       </span>
                     </div>
                     <p className="text-slate-700 dark:text-slate-300 font-mono text-[11px] font-semibold flex items-center gap-1.5">
@@ -3449,7 +3551,7 @@ export const AdminView: React.FC = () => {
                       <span>{googleAccount?.email || settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}</span>
                     </p>
                     <p className="text-[10px] text-slate-500">
-                      Menggunakan ruang lingkup resmi non-terbatas (bebas pelanggaran). Sekali dihubungkan, Email, DB, Drive &amp; Sheets tetap tersambung terus meski refresh atau keluar-masuk aplikasi.
+                      Menggunakan ruang lingkup resmi non-terbatas (bebas pelanggaran). Sekali disimpan atau dihubungkan, Email, DB, Drive &amp; Sheets tetap tersambung terus meski refresh atau buka-tutup aplikasi.
                     </p>
                     {settings.google_last_synced_at && (
                       <p className="text-[10px] text-slate-400">
@@ -3466,12 +3568,12 @@ export const AdminView: React.FC = () => {
                       <button
                         type="button"
                         disabled={googleSyncing}
-                        onClick={() => connectGoogle(false, settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com')}
+                        onClick={() => connectGoogle(false, directEmailInput || settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com')}
                         className="flex items-center gap-2 px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-xs transition-colors disabled:opacity-50"
-                        title="Login dengan Google OAuth 2.0 untuk sinkronisasi otomatis Drive, Sheets, dan Email"
+                        title="Login 1x dengan Google OAuth 2.0 untuk sinkronisasi otomatis permanen"
                       >
                         <Zap className="w-3.5 h-3.5 text-amber-300" />
-                        <span>Hubungkan via Google OAuth 2.0</span>
+                        <span>Hubungkan via Google OAuth 2.0 (1x)</span>
                       </button>
 
                       <button
@@ -3496,10 +3598,10 @@ export const AdminView: React.FC = () => {
                         disabled={googleSyncing}
                         onClick={() => syncGoogleSheetsNow()}
                         className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 font-semibold transition-colors disabled:opacity-50"
-                        title="Sinkronisasi Drive & Sheets otomatis aktif setelah sesi OAuth 2.0 diotorisasi"
+                        title="Sinkronisasi Drive & Sheets tetap aktif permanen"
                       >
                         <RefreshCw className={`w-3.5 h-3.5 ${googleSyncing ? 'animate-spin' : ''}`} />
-                        <span>{googleSyncing ? 'Menyinkronkan...' : googleOAuthActive || serverDriveSyncActive ? 'Perbarui Drive & Sheets' : 'Aktifkan Sesi OAuth 2.0'}</span>
+                        <span>{googleSyncing ? 'Menyinkronkan...' : 'Sinkron Drive & Sheets'}</span>
                       </button>
 
                       <button
@@ -3530,6 +3632,32 @@ export const AdminView: React.FC = () => {
                     </>
                   )}
                 </div>
+              </div>
+
+              {/* Simpan / Tautkan Email Sekolah Permanen Cukup 1x */}
+              <div className="pt-3 border-t border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row sm:items-center gap-2">
+                <div className="flex-1 flex items-center gap-2">
+                  <Mail className="w-4 h-4 text-slate-400 shrink-0" />
+                  <input
+                    type="email"
+                    value={directEmailInput}
+                    onChange={(e) => setDirectEmailInput(e.target.value)}
+                    placeholder="Email sekolah / pengirim (misal: kswsmp.puncakdarussalam@gmail.com)"
+                    className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-mono text-slate-800 dark:text-slate-100"
+                  />
+                </div>
+                <button
+                  type="button"
+                  disabled={savingDirectEmail || !directEmailInput.trim()}
+                  onClick={async () => {
+                    setSavingDirectEmail(true);
+                    await linkEmailDirectly(directEmailInput.trim());
+                    setSavingDirectEmail(false);
+                  }}
+                  className="px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 text-white font-semibold text-xs whitespace-nowrap disabled:opacity-50 transition-colors"
+                >
+                  {savingDirectEmail ? 'Menyimpan...' : 'Simpan Email Permanen (1x)'}
+                </button>
               </div>
             </div>
 
@@ -3611,7 +3739,7 @@ export const AdminView: React.FC = () => {
                       </div>
                     </div>
                     <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300">
-                      9 Lembar Kerja
+                      10 Lembar Kerja
                     </span>
                   </div>
 
@@ -3622,7 +3750,7 @@ export const AdminView: React.FC = () => {
                     </div>
                     <div className="text-slate-500 text-[10px] font-sans pt-1">Lembar Kerja (Sheets):</div>
                     <div className="flex flex-wrap gap-1 font-sans text-[10px]">
-                      {['Siswa', 'Kelas', 'Sesi_Presensi', 'Presensi', 'Izin_Keluar', 'Pelanggaran', 'Izin_Tidak_Masuk', 'Jenis_Pelanggaran', 'Pengaturan'].map((sh) => (
+                      {['Siswa', 'Kelas', 'Sesi_Presensi', 'Rekap_Per_Sesi', 'Presensi', 'Izin_Keluar', 'Pelanggaran', 'Izin_Tidak_Masuk', 'Jenis_Pelanggaran', 'Pengaturan'].map((sh) => (
                         <span key={sh} className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
                           {sh}
                         </span>

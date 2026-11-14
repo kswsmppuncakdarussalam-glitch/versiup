@@ -10,6 +10,101 @@ export async function exportToExcel(data: any[], fileName: string, sheetName = '
   XLSX.writeFile(wb, `${fileName}.xlsx`);
 }
 
+export async function exportSessionRecapToExcel(params: {
+  fileName: string;
+  targetDate: string;
+  sessionSummaries: Array<{
+    sessionId: string;
+    sessionName: string;
+    timeRange: string;
+    onTimeLimit: string;
+    statusLabel: string;
+    totalStudents: number;
+    hadir: number;
+    terlambat: number;
+    izin: number;
+    sakit: number;
+    alpha: number;
+    belumPresensi: number;
+    totalRecorded: number;
+    attendancePercent: number;
+  }>;
+  classSessionSummaries: Array<{
+    sessionId: string;
+    sessionName: string;
+    classId: string;
+    className: string;
+    totalStudents: number;
+    hadir: number;
+    terlambat: number;
+    izin: number;
+    sakit: number;
+    alpha: number;
+    belumPresensi: number;
+    totalAttended: number;
+    attendancePercent: number;
+  }>;
+  detailRows?: Array<Record<string, any>>;
+}) {
+  const XLSX = await import('xlsx');
+  const wb = XLSX.utils.book_new();
+
+  const summarySheetRows = params.sessionSummaries.map((row, idx) => ({
+    No: idx + 1,
+    Tanggal: params.targetDate,
+    ID_Sesi: row.sessionId,
+    Nama_Sesi: row.sessionName,
+    Jam_Sesi: row.timeRange,
+    Batas_Tepat_Waktu: row.onTimeLimit,
+    Status_Sesi: row.statusLabel,
+    Total_Siswa: row.totalStudents,
+    Hadir: row.hadir,
+    Terlambat: row.terlambat,
+    Izin: row.izin,
+    Sakit: row.sakit,
+    Alpha: row.alpha,
+    Belum_Presensi: row.belumPresensi,
+    Total_Tercatat: row.totalRecorded,
+    Persentase_Kehadiran: `${row.attendancePercent}%`,
+  }));
+
+  const classSheetRows = params.classSessionSummaries.map((cRow, idx) => ({
+    No: idx + 1,
+    Tanggal: params.targetDate,
+    Nama_Sesi: cRow.sessionName,
+    Kelas: cRow.className,
+    Total_Siswa: cRow.totalStudents,
+    Hadir: cRow.hadir,
+    Terlambat: cRow.terlambat,
+    Izin: cRow.izin,
+    Sakit: cRow.sakit,
+    Alpha: cRow.alpha,
+    Belum_Presensi: cRow.belumPresensi,
+    Total_Hadir: cRow.totalAttended,
+    Persentase: `${cRow.attendancePercent}%`,
+  }));
+
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(summarySheetRows.length > 0 ? summarySheetRows : [{ Info: 'Belum ada data sesi' }]),
+    'Ringkasan_Sesi'
+  );
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.json_to_sheet(classSheetRows.length > 0 ? classSheetRows : [{ Info: 'Belum ada data kelas' }]),
+    'Rekap_Per_Kelas_Sesi'
+  );
+  if (params.detailRows && params.detailRows.length > 0) {
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(params.detailRows),
+      'Detail_Presensi_Sesi'
+    );
+  }
+
+  XLSX.writeFile(wb, `${params.fileName}.xlsx`);
+}
+
 export interface StudentImportRow {
   NIS: string;
   NISN?: string;
