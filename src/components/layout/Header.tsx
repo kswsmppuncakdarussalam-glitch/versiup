@@ -33,7 +33,6 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
     lockCurrentMenu,
     settings,
     updateSettings,
-    googleSheetsConnected,
     googleOAuthActive,
     serverDriveSyncActive,
     googleSyncing,
@@ -41,7 +40,6 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
     googleNeedsInteractiveReauth,
     syncGoogleSheetsNow,
     permanentDriveSync,
-    driveSyncMode,
     syncStatus,
     syncNow,
     serverVersion,
@@ -204,39 +202,31 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
         {/* Google Drive & Sheets Auto-Sync Status Pill */}
         {googleSyncing || googleAutoRefreshing ? (
           <div
-            title={
-              googleAutoRefreshing
-                ? 'Menyegarkan sesi OAuth 2.0 Google Drive & Sheets secara otomatis...'
-                : 'Sedang menyinkronkan data ke Google Drive & Google Sheets secara otomatis...'
-            }
+            title="Menyinkronkan data ke Google Drive & Google Sheets secara otomatis..."
             className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-sky-50 dark:bg-sky-950/30 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800"
           >
             <RefreshCw className="w-3 h-3 animate-spin" />
-            <span>{googleAutoRefreshing ? 'Menyegarkan OAuth...' : 'Sinkron Drive & Sheets...'}</span>
+            <span>{googleAutoRefreshing ? 'Menyegarkan Sesi Google...' : 'Sinkron Otomatis...'}</span>
           </div>
         ) : isAutoDriveActive ? (
           <button
             type="button"
             onClick={() => syncGoogleSheetsNow()}
-            title={`Auto-Sync Permanen Aktif (${permanentDriveSync ? `Mode Server 0-Klik: ${driveSyncMode}` : settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}). Email, Database, Google Drive & Sheets langsung tersinkron otomatis setiap perubahan.`}
+            title={`Sinkronisasi otomatis aktif penuh (${settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}). Email, Database, Google Drive & Sheets langsung tersinkron setiap perubahan.`}
             className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:hover:bg-emerald-950/50 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800 transition-colors"
           >
             <Database className="w-3 h-3" />
-            <span>
-              {permanentDriveSync
-                ? 'Auto-Sync Drive 0-Klik Aktif'
-                : 'Email, DB, Drive & Sheets Aktif'}
-            </span>
+            <span>Auto-Sync Drive &amp; Sheets Aktif</span>
           </button>
         ) : (settings.google_oauth_connected || isCloudConfiguredInDb) && !googleNeedsInteractiveReauth ? (
           <button
             type="button"
             onClick={() => syncGoogleSheetsNow()}
-            title={`Database Server, Sesi & Email (${settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}) sudah Auto-Sync otomatis sejak awal. Untuk Drive & Sheets 0-klik permanen tanpa OAuth popup, aktifkan Apps Script / Service Account di menu Admin → Basis Data Drive & Sheets, atau klik tombol ini untuk sync Drive sekarang.`}
-            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/30 dark:hover:bg-amber-950/50 text-amber-800 dark:text-amber-300 border-amber-300 dark:border-amber-700 transition-colors"
+            title={`Database Server, Sesi & Email (${settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}) sinkron otomatis. Klik untuk sinkronisasi Google Drive & Sheets sekarang.`}
+            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:hover:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800 transition-colors"
           >
             <Database className="w-3 h-3" />
-            <span>DB Auto • Sync Drive</span>
+            <span>Auto-Sync Mandiri • Drive</span>
           </button>
         ) : (
           <button
@@ -244,15 +234,13 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
             onClick={() => syncGoogleSheetsNow()}
             title={
               googleNeedsInteractiveReauth
-                ? 'Database & Email tetap Auto-Sync otomatis. Sesi OAuth Drive di server habis — klik untuk perbarui atau aktifkan Bridge 0-Klik (Apps Script / Service Account) di menu Admin.'
-                : googleSheetsConnected
-                ? 'Database & Email tetap Auto-Sync otomatis. Klik untuk sinkron Drive via OAuth 2.0 atau aktifkan Bridge 0-Klik di menu Admin.'
-                : 'Hubungkan Google Drive & Sheets'
+                ? 'Database & Email tetap sinkron otomatis. Klik untuk memperbarui sesi Google Drive & Sheets.'
+                : 'Database & Email tetap sinkron otomatis. Klik untuk menghubungkan Google Drive & Sheets.'
             }
-            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/30 dark:hover:bg-amber-950/50 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800 transition-colors"
+            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border-slate-300 dark:border-slate-700 transition-colors"
           >
             <Database className="w-3 h-3" />
-            <span>{googleNeedsInteractiveReauth ? 'Perbarui OAuth Drive' : 'DB Auto • Hubungkan Drive'}</span>
+            <span>{googleNeedsInteractiveReauth ? 'Perbarui Sesi Google' : 'Hubungkan Google Drive'}</span>
           </button>
         )}
 

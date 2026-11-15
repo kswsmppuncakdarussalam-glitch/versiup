@@ -2122,9 +2122,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 localStorage.setItem('dkb_cache_server_drive_active', 'true');
               } catch {}
               showToast(
-                permanentDriveSync
-                  ? 'Sinkronisasi Google Drive & Sheets berhasil melalui Auto-Sync Server 0-Klik!'
-                  : 'Sinkronisasi Google Drive & Sheets berhasil melalui koneksi OAuth tersimpan!',
+                'Sinkronisasi Google Drive & Sheets berhasil secara otomatis!',
                 'success'
               );
               return { success: true };
