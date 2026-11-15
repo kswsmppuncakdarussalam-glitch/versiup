@@ -40,6 +40,7 @@ interface DatabaseSchema {
 const IS_VERCEL = Boolean(process.env.VERCEL || process.env.NOW_REGION || process.env.AWS_LAMBDA_FUNCTION_NAME);
 const DATA_DIR = IS_VERCEL ? path.join('/tmp', 'dkb_data') : path.resolve(process.cwd(), '.data');
 const DB_FILE = path.join(DATA_DIR, 'database.json');
+const DB_BACKUP_FILE = path.join(DATA_DIR, 'database.backup.json');
 
 class StorageManager {
   private db: DatabaseSchema | null = null;
@@ -50,6 +51,18 @@ class StorageManager {
 
   constructor() {
     this.ensureDataDir();
+  }
+
+  private hasRealSchoolData(db: DatabaseSchema | null | undefined): boolean {
+    if (!db) return false;
+    return (
+      (db.students?.length || 0) > 0 ||
+      (db.classes?.length || 0) > 0 ||
+      (db.attendance?.length || 0) > 0 ||
+      (db.violations?.length || 0) > 0 ||
+      (db.out_of_class?.length || 0) > 0 ||
+      (db.leave_requests?.length || 0) > 0
+    );
   }
 
   private ensureDataDir() {
@@ -86,6 +99,95 @@ class StorageManager {
     return true;
   }
 
+  private reconcileSettingsAndNotifications(db: DatabaseSchema): boolean {
+    let modified = false;
+    if (!db.notification_settings) {
+      db.notification_settings = this.getDefaultSchema().notification_settings;
+      modified = true;
+    }
+    if (!Array.isArray(db.notification_log)) {
+      db.notification_log = [];
+      modified = true;
+    }
+    if (!Array.isArray(db.audit_log)) {
+      db.audit_log = [];
+      modified = true;
+    }
+
+    // Ensure classes have homeroom_teacher_email configured by admin
+    if (db.classes) {
+      const defaultEmails: Record<string, string> = {
+        '10-RPL-1': 'siti.aminah@sekolah.sch.id',
+        '10-TKJ-1': 'budi.santoso@sekolah.sch.id',
+        '11-RPL-1': 'sri.rahayu@sekolah.sch.id',
+        '12-RPL-1': 'ahmad.fauzi@sekolah.sch.id',
+      };
+      for (const c of db.classes) {
+        if (!c.homeroom_teacher_email) {
+          c.homeroom_teacher_email = defaultEmails[c.id] || `${c.id.toLowerCase().replace(/[^a-z0-9]/g, '.')}@sekolah.sch.id`;
+          modified = true;
+        }
+      }
+    }
+
+    // Ensure notification_settings have weekly recap settings
+    if (db.notification_settings.weekly_recap_enabled === undefined) {
+      db.notification_settings.weekly_recap_enabled = true;
+      db.notification_settings.weekly_recap_day = 5;
+      db.notification_settings.weekly_recap_time = '15:00';
+      modified = true;
+    }
+
+    // Ensure google_account_email & core settings defaults
+    if (db.settings) {
+      if (!db.settings.google_account_email) {
+        db.settings.google_account_email = 'kswsmp.puncakdarussalam@gmail.com';
+        db.settings.google_account_name = 'Kesiswaan SMP Puncak Darussalam';
+        modified = true;
+      }
+      if (db.settings.toggle_email_notifications === undefined) {
+        db.settings.toggle_email_notifications = true;
+        modified = true;
+      }
+      if (db.settings.google_client_id === undefined) {
+        db.settings.google_client_id = '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com';
+        modified = true;
+      }
+      if (
+        db.settings.google_oauth_connected === undefined ||
+        (!db.settings.google_oauth_connected &&
+          Boolean(db.settings.google_account_email?.trim()) &&
+          Boolean(db.settings.google_sheet_id?.trim() || db.settings.google_drive_folder_id?.trim()))
+      ) {
+        db.settings.google_oauth_connected = Boolean(
+          db.settings.google_account_email?.trim() &&
+            (db.settings.google_sheet_id?.trim() || db.settings.google_drive_folder_id?.trim())
+        );
+        modified = true;
+      }
+      if (db.settings.auto_session_switch === undefined) {
+        db.settings.auto_session_switch = true;
+        modified = true;
+      }
+      if (db.settings.auto_session_switch_notify === undefined) {
+        db.settings.auto_session_switch_notify = true;
+        modified = true;
+      }
+
+      // Atomically keep settings.toggle_email_notifications and notification_settings.email_enabled in sync
+      if (db.settings.toggle_email_notifications !== db.notification_settings.email_enabled) {
+        const sTime = new Date(db.settings.updated_at || 0).getTime();
+        const nTime = new Date(db.notification_settings.updated_at || 0).getTime();
+        const authoritative = sTime >= nTime ? db.settings.toggle_email_notifications : db.notification_settings.email_enabled;
+        db.settings.toggle_email_notifications = authoritative;
+        db.notification_settings.email_enabled = authoritative;
+        modified = true;
+      }
+    }
+
+    return modified;
+  }
+
   private async loadDb(): Promise<DatabaseSchema> {
     const now = Date.now();
 
@@ -100,70 +202,7 @@ class StorageManager {
         this.db = JSON.parse(content);
         this.lastMtimeMs = stat.mtimeMs;
 
-        // Ensure classes have homeroom_teacher_email configured by admin
-        let modified = false;
-        if (this.db?.classes) {
-          const defaultEmails: Record<string, string> = {
-            '10-RPL-1': 'siti.aminah@sekolah.sch.id',
-            '10-TKJ-1': 'budi.santoso@sekolah.sch.id',
-            '11-RPL-1': 'sri.rahayu@sekolah.sch.id',
-            '12-RPL-1': 'ahmad.fauzi@sekolah.sch.id',
-          };
-          for (const c of this.db.classes) {
-            if (!c.homeroom_teacher_email) {
-              c.homeroom_teacher_email = defaultEmails[c.id] || `${c.id.toLowerCase().replace(/[^a-z0-9]/g, '.')}@sekolah.sch.id`;
-              modified = true;
-            }
-          }
-        }
-
-        // Ensure notification_settings have weekly recap settings
-        if (this.db?.notification_settings) {
-          if (this.db.notification_settings.weekly_recap_enabled === undefined) {
-            this.db.notification_settings.weekly_recap_enabled = true;
-            this.db.notification_settings.weekly_recap_day = 5; // Friday
-            this.db.notification_settings.weekly_recap_time = '15:00';
-            modified = true;
-          }
-        }
-
-        // Ensure google_account_email is configured
-        if (this.db?.settings) {
-          if (!this.db.settings.google_account_email) {
-            this.db.settings.google_account_email = 'kswsmp.puncakdarussalam@gmail.com';
-            this.db.settings.google_account_name = 'Kesiswaan SMP Puncak Darussalam';
-            modified = true;
-          }
-          if (this.db.settings.toggle_email_notifications === undefined) {
-            this.db.settings.toggle_email_notifications = true;
-            modified = true;
-          }
-          if (this.db.settings.google_client_id === undefined) {
-            this.db.settings.google_client_id = '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com';
-            modified = true;
-          }
-          if (
-            this.db.settings.google_oauth_connected === undefined ||
-            (!this.db.settings.google_oauth_connected &&
-              Boolean(this.db.settings.google_account_email?.trim()) &&
-              Boolean(this.db.settings.google_sheet_id?.trim() || this.db.settings.google_drive_folder_id?.trim()))
-          ) {
-            this.db.settings.google_oauth_connected = Boolean(
-              this.db.settings.google_account_email?.trim() &&
-                (this.db.settings.google_sheet_id?.trim() || this.db.settings.google_drive_folder_id?.trim())
-            );
-            modified = true;
-          }
-          if (this.db.settings.auto_session_switch === undefined) {
-            this.db.settings.auto_session_switch = true;
-            modified = true;
-          }
-          if (this.db.settings.auto_session_switch_notify === undefined) {
-            this.db.settings.auto_session_switch_notify = true;
-            modified = true;
-          }
-        }
-
+        const modified = this.db ? this.reconcileSettingsAndNotifications(this.db) : false;
         if (modified && this.db) {
           this.saveDbSync(this.db);
         }
@@ -171,7 +210,23 @@ class StorageManager {
         this.lastCacheTime = now;
         return this.db!;
       } catch (err) {
-        console.error('[Storage] Error reading db file, re-initializing:', err);
+        console.error('[Storage] Error reading db file, checking rolling backup:', err);
+      }
+    }
+
+    // Recover from rolling backup if main database file is missing or unreadable
+    if (fs.existsSync(DB_BACKUP_FILE)) {
+      try {
+        const backupContent = fs.readFileSync(DB_BACKUP_FILE, 'utf-8');
+        const restoredDb = JSON.parse(backupContent) as DatabaseSchema;
+        this.reconcileSettingsAndNotifications(restoredDb);
+        this.db = restoredDb;
+        this.saveDbSync(this.db);
+        this.lastCacheTime = now;
+        console.log('[Storage] Recovered database from rolling backup:', DB_BACKUP_FILE);
+        return this.db;
+      } catch (backupErr) {
+        console.error('[Storage] Rolling backup recovery failed:', backupErr);
       }
     }
 
@@ -185,13 +240,21 @@ class StorageManager {
   private saveDbSync(db: DatabaseSchema) {
     try {
       this.ensureDataDir();
+      const serialized = JSON.stringify(db, null, 2);
       const tempFile = `${DB_FILE}.tmp.${Date.now()}.${Math.random().toString(36).substring(2, 6)}`;
-      fs.writeFileSync(tempFile, JSON.stringify(db, null, 2), 'utf-8');
+      fs.writeFileSync(tempFile, serialized, 'utf-8');
       fs.renameSync(tempFile, DB_FILE);
       try {
         this.lastMtimeMs = fs.statSync(DB_FILE).mtimeMs;
       } catch {
         this.lastMtimeMs = Date.now();
+      }
+
+      // Maintain rolling safety backup whenever real data exists or no backup exists yet
+      if (this.hasRealSchoolData(db) || !fs.existsSync(DB_BACKUP_FILE)) {
+        const backupTemp = `${DB_BACKUP_FILE}.tmp.${Date.now()}.${Math.random().toString(36).substring(2, 6)}`;
+        fs.writeFileSync(backupTemp, serialized, 'utf-8');
+        fs.renameSync(backupTemp, DB_BACKUP_FILE);
       }
     } catch (err) {
       console.warn('[Storage] saveDbSync error (ephemeral cache active):', err);
@@ -253,8 +316,66 @@ class StorageManager {
     }
   }
 
+  private mergeCollectionByKey<T extends Record<string, any>>(
+    existing: T[],
+    incoming: T[],
+    keyField: keyof T
+  ): T[] {
+    const map = new Map<string, T>();
+    for (const item of existing) {
+      const k = item && item[keyField] ? String(item[keyField]) : '';
+      if (k) map.set(k, item);
+    }
+    for (const item of incoming) {
+      const k = item && item[keyField] ? String(item[keyField]) : '';
+      if (!k) continue;
+      const cur = map.get(k);
+      if (!cur) {
+        map.set(k, item);
+      } else {
+        const incT = new Date(item.updated_at || item.created_at || 0).getTime();
+        const curT = new Date(cur.updated_at || cur.created_at || 0).getTime();
+        if (incT >= curT) {
+          map.set(k, { ...cur, ...item });
+        }
+      }
+    }
+    return Array.from(map.values());
+  }
+
+  private mergeSettingsSafe(existing: AppSettings, incoming: Partial<AppSettings>): AppSettings {
+    const preserveKeys: Array<keyof AppSettings> = [
+      'google_client_id',
+      'google_account_email',
+      'google_account_name',
+      'google_account_photo',
+      'google_sheet_id',
+      'google_sheet_url',
+      'google_drive_folder_id',
+      'google_drive_folder_url',
+      'google_drive_backup_file_id',
+      'google_drive_backup_file_url',
+      'school_name',
+    ];
+    const next: AppSettings = { ...existing, ...incoming };
+    if (incoming.google_oauth_connected !== false) {
+      for (const k of preserveKeys) {
+        const incVal = incoming[k];
+        const exVal = existing[k];
+        if ((incVal === undefined || incVal === '') && typeof exVal === 'string' && exVal.trim()) {
+          (next as any)[k] = exVal;
+        }
+      }
+      if (existing.google_oauth_connected && incoming.google_oauth_connected === undefined) {
+        next.google_oauth_connected = true;
+      }
+    }
+    return next;
+  }
+
   // --- TWO-WAY BIDIRECTIONAL SYNC ---
   public async applyTwoWaySync(payload: {
+    merge?: boolean;
     classes?: SchoolClass[];
     students?: Student[];
     sessions?: AttendanceSession[];
@@ -269,24 +390,27 @@ class StorageManager {
   }) {
     return this.mutate((db) => {
       const nowIso = new Date().toISOString();
+      const useMerge = Boolean(payload.merge);
 
       if (Array.isArray(payload.classes)) {
-        db.classes = payload.classes;
+        db.classes = useMerge ? this.mergeCollectionByKey(db.classes, payload.classes, 'id') : payload.classes;
         this.recordChange(db, 'classes', 'bulk', 'update', db.classes);
       }
 
       if (Array.isArray(payload.students)) {
-        db.students = payload.students;
+        db.students = useMerge ? this.mergeCollectionByKey(db.students, payload.students, 'nis') : payload.students;
         this.recordChange(db, 'students', 'bulk', 'update', db.students);
       }
 
       if (Array.isArray(payload.sessions)) {
-        db.sessions = payload.sessions;
+        db.sessions = useMerge ? this.mergeCollectionByKey(db.sessions, payload.sessions, 'id') : payload.sessions;
         this.recordChange(db, 'sessions', 'bulk', 'update', db.sessions);
       }
 
       if (Array.isArray(payload.violation_types)) {
-        db.violation_types = payload.violation_types;
+        db.violation_types = useMerge
+          ? this.mergeCollectionByKey(db.violation_types, payload.violation_types, 'id')
+          : payload.violation_types;
         this.recordChange(db, 'violation_types', 'bulk', 'update', db.violation_types);
       }
 
@@ -331,13 +455,31 @@ class StorageManager {
       }
 
       if (payload.settings) {
-        db.settings = { ...db.settings, ...payload.settings, updated_at: nowIso };
+        db.settings = useMerge
+          ? { ...this.mergeSettingsSafe(db.settings, payload.settings), updated_at: nowIso }
+          : { ...db.settings, ...payload.settings, updated_at: nowIso };
         this.recordChange(db, 'settings', 'global', 'update', db.settings);
+        if (payload.settings.toggle_email_notifications !== undefined) {
+          db.notification_settings = {
+            ...db.notification_settings,
+            email_enabled: payload.settings.toggle_email_notifications,
+            updated_at: nowIso,
+          };
+          this.recordChange(db, 'notification_settings', 'global', 'update', db.notification_settings);
+        }
       }
 
       if (payload.notification_settings) {
         db.notification_settings = { ...db.notification_settings, ...payload.notification_settings, updated_at: nowIso };
         this.recordChange(db, 'notification_settings', 'global', 'update', db.notification_settings);
+        if (payload.notification_settings.email_enabled !== undefined) {
+          db.settings = {
+            ...db.settings,
+            toggle_email_notifications: payload.notification_settings.email_enabled,
+            updated_at: nowIso,
+          };
+          this.recordChange(db, 'settings', 'global', 'update', db.settings);
+        }
       }
 
       if (Array.isArray(payload.mutations)) {
@@ -349,9 +491,25 @@ class StorageManager {
           if (m.type === 'settings' && p) {
             db.settings = { ...db.settings, ...p, updated_at: nowIso };
             this.recordChange(db, 'settings', 'global', 'update', db.settings);
+            if (p.toggle_email_notifications !== undefined) {
+              db.notification_settings = {
+                ...db.notification_settings,
+                email_enabled: p.toggle_email_notifications,
+                updated_at: nowIso,
+              };
+              this.recordChange(db, 'notification_settings', 'global', 'update', db.notification_settings);
+            }
           } else if (m.type === 'notification_settings' && p) {
             db.notification_settings = { ...db.notification_settings, ...p, updated_at: nowIso };
             this.recordChange(db, 'notification_settings', 'global', 'update', db.notification_settings);
+            if (p.email_enabled !== undefined) {
+              db.settings = {
+                ...db.settings,
+                toggle_email_notifications: p.email_enabled,
+                updated_at: nowIso,
+              };
+              this.recordChange(db, 'settings', 'global', 'update', db.settings);
+            }
           } else if (m.type === 'classes' && p) {
             if (action === 'delete') {
               const delId = typeof p === 'string' ? p : p.id;
@@ -572,6 +730,8 @@ class StorageManager {
           violations: db.violations,
           leave_requests: db.leave_requests,
           notification_settings: db.notification_settings,
+          notification_log: db.notification_log.slice(0, 100),
+          audit_log: db.audit_log.slice(0, 100),
         },
       };
     });
@@ -607,6 +767,8 @@ class StorageManager {
           violations: db.violations,
           leave_requests: db.leave_requests,
           notification_settings: db.notification_settings,
+          notification_log: db.notification_log.slice(0, 100),
+          audit_log: db.audit_log.slice(0, 100),
         },
       };
     }
@@ -1269,12 +1431,21 @@ class StorageManager {
 
   public async updateSettings(updates: Partial<AppSettings>): Promise<AppSettings> {
     return this.mutate((db) => {
+      const nowIso = new Date().toISOString();
       db.settings = {
         ...db.settings,
         ...updates,
-        updated_at: new Date().toISOString(),
+        updated_at: nowIso,
       };
       this.recordChange(db, 'settings', 'global', 'update', db.settings);
+      if (updates.toggle_email_notifications !== undefined) {
+        db.notification_settings = {
+          ...db.notification_settings,
+          email_enabled: updates.toggle_email_notifications,
+          updated_at: nowIso,
+        };
+        this.recordChange(db, 'notification_settings', 'global', 'update', db.notification_settings);
+      }
       return db.settings;
     });
   }
@@ -1287,12 +1458,21 @@ class StorageManager {
 
   public async updateNotificationSettings(updates: Partial<NotificationSettings>): Promise<NotificationSettings> {
     return this.mutate((db) => {
+      const nowIso = new Date().toISOString();
       db.notification_settings = {
         ...db.notification_settings,
         ...updates,
-        updated_at: new Date().toISOString(),
+        updated_at: nowIso,
       };
       this.recordChange(db, 'notification_settings', 'global', 'update', db.notification_settings);
+      if (updates.email_enabled !== undefined) {
+        db.settings = {
+          ...db.settings,
+          toggle_email_notifications: updates.email_enabled,
+          updated_at: nowIso,
+        };
+        this.recordChange(db, 'settings', 'global', 'update', db.settings);
+      }
       return db.notification_settings;
     });
   }
@@ -1308,6 +1488,7 @@ class StorageManager {
       if (db.notification_log.length > 500) {
         db.notification_log = db.notification_log.slice(0, 500);
       }
+      this.recordChange(db, 'notification_log', log.id, 'insert', log);
     });
   }
 
@@ -1362,6 +1543,7 @@ class StorageManager {
     if (db.audit_log.length > 1000) {
       db.audit_log = db.audit_log.slice(0, 1000);
     }
+    this.recordChange(db, 'audit_log', log.id, 'insert', log);
   }
 
   // --- DEFAULT SEED SCHEMA ---

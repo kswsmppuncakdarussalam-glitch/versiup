@@ -206,7 +206,7 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
             <RefreshCw className="w-3 h-3 animate-spin" />
             <span>Sinkron Drive & Sheets...</span>
           </div>
-        ) : isAutoDriveActive || settings.google_oauth_connected || isCloudConfiguredInDb ? (
+        ) : isAutoDriveActive ? (
           <button
             type="button"
             onClick={() => syncGoogleSheetsNow()}
@@ -214,7 +214,17 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
             className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:hover:bg-emerald-950/50 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800 transition-colors"
           >
             <Database className="w-3 h-3" />
-            <span>{isAutoDriveActive ? 'Email, DB, Drive & Sheets Aktif' : 'Email & Cloud Tersambung'}</span>
+            <span>Email, DB, Drive &amp; Sheets Aktif</span>
+          </button>
+        ) : settings.google_oauth_connected || isCloudConfiguredInDb ? (
+          <button
+            type="button"
+            onClick={() => syncGoogleSheetsNow()}
+            title={`Database & Email (${settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}) tetap tersimpan permanen. Klik 1x untuk menyegarkan sesi OAuth 2.0 Google Drive & Sheets agar auto-sync cloud aktif kembali.`}
+            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/30 dark:hover:bg-amber-950/50 text-amber-800 dark:text-amber-300 border-amber-300 dark:border-amber-700 transition-colors"
+          >
+            <Database className="w-3 h-3" />
+            <span>DB &amp; Email Tersimpan • Aktifkan Drive (1x)</span>
           </button>
         ) : (
           <button

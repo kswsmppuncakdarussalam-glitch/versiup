@@ -700,6 +700,166 @@ export interface SyncDataPayload {
 
 const DRIVE_BACKUP_FILENAME = 'DISIPLIN_KITA_BISA_Database_Realtime.json';
 
+export const hasRealSyncData = (data: any): boolean => {
+  if (!data || typeof data !== 'object') return false;
+  return (
+    (data.students?.length || 0) > 0 ||
+    (data.classes?.length || 0) > 0 ||
+    (data.attendance?.length || 0) > 0 ||
+    (data.violations?.length || 0) > 0 ||
+    (data.outOfClass?.length || data.out_of_class?.length || 0) > 0 ||
+    (data.leaveRequests?.length || data.leave_requests?.length || 0) > 0
+  );
+};
+
+/**
+ * Pull real-time JSON database snapshot from Google Drive folder
+ */
+export const pullDriveBackupFile = async (
+  accessToken: string,
+  existingFileId?: string,
+  folderId?: string
+): Promise<{ fileId: string; fileUrl: string; data: any } | null> => {
+  if (!accessToken) return null;
+
+  const validFolderId =
+    folderId && folderId !== 'folder_kesiswaan_puncak_darussalam' ? folderId : undefined;
+  let targetFileId =
+    existingFileId && existingFileId !== 'backup_kesiswaan_puncak_darussalam' ? existingFileId : '';
+
+  if (!targetFileId) {
+    const queryStr = validFolderId
+      ? `name='${DRIVE_BACKUP_FILENAME}' and '${validFolderId}' in parents and trashed=false`
+      : `name='${DRIVE_BACKUP_FILENAME}' and trashed=false`;
+    const searchRes = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(queryStr)}&fields=files(id,webViewLink,modifiedTime)&orderBy=modifiedTime desc`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (searchRes.status === 401) {
+      setInMemoryToken(null);
+      return null;
+    }
+    if (searchRes.ok) {
+      const searchJson = await searchRes.json().catch(() => ({}));
+      if (searchJson.files && searchJson.files.length > 0) {
+        targetFileId = searchJson.files[0].id;
+      }
+    }
+  }
+
+  if (!targetFileId) return null;
+
+  const dlRes = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${targetFileId}?alt=media`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  if (dlRes.status === 401) {
+    setInMemoryToken(null);
+    return null;
+  }
+  if (!dlRes.ok) return null;
+
+  const parsed = await dlRes.json().catch(() => null);
+  const data = parsed?.data || parsed;
+  if (!data || typeof data !== 'object') return null;
+
+  return {
+    fileId: targetFileId,
+    fileUrl: `https://drive.google.com/file/d/${targetFileId}/view`,
+    data,
+  };
+};
+
+/**
+ * Fallback: pull Siswa / Kelas / Sesi_Presensi directly from Spreadsheet rows if JSON backup missing
+ */
+export const pullSpreadsheetDatabase = async (
+  accessToken: string,
+  spreadsheetId?: string
+): Promise<any | null> => {
+  if (!accessToken || !spreadsheetId || spreadsheetId === 'spreadsheet_kesiswaan_puncak_darussalam') {
+    return null;
+  }
+  try {
+    const r1 = encodeURIComponent('Siswa!A2:I5000');
+    const r2 = encodeURIComponent('Kelas!A2:F500');
+    const r3 = encodeURIComponent('Sesi_Presensi!A2:I100');
+    const res = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchGet?ranges=${r1}&ranges=${r2}&ranges=${r3}`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (res.status === 401) {
+      setInMemoryToken(null);
+      return null;
+    }
+    if (!res.ok) return null;
+
+    const json = await res.json().catch(() => null);
+    const valueRanges = json?.valueRanges || [];
+    const siswaRows: any[][] = valueRanges[0]?.values || [];
+    const kelasRows: any[][] = valueRanges[1]?.values || [];
+    const sesiRows: any[][] = valueRanges[2]?.values || [];
+
+    if (siswaRows.length === 0 && kelasRows.length === 0) return null;
+    const nowIso = new Date().toISOString();
+
+    const students = siswaRows
+      .filter((r) => r[0] && r[1])
+      .map((r) => ({
+        nis: String(r[0]).trim(),
+        name: String(r[1]).trim(),
+        class_id: String(r[2] || '').trim(),
+        gender: String(r[3] || '').toLowerCase().includes('perempuan') ? 'P' : 'L',
+        rfid_uid: r[4] && r[4] !== '-' ? String(r[4]).trim() : '',
+        card_code: r[5] && r[5] !== '-' ? String(r[5]).trim() : String(r[0]).trim(),
+        parent_name: r[6] && r[6] !== '-' ? String(r[6]).trim() : '',
+        parent_email: r[7] && r[7] !== '-' ? String(r[7]).trim() : '',
+        created_at: nowIso,
+        updated_at: nowIso,
+      }));
+
+    const classes = kelasRows
+      .filter((r) => r[0] && r[1])
+      .map((r) => ({
+        id: String(r[0]).trim(),
+        name: String(r[1]).trim(),
+        grade: String(r[2] || '10').trim(),
+        major: String(r[3] || 'Umum').trim(),
+        homeroom_teacher_name: r[4] && r[4] !== '-' ? String(r[4]).trim() : `Wali Kelas ${r[1]}`,
+        homeroom_teacher_email: r[5] && r[5] !== '-' ? String(r[5]).trim() : '',
+        quota_limit: 2,
+        created_at: nowIso,
+        updated_at: nowIso,
+      }));
+
+    const sessions = sesiRows
+      .filter((r) => r[0] && r[1])
+      .map((r) => ({
+        id: String(r[0]).trim(),
+        name: String(r[1]).trim(),
+        start_time: String(r[2] || '06:00').trim(),
+        on_time_limit: String(r[3] || '07:00').trim(),
+        end_time: String(r[4] || '08:00').trim(),
+        late_tolerance_minutes: Number(r[5]) || 0,
+        active_days: String(r[6] || '1,2,3,4,5')
+          .split(',')
+          .map((x) => parseInt(x.trim(), 10))
+          .filter((n) => !Number.isNaN(n)),
+        is_active: !String(r[7] || '').toLowerCase().includes('nonaktif'),
+        created_at: nowIso,
+        updated_at: nowIso,
+      }));
+
+    return {
+      students,
+      classes,
+      ...(sessions.length > 0 ? { sessions } : {}),
+    };
+  } catch {
+    return null;
+  }
+};
+
 /**
  * Create or update a real-time JSON database snapshot inside the dedicated Google Drive folder
  */
@@ -1234,7 +1394,8 @@ export const syncAllDataToGoogleSheets = async (
  */
 export const syncAllDataToDriveAndSheets = async (
   accessToken: string,
-  payload: SyncDataPayload
+  payload: SyncDataPayload,
+  options?: { allowEmptyOverwrite?: boolean }
 ): Promise<{
   folderId: string;
   folderUrl: string;
@@ -1243,6 +1404,8 @@ export const syncAllDataToDriveAndSheets = async (
   backupFileId: string;
   backupFileUrl: string;
   rowsUpdated: number;
+  restoredFromCloud?: boolean;
+  recoveredData?: any;
 }> => {
   let folderId = payload.settings.google_drive_folder_id || '';
   let folderUrl = payload.settings.google_drive_folder_url || '';
@@ -1261,6 +1424,41 @@ export const syncAllDataToDriveAndSheets = async (
     const sheet = await getOrCreateSpreadsheet(accessToken, folderId);
     spreadsheetId = sheet.spreadsheetId;
     spreadsheetUrl = sheet.spreadsheetUrl;
+  }
+
+  const resolvedFolderUrl = folderUrl || `https://drive.google.com/drive/folders/${folderId}`;
+  const resolvedSheetUrl = spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+
+  // Safety guard: never overwrite existing non-empty Drive backup or Spreadsheet if local DB is empty
+  if (!hasRealSyncData(payload) && !options?.allowEmptyOverwrite) {
+    const existingBackup = await pullDriveBackupFile(accessToken, backupFileId, folderId);
+    if (existingBackup && hasRealSyncData(existingBackup.data)) {
+      return {
+        folderId,
+        folderUrl: resolvedFolderUrl,
+        spreadsheetId,
+        spreadsheetUrl: resolvedSheetUrl,
+        backupFileId: existingBackup.fileId,
+        backupFileUrl: existingBackup.fileUrl,
+        rowsUpdated: 0,
+        restoredFromCloud: true,
+        recoveredData: existingBackup.data,
+      };
+    }
+    const existingSheet = await pullSpreadsheetDatabase(accessToken, spreadsheetId);
+    if (existingSheet && hasRealSyncData(existingSheet)) {
+      return {
+        folderId,
+        folderUrl: resolvedFolderUrl,
+        spreadsheetId,
+        spreadsheetUrl: resolvedSheetUrl,
+        backupFileId,
+        backupFileUrl,
+        rowsUpdated: 0,
+        restoredFromCloud: true,
+        recoveredData: existingSheet,
+      };
+    }
   }
 
   const runBoth = async (targetFolderId: string, targetFolderUrl: string, targetSheetId: string, targetSheetUrl: string, targetBackupId?: string) => {
@@ -1283,8 +1481,6 @@ export const syncAllDataToDriveAndSheets = async (
   };
 
   try {
-    const resolvedFolderUrl = folderUrl || `https://drive.google.com/drive/folders/${folderId}`;
-    const resolvedSheetUrl = spreadsheetUrl || `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
     const { sheetsResult, driveResult } = await runBoth(folderId, resolvedFolderUrl, spreadsheetId, resolvedSheetUrl, backupFileId);
     return {
       folderId,

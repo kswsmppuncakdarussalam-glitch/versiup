@@ -175,6 +175,9 @@ export const AdminView: React.FC = () => {
   const [ttsLateInput, setTtsLateInput] = useState(settings.tts_template_late || '');
   const ttsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const schoolNameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingDebouncedPatchRef = useRef<Partial<AppSettings>>({});
+  const updateSettingsRef = useRef(updateSettings);
+  updateSettingsRef.current = updateSettings;
 
   const handleOpenInlineEdit = () => {
     setInlineSheetIdInput(settings.google_sheet_url || settings.google_sheet_id || '');
@@ -315,6 +318,11 @@ export const AdminView: React.FC = () => {
       if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
       if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
       if (schoolNameTimerRef.current) clearTimeout(schoolNameTimerRef.current);
+      const pendingPatch = pendingDebouncedPatchRef.current;
+      if (Object.keys(pendingPatch).length > 0) {
+        pendingDebouncedPatchRef.current = {};
+        void updateSettingsRef.current(pendingPatch, { silent: true });
+      }
     };
   }, []);
 
@@ -800,7 +808,7 @@ export const AdminView: React.FC = () => {
           className={`mt-3 px-3 py-2 rounded-lg border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
             googleSyncing
               ? 'bg-sky-50 dark:bg-sky-950/30 border-sky-200 dark:border-sky-800 text-sky-800 dark:text-sky-200'
-              : googleOAuthActive || serverDriveSyncActive || isCloudConfiguredInDb
+              : googleOAuthActive || serverDriveSyncActive
               ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200'
               : 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800 text-amber-900 dark:text-amber-200'
           }`}
@@ -822,7 +830,7 @@ export const AdminView: React.FC = () => {
                 </>
               ) : isCloudConfiguredInDb ? (
                 <>
-                  <strong>Email &amp; Cloud Tersimpan Permanen ({settings.google_account_email}):</strong> ID Cloud Console, email &amp; tautan Drive/Sheet tetap tersimpan meski refresh atau buka-tutup aplikasi tanpa perlu menautkan ulang.
+                  <strong>DB &amp; Email Tersimpan Permanen ({settings.google_account_email}):</strong> ID Cloud Console, email &amp; tautan Drive/Sheet aman dan tidak hilang. Sesi OAuth Drive/Sheets perlu disegarkan 1x klik agar push ke Google Drive &amp; Sheets berjalan otomatis.
                 </>
               ) : (
                 <>
@@ -836,13 +844,9 @@ export const AdminView: React.FC = () => {
               type="button"
               disabled={googleSyncing}
               onClick={() => syncGoogleSheetsNow()}
-              className={`px-3 py-1 rounded text-white font-semibold whitespace-nowrap shrink-0 disabled:opacity-50 transition-colors ${
-                isCloudConfiguredInDb
-                  ? 'bg-emerald-600 hover:bg-emerald-700'
-                  : 'bg-amber-600 hover:bg-amber-700'
-              }`}
+              className="px-3 py-1 rounded text-white font-semibold whitespace-nowrap shrink-0 disabled:opacity-50 transition-colors bg-amber-600 hover:bg-amber-700"
             >
-              {isCloudConfiguredInDb ? 'Sinkronkan Drive & Sheets' : 'Hubungkan OAuth 2.0 (1x)'}
+              {isCloudConfiguredInDb ? 'Segarkan OAuth Drive (1 Klik)' : 'Hubungkan OAuth 2.0 (1x)'}
             </button>
           )}
         </div>
@@ -2228,8 +2232,14 @@ export const AdminView: React.FC = () => {
                     onChange={(e) => {
                       const val = e.target.value;
                       setSchoolNameInput(val);
+                      pendingDebouncedPatchRef.current = {
+                        ...pendingDebouncedPatchRef.current,
+                        school_name: val.trim(),
+                      };
                       if (schoolNameTimerRef.current) clearTimeout(schoolNameTimerRef.current);
                       schoolNameTimerRef.current = setTimeout(() => {
+                        const { school_name: _ignored, ...rest } = pendingDebouncedPatchRef.current;
+                        pendingDebouncedPatchRef.current = rest;
                         if (val.trim() !== (settings.school_name || '').trim()) {
                           updateSettings({ school_name: val.trim() }, { silent: true });
                         }
@@ -2237,6 +2247,8 @@ export const AdminView: React.FC = () => {
                     }}
                     onBlur={() => {
                       if (schoolNameTimerRef.current) clearTimeout(schoolNameTimerRef.current);
+                      const { school_name: _ignored, ...rest } = pendingDebouncedPatchRef.current;
+                      pendingDebouncedPatchRef.current = rest;
                       if (schoolNameInput.trim() !== (settings.school_name || '').trim()) {
                         updateSettings({ school_name: schoolNameInput.trim() }, { silent: true });
                       }
@@ -2925,13 +2937,21 @@ export const AdminView: React.FC = () => {
                 onChange={(e) => {
                   const val = e.target.value;
                   setTtsPresentInput(val);
+                  pendingDebouncedPatchRef.current = {
+                    ...pendingDebouncedPatchRef.current,
+                    tts_template_present: val,
+                  };
                   if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
                   ttsTimerRef.current = setTimeout(() => {
+                    const { tts_template_present: _ignored, ...rest } = pendingDebouncedPatchRef.current;
+                    pendingDebouncedPatchRef.current = rest;
                     updateSettings({ tts_template_present: val }, { silent: true });
                   }, 500);
                 }}
                 onBlur={() => {
                   if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
+                  const { tts_template_present: _ignored, ...rest } = pendingDebouncedPatchRef.current;
+                  pendingDebouncedPatchRef.current = rest;
                   if (ttsPresentInput !== settings.tts_template_present) {
                     updateSettings({ tts_template_present: ttsPresentInput }, { silent: true });
                   }
@@ -2953,13 +2973,21 @@ export const AdminView: React.FC = () => {
                 onChange={(e) => {
                   const val = e.target.value;
                   setTtsLateInput(val);
+                  pendingDebouncedPatchRef.current = {
+                    ...pendingDebouncedPatchRef.current,
+                    tts_template_late: val,
+                  };
                   if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
                   ttsTimerRef.current = setTimeout(() => {
+                    const { tts_template_late: _ignored, ...rest } = pendingDebouncedPatchRef.current;
+                    pendingDebouncedPatchRef.current = rest;
                     updateSettings({ tts_template_late: val }, { silent: true });
                   }, 500);
                 }}
                 onBlur={() => {
                   if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
+                  const { tts_template_late: _ignored, ...rest } = pendingDebouncedPatchRef.current;
+                  pendingDebouncedPatchRef.current = rest;
                   if (ttsLateInput !== settings.tts_template_late) {
                     updateSettings({ tts_template_late: ttsLateInput }, { silent: true });
                   }
@@ -3003,9 +3031,10 @@ export const AdminView: React.FC = () => {
                 type="checkbox"
                 id="email-toggle"
                 checked={settings.toggle_email_notifications && notificationSettings.email_enabled}
-                onChange={(e) => {
-                  updateSettings({ toggle_email_notifications: e.target.checked });
-                  updateNotificationSettings({ email_enabled: e.target.checked });
+                onChange={async (e) => {
+                  const nextEnabled = e.target.checked;
+                  await updateSettings({ toggle_email_notifications: nextEnabled });
+                  await updateNotificationSettings({ email_enabled: nextEnabled }, { silent: true });
                 }}
                 className="w-4 h-4 rounded text-slate-900"
               />
@@ -3264,11 +3293,11 @@ export const AdminView: React.FC = () => {
                 <div>
                   <h2 className="text-sm font-bold text-slate-900 dark:text-white flex flex-wrap items-center gap-2">
                     Basis Data Google Drive, Google Sheets &amp; OAuth 2.0
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${(googleOAuthActive || serverDriveSyncActive || isCloudConfiguredInDb) ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${(googleOAuthActive || serverDriveSyncActive) ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300' : isCloudConfiguredInDb ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300' : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'}`}>
                       {googleOAuthActive || serverDriveSyncActive
                         ? 'OAuth 2.0 & Auto-Sync Real-Time Aktif'
                         : isCloudConfiguredInDb
-                        ? 'Tersimpan Permanen (Refresh & Buka-Tutup Aman)'
+                        ? 'DB & Email Tersimpan • OAuth Drive Perlu Disegarkan (1x)'
                         : 'Siap Dihubungkan 1x via Google OAuth 2.0'}
                     </span>
                   </h2>
@@ -3284,13 +3313,17 @@ export const AdminView: React.FC = () => {
                 disabled={googleSyncing}
                 onClick={() => syncGoogleSheetsNow()}
                 className={`flex items-center gap-2 px-3.5 py-2 rounded-lg font-semibold disabled:opacity-50 transition-colors shrink-0 ${
-                  googleOAuthActive || serverDriveSyncActive || isCloudConfiguredInDb
+                  googleOAuthActive || serverDriveSyncActive
                     ? 'border border-emerald-200 dark:border-emerald-800 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:hover:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
+                    : isCloudConfiguredInDb
+                    ? 'bg-amber-600 hover:bg-amber-700 text-white shadow-xs'
                     : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs'
                 }`}
                 title={
-                  googleOAuthActive || serverDriveSyncActive || isCloudConfiguredInDb
-                    ? 'Tautan Google & email tersimpan permanen — klik untuk sinkron Drive & Sheets'
+                  googleOAuthActive || serverDriveSyncActive
+                    ? 'Tautan Google & email aktif permanen — klik untuk sinkron Drive & Sheets'
+                    : isCloudConfiguredInDb
+                    ? 'DB & Email tersimpan permanen — klik 1x untuk menyegarkan sesi OAuth Drive & Sheets'
                     : 'Masuk 1x dengan Google OAuth 2.0 untuk mengaktifkan auto-sync permanen'
                 }
               >
@@ -3301,7 +3334,7 @@ export const AdminView: React.FC = () => {
                     : googleOAuthActive || serverDriveSyncActive
                     ? 'OAuth 2.0 & Auto-Sync Aktif'
                     : isCloudConfiguredInDb
-                    ? 'Email & Cloud Tersambung'
+                    ? 'Segarkan OAuth Drive (1 Klik)'
                     : 'Hubungkan Google OAuth 2.0 (1x)'}
                 </span>
               </button>
@@ -3399,9 +3432,15 @@ export const AdminView: React.FC = () => {
                           const cleaned = normalizeGoogleClientId(pasted);
                           setCustomClientIdInput(cleaned);
                           registerGoogleClientIdToJs(cleaned);
+                          pendingDebouncedPatchRef.current = {
+                            ...pendingDebouncedPatchRef.current,
+                            google_client_id: cleaned,
+                          };
                           setClientIdAutoStatus('saving');
                           if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
                           clientIdTimerRef.current = setTimeout(async () => {
+                            const { google_client_id: _ignored, ...rest } = pendingDebouncedPatchRef.current;
+                            pendingDebouncedPatchRef.current = rest;
                             await updateSettings({ google_client_id: cleaned }, { silent: true });
                             setClientIdAutoStatus('saved');
                             showToast('ID Cloud Console otomatis terdaftar ke JavaScript & database!', 'success');
@@ -3413,15 +3452,23 @@ export const AdminView: React.FC = () => {
                         setCustomClientIdInput(cleaned);
                         // 0ms registration into browser JS runtime & GIS client
                         registerGoogleClientIdToJs(cleaned);
+                        pendingDebouncedPatchRef.current = {
+                          ...pendingDebouncedPatchRef.current,
+                          google_client_id: cleaned,
+                        };
                         setClientIdAutoStatus('saving');
                         if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
                         clientIdTimerRef.current = setTimeout(async () => {
+                          const { google_client_id: _ignored, ...rest } = pendingDebouncedPatchRef.current;
+                          pendingDebouncedPatchRef.current = rest;
                           await updateSettings({ google_client_id: cleaned }, { silent: true });
                           setClientIdAutoStatus('saved');
                         }, 350);
                       }}
                       onBlur={async () => {
                         if (clientIdTimerRef.current) clearTimeout(clientIdTimerRef.current);
+                        const { google_client_id: _ignored, ...rest } = pendingDebouncedPatchRef.current;
+                        pendingDebouncedPatchRef.current = rest;
                         const cleaned = normalizeGoogleClientId(customClientIdInput);
                         if (cleaned !== normalizeGoogleClientId(settings.google_client_id || '')) {
                           setClientIdAutoStatus('saving');
@@ -3534,15 +3581,17 @@ export const AdminView: React.FC = () => {
                         {googleAccount?.name || settings.google_account_name || 'Kesiswaan SMP Puncak Darussalam'}
                       </span>
                       <span className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2.5 py-0.5 rounded-full border ${
-                        googleOAuthActive || serverDriveSyncActive || isCloudConfiguredInDb || googleSheetsConnected
+                        googleOAuthActive || serverDriveSyncActive
                           ? 'text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800'
+                          : isCloudConfiguredInDb || googleSheetsConnected
+                          ? 'text-amber-800 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border-amber-300 dark:border-amber-700'
                           : 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-800'
                       }`}>
                         <Check className="w-3 h-3" />
                         {googleOAuthActive || serverDriveSyncActive
                           ? 'OAuth 2.0 & Server Aktif Permanen'
                           : isCloudConfiguredInDb || googleSheetsConnected
-                          ? 'Tersimpan Permanen (Aman Refresh & Buka-Tutup)'
+                          ? 'DB & Email Tersimpan • Segarkan OAuth Drive (1x)'
                           : 'Perlu Ditautkan 1x'}
                       </span>
                     </div>

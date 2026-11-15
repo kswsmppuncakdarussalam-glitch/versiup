@@ -26,6 +26,7 @@ import {
   signInWithGoogle,
   disconnectGoogleAccount,
   syncAllDataToDriveAndSheets,
+  hasRealSyncData,
   getAccessToken,
   hasValidGoogleToken,
   getTokenExpiresInSeconds,
@@ -355,8 +356,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setGoogleSheetsConnected(true);
     }
   }, [settings.google_account_email, settings.google_account_name, settings.google_account_photo, settings.google_last_synced_at]);
-  const [notificationLogs, setNotificationLogs] = useState<NotificationLog[]>([]);
-  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [notificationLogs, setNotificationLogs] = useState<NotificationLog[]>(() => getCachedData('dkb_cache_notification_logs', []));
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>(() => getCachedData('dkb_cache_audit_logs', []));
 
   // Toasts
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
@@ -380,6 +381,30 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const settingsRef = useRef<AppSettings>(settings);
   settingsRef.current = settings;
+  const latestLocalDataRef = useRef({
+    students,
+    classes,
+    sessions,
+    violationTypes,
+    attendance,
+    outOfClass,
+    violations,
+    leaveRequests,
+    settings,
+    notificationSettings,
+  });
+  latestLocalDataRef.current = {
+    students,
+    classes,
+    sessions,
+    violationTypes,
+    attendance,
+    outOfClass,
+    violations,
+    leaveRequests,
+    settings,
+    notificationSettings,
+  };
   const isSyncingRef = useRef(false);
   const pendingSyncRef = useRef(false);
   const pendingBroadcastRef = useRef(false);
@@ -769,6 +794,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }
           break;
 
+        case 'notification_log':
+          if (action === 'insert' && data) {
+            setNotificationLogs((prev) => {
+              if (prev.some((n) => n.id === entity_id)) return prev;
+              const next = [data, ...prev].slice(0, 100);
+              try { localStorage.setItem('dkb_cache_notification_logs', JSON.stringify(next)); } catch {}
+              return next;
+            });
+          }
+          break;
+
+        case 'audit_log':
+          if (action === 'insert' && data) {
+            setAuditLogs((prev) => {
+              if (prev.some((a) => a.id === entity_id)) return prev;
+              const next = [data, ...prev].slice(0, 100);
+              try { localStorage.setItem('dkb_cache_audit_logs', JSON.stringify(next)); } catch {}
+              return next;
+            });
+          }
+          break;
+
         case 'users':
           // If current user modified or invalidated
           if (session && session.userId === entity_id) {
@@ -789,7 +836,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           break;
       }
     }
-  }, [session, showToast]);
+  }, [session, showToast, serverDriveSyncActive]);
 
   // Two-Way Delta Sync with Timeout, Follow-up Queueing & Non-Stuttering Updates
   const syncNow = useCallback(async (isManual = false, shouldBroadcast = true) => {
@@ -879,7 +926,59 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const hasVersionChanged = data.version !== versionRef.current;
 
       if (data.fullSnapshot && data.data) {
-        // Full Snapshot initialization: Replace with fresh clean server data (purges old demo caches)
+        const localSnap = latestLocalDataRef.current;
+        const explicitClearAt = (() => {
+          try {
+            return parseInt(localStorage.getItem('dkb_explicit_clear_at') || '0', 10);
+          } catch {
+            return 0;
+          }
+        })();
+        const isRecentExplicitClear = explicitClearAt > 0 && Date.now() - explicitClearAt < 60000;
+        const serverHasData = hasRealSyncData(data.data);
+        const localHasData = hasRealSyncData(localSnap);
+
+        // Anti-data-loss guard: If server restarted empty while browser has real cached school data
+        // (and admin did not just run clearAllStudents), heal the server DB instead of wiping local data!
+        if (!serverHasData && localHasData && !isRecentExplicitClear) {
+          try {
+            const healRes = await fetch('/api/sync', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+              },
+              body: JSON.stringify({
+                merge: true,
+                classes: localSnap.classes,
+                students: localSnap.students,
+                sessions: localSnap.sessions,
+                violation_types: localSnap.violationTypes,
+                attendance: localSnap.attendance,
+                out_of_class: localSnap.outOfClass,
+                violations: localSnap.violations,
+                leave_requests: localSnap.leaveRequests,
+                settings: localSnap.settings,
+                notification_settings: localSnap.notificationSettings,
+              }),
+            });
+            if (healRes.ok) {
+              const healedJson = await healRes.json().catch(() => null);
+              if (healedJson?.version) {
+                setServerVersion(healedJson.version);
+                versionRef.current = healedJson.version;
+                try {
+                  localStorage.setItem('dkb_cache_version', String(healedJson.version));
+                } catch {}
+              }
+              showToast('Data sekolah dipulihkan dari cache lokal dan disinkronkan ulang ke database server.', 'info');
+            }
+          } catch {}
+          setSyncStatus((prev) => (prev !== 'synced' ? 'synced' : prev));
+          setInitialLoadError(null);
+          return;
+        }
+
         const nextSettings = data.data.settings || defaultSettings;
         setSettings(nextSettings);
         settingsRef.current = nextSettings;
@@ -902,6 +1001,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setLeaveRequests(data.data.leave_requests || []);
         if (data.data.notification_settings) {
           setNotificationSettings(data.data.notification_settings);
+        }
+        if (Array.isArray(data.data.notification_log)) {
+          setNotificationLogs(data.data.notification_log);
+          try {
+            localStorage.setItem('dkb_cache_notification_logs', JSON.stringify(data.data.notification_log));
+          } catch {}
+        }
+        if (Array.isArray(data.data.audit_log)) {
+          setAuditLogs(data.data.audit_log);
+          try {
+            localStorage.setItem('dkb_cache_audit_logs', JSON.stringify(data.data.audit_log));
+          } catch {}
         }
 
         try {
@@ -1021,11 +1132,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       showToast('Koneksi terputus. Mode offline aktif.', 'error');
     };
 
+    const handlePageHide = () => {
+      try {
+        const rawQ = localStorage.getItem('dkb_offline_queue');
+        if (rawQ && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+          const queue = JSON.parse(rawQ);
+          if (Array.isArray(queue) && queue.length > 0) {
+            const blob = new Blob([JSON.stringify({ mutations: queue })], { type: 'application/json' });
+            if (navigator.sendBeacon('/api/sync', blob)) {
+              localStorage.removeItem('dkb_offline_queue');
+            }
+          }
+        }
+      } catch {}
+    };
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('focus', handleFocus);
     window.addEventListener('storage', handleStorageChange);
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+    window.addEventListener('pagehide', handlePageHide);
 
     setupInterval();
 
@@ -1040,6 +1167,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       window.removeEventListener('storage', handleStorageChange);
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('pagehide', handlePageHide);
     };
   }, [syncNow, showToast]);
 
@@ -1600,11 +1728,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         clientId: resolvedClientId,
         expiresIn,
       });
+      await syncNow(false, false);
 
+      const curSnap = latestLocalDataRef.current;
       const nextNotifSettings: NotificationSettings = {
-        ...notificationSettings,
+        ...curSnap.notificationSettings,
         email_enabled: true,
-        weekly_recap_enabled: notificationSettings.weekly_recap_enabled ?? true,
+        weekly_recap_enabled: curSnap.notificationSettings.weekly_recap_enabled ?? true,
       };
       const nextSettingsSnapshot: AppSettings = {
         ...settingsRef.current,
@@ -1618,17 +1748,39 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       const sigBeforeSync = driveSheetSignature;
       const syncRes = await syncAllDataToDriveAndSheets(accessToken, {
-        students,
-        classes,
-        sessions,
-        attendance,
-        outOfClass,
-        violations,
-        leaveRequests,
-        violationTypes,
+        students: curSnap.students,
+        classes: curSnap.classes,
+        sessions: curSnap.sessions,
+        attendance: curSnap.attendance,
+        outOfClass: curSnap.outOfClass,
+        violations: curSnap.violations,
+        leaveRequests: curSnap.leaveRequests,
+        violationTypes: curSnap.violationTypes,
         settings: nextSettingsSnapshot,
         notificationSettings: nextNotifSettings,
       });
+
+      if (syncRes.restoredFromCloud && syncRes.recoveredData) {
+        await fetch('/api/sync', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+          },
+          body: JSON.stringify({
+            merge: true,
+            classes: syncRes.recoveredData.classes,
+            students: syncRes.recoveredData.students,
+            sessions: syncRes.recoveredData.sessions,
+            violation_types: syncRes.recoveredData.violation_types,
+            attendance: syncRes.recoveredData.attendance,
+            out_of_class: syncRes.recoveredData.out_of_class,
+            violations: syncRes.recoveredData.violations,
+            leave_requests: syncRes.recoveredData.leave_requests,
+          }),
+        }).catch(() => {});
+        await syncNow(false, true);
+      }
 
       const nowIso = new Date().toISOString();
       lastAutoSheetSigRef.current = sigBeforeSync;
@@ -1656,7 +1808,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       showToast(
-        `OAuth 2.0 (${accountInfo.email}) terhubung permanen! Email, DB, Drive & Sheets sinkron (${syncRes.rowsUpdated} baris).`,
+        syncRes.restoredFromCloud
+          ? `OAuth 2.0 (${accountInfo.email}) terhubung & data dipulihkan otomatis dari cadangan Google Drive/Sheets!`
+          : `OAuth 2.0 (${accountInfo.email}) terhubung permanen! Email, DB, Drive & Sheets sinkron (${syncRes.rowsUpdated} baris).`,
         'success'
       );
       return { success: true };
@@ -1809,9 +1963,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         clientId: targetClientId || latestSettings.google_client_id,
         expiresIn: tokenExpiresIn,
       });
+      await syncNow(false, false);
 
       showToast('Menyinkronkan seluruh data (ID Cloud, Sesi, Siswa, Kelas, Presensi) ke Drive & Sheets...', 'info');
       const sigBeforeSync = driveSheetSignature;
+      const curSnap = latestLocalDataRef.current;
       const nextSettingsForSync: AppSettings = {
         ...settingsRef.current,
         ...(targetClientId ? { google_client_id: targetClientId } : {}),
@@ -1826,22 +1982,44 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         toggle_email_notifications: true,
       };
       const nextNotifForSync: NotificationSettings = {
-        ...notificationSettings,
+        ...curSnap.notificationSettings,
         email_enabled: true,
       };
 
       const syncRes = await syncAllDataToDriveAndSheets(token, {
-        students,
-        classes,
-        sessions,
-        attendance,
-        outOfClass,
-        violations,
-        leaveRequests,
-        violationTypes,
+        students: curSnap.students,
+        classes: curSnap.classes,
+        sessions: curSnap.sessions,
+        attendance: curSnap.attendance,
+        outOfClass: curSnap.outOfClass,
+        violations: curSnap.violations,
+        leaveRequests: curSnap.leaveRequests,
+        violationTypes: curSnap.violationTypes,
         settings: nextSettingsForSync,
         notificationSettings: nextNotifForSync,
       });
+
+      if (syncRes.restoredFromCloud && syncRes.recoveredData) {
+        await fetch('/api/sync', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+          },
+          body: JSON.stringify({
+            merge: true,
+            classes: syncRes.recoveredData.classes,
+            students: syncRes.recoveredData.students,
+            sessions: syncRes.recoveredData.sessions,
+            violation_types: syncRes.recoveredData.violation_types,
+            attendance: syncRes.recoveredData.attendance,
+            out_of_class: syncRes.recoveredData.out_of_class,
+            violations: syncRes.recoveredData.violations,
+            leave_requests: syncRes.recoveredData.leave_requests,
+          }),
+        }).catch(() => {});
+        await syncNow(false, true);
+      }
 
       const nowIso = new Date().toISOString();
       lastAutoSheetSigRef.current = sigBeforeSync;
@@ -1872,7 +2050,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
       setGoogleOAuthActive(hasValidGoogleToken());
       showToast(
-        `OAuth 2.0 & Auto-Sync Google Drive + Sheets aktif (${syncRes.rowsUpdated} baris tersinkron).`,
+        syncRes.restoredFromCloud
+          ? 'Data berhasil dipulihkan otomatis dari cadangan Google Drive/Sheets ke aplikasi & database!'
+          : `OAuth 2.0 & Auto-Sync Google Drive + Sheets aktif (${syncRes.rowsUpdated} baris tersinkron).`,
         'success'
       );
       return { success: true, rowsUpdated: syncRes.rowsUpdated };
@@ -2030,8 +2210,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
+        if (res.status === 401 || res.status >= 500) {
+          return recordAttendanceOffline(params);
+        }
         soundEffects.playErrorBeep();
         return {
           success: false,
@@ -2187,8 +2370,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
+        if (res.status === 401 || res.status >= 500) {
+          return makeOfflineOutOfClass();
+        }
         soundEffects.playErrorBeep();
         return { success: false, error: data.error };
       }
@@ -2238,8 +2424,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         },
         body: JSON.stringify({ id, returnMethod, notes, auditReason }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
+        if (res.status === 401 || res.status >= 500) {
+          const synced = await pushTwoWayMutation('out_of_class', 'update', {
+            id,
+            status: 'returned',
+            returned_at: nowIso,
+            return_method: returnMethod,
+            return_notes: notes,
+            audit_reason: auditReason,
+          });
+          setOutOfClass((prev) => {
+            const next = prev.map((o) =>
+              o.id === id ? { ...o, status: 'returned' as const, returned_at: nowIso, return_method: returnMethod, return_notes: notes } : o
+            );
+            try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
+            return next;
+          });
+          setLocalDataNonce((n) => n + 1);
+          soundEffects.playSuccessBeep();
+          if (synced) syncNow(false, true);
+          return { success: true };
+        }
         soundEffects.playErrorBeep();
         return { success: false, error: data.error };
       }
@@ -2318,8 +2525,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         },
         body: JSON.stringify(params),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
+        if (res.status === 401 || res.status >= 500) {
+          return makeOfflineViolation();
+        }
         soundEffects.playErrorBeep();
         return { success: false, error: data.error };
       }
@@ -2481,7 +2691,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const clearAllStudents = async () => {
     setStudents([]);
-    try { localStorage.setItem('dkb_cache_students', JSON.stringify([])); } catch {}
+    try {
+      localStorage.setItem('dkb_cache_students', JSON.stringify([]));
+      localStorage.setItem('dkb_explicit_clear_at', String(Date.now()));
+    } catch {}
     setLocalDataNonce((n) => n + 1);
     try {
       const res = await fetch('/api/students', {
@@ -2990,10 +3203,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   // Automatic Real-Time Background Google Drive & Google Sheets Sync
-  // Triggers automatically (~450ms debounced) on EVERY local or cross-device data/setting change,
-  // and queues follow-up syncs if additional mutations arrive while a sync request is in flight.
+  // Works seamlessly using either browser in-memory OAuth token OR persisted server OAuth session,
+  // so refreshes / logout / reopen continue syncing every change automatically without manual clicks.
   useEffect(() => {
-    if (!hasSyncedOnce || !hasValidGoogleToken()) return;
+    const hasClientToken = hasValidGoogleToken();
+    if (!hasSyncedOnce || (!hasClientToken && !serverDriveSyncActive)) return;
     if (typeof navigator !== 'undefined' && !navigator.onLine) return;
 
     if (driveSheetSignature === lastAutoSheetSigRef.current) {
@@ -3006,7 +3220,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     const timer = setTimeout(async () => {
-      if (!hasValidGoogleToken()) return;
+      const clientTokenActive = hasValidGoogleToken();
+      if (!clientTokenActive && !serverDriveSyncActive) return;
       if (isAutoSheetSyncingRef.current) {
         pendingAutoSheetSyncRef.current = true;
         return;
@@ -3017,44 +3232,89 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       isAutoSheetSyncingRef.current = true;
       setGoogleSyncing(true);
       try {
-        const token = await getAccessToken();
-        if (!token) {
-          setGoogleOAuthActive(false);
-          return;
-        }
-
         const capturedSig = snap.driveSheetSignature;
-        const syncRes = await syncAllDataToDriveAndSheets(token, {
-          students: snap.students,
-          classes: snap.classes,
-          sessions: snap.sessions,
-          attendance: snap.attendance,
-          outOfClass: snap.outOfClass,
-          violations: snap.violations,
-          leaveRequests: snap.leaveRequests,
-          violationTypes: snap.violationTypes,
-          settings: snap.settings,
-          notificationSettings: snap.notificationSettings,
-        });
 
-        lastAutoSheetSigRef.current = capturedSig;
-        const metaUpdates: Partial<AppSettings> = {
-          google_last_synced_at: new Date().toISOString(),
-        };
-        if (syncRes.folderId && syncRes.folderId !== snap.settings.google_drive_folder_id) {
-          metaUpdates.google_drive_folder_id = syncRes.folderId;
-          metaUpdates.google_drive_folder_url = syncRes.folderUrl;
-        }
-        if (syncRes.spreadsheetId && syncRes.spreadsheetId !== snap.settings.google_sheet_id) {
-          metaUpdates.google_sheet_id = syncRes.spreadsheetId;
-          metaUpdates.google_sheet_url = syncRes.spreadsheetUrl;
-        }
-        if (syncRes.backupFileId && syncRes.backupFileId !== snap.settings.google_drive_backup_file_id) {
-          metaUpdates.google_drive_backup_file_id = syncRes.backupFileId;
-          metaUpdates.google_drive_backup_file_url = syncRes.backupFileUrl;
-        }
+        if (clientTokenActive) {
+          const token = await getAccessToken();
+          if (!token) {
+            setGoogleOAuthActive(false);
+            return;
+          }
 
-        await updateSettings(metaUpdates, { silent: true });
+          const syncRes = await syncAllDataToDriveAndSheets(token, {
+            students: snap.students,
+            classes: snap.classes,
+            sessions: snap.sessions,
+            attendance: snap.attendance,
+            outOfClass: snap.outOfClass,
+            violations: snap.violations,
+            leaveRequests: snap.leaveRequests,
+            violationTypes: snap.violationTypes,
+            settings: snap.settings,
+            notificationSettings: snap.notificationSettings,
+          });
+
+          if (syncRes.restoredFromCloud && syncRes.recoveredData) {
+            await fetch('/api/sync', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+              },
+              body: JSON.stringify({
+                merge: true,
+                classes: syncRes.recoveredData.classes,
+                students: syncRes.recoveredData.students,
+                sessions: syncRes.recoveredData.sessions,
+                violation_types: syncRes.recoveredData.violation_types,
+                attendance: syncRes.recoveredData.attendance,
+                out_of_class: syncRes.recoveredData.out_of_class,
+                violations: syncRes.recoveredData.violations,
+                leave_requests: syncRes.recoveredData.leave_requests,
+              }),
+            }).catch(() => {});
+            syncNow(false, true);
+          }
+
+          lastAutoSheetSigRef.current = capturedSig;
+          const metaUpdates: Partial<AppSettings> = {
+            google_last_synced_at: new Date().toISOString(),
+          };
+          if (syncRes.folderId && syncRes.folderId !== snap.settings.google_drive_folder_id) {
+            metaUpdates.google_drive_folder_id = syncRes.folderId;
+            metaUpdates.google_drive_folder_url = syncRes.folderUrl;
+          }
+          if (syncRes.spreadsheetId && syncRes.spreadsheetId !== snap.settings.google_sheet_id) {
+            metaUpdates.google_sheet_id = syncRes.spreadsheetId;
+            metaUpdates.google_sheet_url = syncRes.spreadsheetUrl;
+          }
+          if (syncRes.backupFileId && syncRes.backupFileId !== snap.settings.google_drive_backup_file_id) {
+            metaUpdates.google_drive_backup_file_id = syncRes.backupFileId;
+            metaUpdates.google_drive_backup_file_url = syncRes.backupFileUrl;
+          }
+
+          await updateSettings(metaUpdates, { silent: true });
+        } else if (serverDriveSyncActive) {
+          // Persisted server OAuth session seamlessly handles refreshes and re-logins without manual clicks
+          const pushRes = await fetch('/api/google-sync/push', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+          });
+          if (pushRes.ok) {
+            const pushData = await pushRes.json().catch(() => ({}));
+            if (pushData.success) {
+              lastAutoSheetSigRef.current = capturedSig;
+              if (pushData.restoredFromCloud) {
+                syncNow(false, true);
+              }
+            } else if (pushData.oauthTokenExpired || pushData.needsReauth) {
+              setServerDriveSyncActive(false);
+              try {
+                localStorage.setItem('dkb_cache_server_drive_active', 'false');
+              } catch {}
+            }
+          }
+        }
       } catch (err: any) {
         console.warn('[Auto Drive & Sheets Sync]:', err);
         if (err?.statusCode === 401) {
@@ -3066,7 +3326,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setGoogleSyncing(false);
         const latestSig = latestDrivePayloadRef.current.driveSheetSignature;
         if (
-          hasValidGoogleToken() &&
+          (hasValidGoogleToken() || serverDriveSyncActive) &&
           (pendingAutoSheetSyncRef.current || latestSig !== lastAutoSheetSigRef.current)
         ) {
           pendingAutoSheetSyncRef.current = false;
@@ -3079,9 +3339,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [
     hasSyncedOnce,
     googleOAuthActive,
+    serverDriveSyncActive,
     autoSheetSyncTick,
     driveSheetSignature,
     updateSettings,
+    session?.token,
+    syncNow,
+    showToast,
   ]);
 
   return (

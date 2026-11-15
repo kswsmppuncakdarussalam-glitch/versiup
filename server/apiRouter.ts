@@ -80,6 +80,94 @@ export class JsonResponse {
   }
 }
 
+async function restoreFromCloudIfEmpty(
+  overrideToken?: string,
+  forceMerge = false
+): Promise<{
+  restored: boolean;
+  source?: 'drive_json' | 'google_sheets';
+  counts?: { students: number; classes: number; attendance: number; violations: number };
+}> {
+  try {
+    const snap = await storage.getFullSnapshot();
+    const db = snap.db;
+    const isEmpty = !googleSheetsClient.hasRealData(db);
+    if (!isEmpty && !forceMerge) {
+      return { restored: false };
+    }
+
+    const folderId = db?.settings?.google_drive_folder_id;
+    const backupFileId = db?.settings?.google_drive_backup_file_id;
+    const sheetId = db?.settings?.google_sheet_id;
+
+    let restoredPayload: any = null;
+    let discoveredFileId: string | undefined;
+    let source: 'drive_json' | 'google_sheets' = 'drive_json';
+
+    const driveBackup = await googleSheetsClient.pullDriveBackupWithToken(
+      backupFileId,
+      folderId,
+      overrideToken
+    );
+    if (driveBackup && googleSheetsClient.hasRealData(driveBackup.data)) {
+      restoredPayload = driveBackup.data;
+      discoveredFileId = driveBackup.backupFileId;
+      source = 'drive_json';
+    } else if (sheetId) {
+      const sheetData = await googleSheetsClient.pullSpreadsheetDataWithToken(
+        sheetId,
+        overrideToken
+      );
+      if (sheetData && googleSheetsClient.hasRealData(sheetData)) {
+        restoredPayload = sheetData;
+        source = 'google_sheets';
+      }
+    }
+
+    if (!restoredPayload) {
+      return { restored: false };
+    }
+
+    const mergedSettings = {
+      ...(restoredPayload.settings || {}),
+      ...(discoveredFileId ? { google_drive_backup_file_id: discoveredFileId } : {}),
+      google_last_synced_at: new Date().toISOString(),
+    };
+
+    await storage.applyTwoWaySync({
+      merge: true,
+      classes: Array.isArray(restoredPayload.classes) ? restoredPayload.classes : undefined,
+      students: Array.isArray(restoredPayload.students) ? restoredPayload.students : undefined,
+      sessions: Array.isArray(restoredPayload.sessions) ? restoredPayload.sessions : undefined,
+      violation_types: Array.isArray(restoredPayload.violation_types)
+        ? restoredPayload.violation_types
+        : undefined,
+      attendance: Array.isArray(restoredPayload.attendance) ? restoredPayload.attendance : undefined,
+      out_of_class: Array.isArray(restoredPayload.out_of_class) ? restoredPayload.out_of_class : undefined,
+      violations: Array.isArray(restoredPayload.violations) ? restoredPayload.violations : undefined,
+      leave_requests: Array.isArray(restoredPayload.leave_requests)
+        ? restoredPayload.leave_requests
+        : undefined,
+      settings: mergedSettings,
+      notification_settings: restoredPayload.notification_settings || undefined,
+    });
+
+    return {
+      restored: true,
+      source,
+      counts: {
+        students: restoredPayload.students?.length || 0,
+        classes: restoredPayload.classes?.length || 0,
+        attendance: restoredPayload.attendance?.length || 0,
+        violations: restoredPayload.violations?.length || 0,
+      },
+    };
+  } catch (err) {
+    console.warn('[restoreFromCloudIfEmpty Warning]:', err);
+    return { restored: false };
+  }
+}
+
 /**
  * Main API Handler routing requests based on path
  */
@@ -512,17 +600,51 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           ...(name ? { google_account_name: name } : {}),
           ...(clientId ? { google_client_id: clientId } : {}),
         });
-        const notifSettings = await storage.getNotificationSettings();
-        if (!notifSettings.email_enabled) {
-          await storage.updateNotificationSettings({ email_enabled: true });
+
+        // Auto-recover school data from Google Drive backup / Sheets if server DB restarted empty
+        const restoreRes = await restoreFromCloudIfEmpty(token);
+        const latestSnap = await storage.getFullSnapshot();
+        if (googleSheetsClient.hasRealData(latestSnap.db)) {
+          googleSheetsClient.scheduleAutoSync(() => latestSnap.db);
         }
 
         return JsonResponse.ok({
           success: true,
           serverDriveSyncActive: googleSheetsClient.isConnected,
           oauthTokenExpired: false,
+          restoredFromCloud: restoreRes.restored,
+          restoredSource: restoreRes.source,
+          restoredCounts: restoreRes.counts,
         });
       }
+    }
+
+    // 3b2. GOOGLE DRIVE & SHEETS PULL / MERGE: /api/google-sync/pull
+    if (pathname === '/api/google-sync/pull' && method === 'POST') {
+      const overrideToken = token && token !== 'undefined' && token !== 'null' ? token : undefined;
+      if (overrideToken) {
+        googleSheetsClient.setOAuthSession(overrideToken, Number(req.body?.expiresIn) || 3500);
+      }
+      if (!googleSheetsClient.isConnected) {
+        return JsonResponse.ok({
+          success: false,
+          needsReauth: true,
+          restored: false,
+          serverDriveSyncActive: false,
+          oauthTokenExpired: googleSheetsClient.isOAuthExpired,
+        });
+      }
+      const restoreRes = await restoreFromCloudIfEmpty(overrideToken, Boolean(req.body?.forceMerge));
+      const snap = await storage.getFullSnapshot();
+      return JsonResponse.ok({
+        success: true,
+        restored: restoreRes.restored,
+        source: restoreRes.source,
+        counts: restoreRes.counts,
+        version: snap.version,
+        serverDriveSyncActive: googleSheetsClient.isConnected,
+        oauthTokenExpired: googleSheetsClient.isOAuthExpired,
+      });
     }
 
     // 3c. SERVER-SIDE GOOGLE DRIVE & SHEETS PUSH: /api/google-sync/push
@@ -535,8 +657,10 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           oauthTokenExpired: googleSheetsClient.isOAuthExpired,
         });
       }
+      // First restore from cloud if server restarted empty so we never overwrite real cloud data!
+      const restoreRes = await restoreFromCloudIfEmpty();
       const snap = await storage.getFullSnapshot();
-      await googleSheetsClient.syncFullDatabase(snap.db);
+      const pushOutcome = await googleSheetsClient.syncFullDatabase(snap.db);
       if (googleSheetsClient.isOAuthExpired || !googleSheetsClient.isConnected) {
         return JsonResponse.ok({
           success: false,
@@ -545,10 +669,20 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           oauthTokenExpired: true,
         });
       }
+      if (pushOutcome && pushOutcome.abortedEmptyOverwrite) {
+        return JsonResponse.ok({
+          success: false,
+          abortedEmptyOverwrite: true,
+          serverDriveSyncActive: googleSheetsClient.isConnected,
+          oauthTokenExpired: false,
+        });
+      }
       const nowIso = new Date().toISOString();
       await storage.updateSettings({ google_last_synced_at: nowIso });
       return JsonResponse.ok({
         success: true,
+        restoredFromCloud: restoreRes.restored,
+        restoredCounts: restoreRes.counts,
         serverDriveSyncActive: googleSheetsClient.isConnected,
         oauthTokenExpired: false,
         syncedAt: nowIso,

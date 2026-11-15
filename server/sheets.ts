@@ -223,6 +223,206 @@ export class GoogleSheetsClient {
     });
   }
 
+  public hasRealData(db: any): boolean {
+    if (!db) return false;
+    return (
+      (db.students?.length || 0) > 0 ||
+      (db.classes?.length || 0) > 0 ||
+      (db.attendance?.length || 0) > 0 ||
+      (db.violations?.length || 0) > 0 ||
+      (db.out_of_class?.length || 0) > 0 ||
+      (db.leave_requests?.length || 0) > 0
+    );
+  }
+
+  private getActiveOAuthToken(overrideToken?: string): string {
+    if (overrideToken && overrideToken.trim()) return overrideToken.trim();
+    return this.hasValidOAuthToken() ? this.oauthAccessToken : '';
+  }
+
+  private handleOAuth401() {
+    this.oauthAccessToken = '';
+    this.oauthExpiresAt = 0;
+    this.oauthTokenExpired = true;
+    this.removePersistedOAuthSession();
+  }
+
+  /**
+   * Pull JSON backup from Google Drive using OAuth token or Service Account
+   */
+  public async pullDriveBackupWithToken(
+    backupFileId?: string,
+    folderId?: string,
+    overrideToken?: string
+  ): Promise<{ backupFileId: string; data: any } | null> {
+    const token = this.getActiveOAuthToken(overrideToken);
+    const validFolderId =
+      folderId && folderId !== 'folder_kesiswaan_puncak_darussalam' ? folderId : '';
+    let targetFileId =
+      backupFileId && backupFileId !== 'backup_kesiswaan_puncak_darussalam'
+        ? backupFileId
+        : this.driveBackupFileId || '';
+
+    if (token) {
+      if (!targetFileId) {
+        const backupFilename = 'DISIPLIN_KITA_BISA_Database_Realtime.json';
+        const q = validFolderId
+          ? `name='${backupFilename}' and '${validFolderId}' in parents and trashed=false`
+          : `name='${backupFilename}' and trashed=false`;
+        const searchRes = await fetch(
+          `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,modifiedTime)&orderBy=modifiedTime desc`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (searchRes.status === 401) {
+          this.handleOAuth401();
+          return null;
+        }
+        if (searchRes.ok) {
+          const searchJson = await searchRes.json().catch(() => ({}));
+          targetFileId = searchJson.files?.[0]?.id || '';
+        }
+      }
+
+      if (!targetFileId) return null;
+
+      const dlRes = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${targetFileId}?alt=media`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (dlRes.status === 401) {
+        this.handleOAuth401();
+        return null;
+      }
+      if (!dlRes.ok) return null;
+
+      const parsed = await dlRes.json().catch(() => null);
+      const data = parsed?.data || parsed;
+      if (!data || typeof data !== 'object') return null;
+      this.driveBackupFileId = targetFileId;
+      return { backupFileId: targetFileId, data };
+    }
+
+    if (this.isConfigured && this.driveService) {
+      try {
+        if (!targetFileId) {
+          const backupFilename = 'DISIPLIN_KITA_BISA_Database_Realtime.json';
+          const q = validFolderId
+            ? `name='${backupFilename}' and '${validFolderId}' in parents and trashed=false`
+            : `name='${backupFilename}' and trashed=false`;
+          const listRes = await this.driveService.files.list({ q, fields: 'files(id)' });
+          targetFileId = listRes.data?.files?.[0]?.id || '';
+        }
+        if (!targetFileId) return null;
+        const fileRes = await this.driveService.files.get({ fileId: targetFileId, alt: 'media' });
+        const parsed = typeof fileRes.data === 'string' ? JSON.parse(fileRes.data) : fileRes.data;
+        const data = parsed?.data || parsed;
+        if (!data || typeof data !== 'object') return null;
+        this.driveBackupFileId = targetFileId;
+        return { backupFileId: targetFileId, data };
+      } catch (err) {
+        console.warn('[GoogleSheetsClient] pullDriveBackup service account warning:', err);
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Fallback reader: pull Siswa / Kelas / Sesi_Presensi directly from Spreadsheet rows if Drive JSON backup is missing
+   */
+  public async pullSpreadsheetDataWithToken(
+    spreadsheetId?: string,
+    overrideToken?: string
+  ): Promise<any | null> {
+    const sid =
+      spreadsheetId && spreadsheetId !== 'spreadsheet_kesiswaan_puncak_darussalam'
+        ? spreadsheetId
+        : this.spreadsheetId;
+    if (!sid) return null;
+    const token = this.getActiveOAuthToken(overrideToken);
+    if (!token) return null;
+
+    try {
+      const ranges = encodeURIComponent('Siswa!A2:I5000');
+      const r2 = encodeURIComponent('Kelas!A2:F500');
+      const r3 = encodeURIComponent('Sesi_Presensi!A2:I100');
+      const res = await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values:batchGet?ranges=${ranges}&ranges=${r2}&ranges=${r3}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (res.status === 401) {
+        this.handleOAuth401();
+        return null;
+      }
+      if (!res.ok) return null;
+
+      const json = await res.json().catch(() => null);
+      const valueRanges = json?.valueRanges || [];
+      const siswaRows: any[][] = valueRanges[0]?.values || [];
+      const kelasRows: any[][] = valueRanges[1]?.values || [];
+      const sesiRows: any[][] = valueRanges[2]?.values || [];
+
+      if (siswaRows.length === 0 && kelasRows.length === 0) return null;
+      const nowIso = new Date().toISOString();
+
+      const students = siswaRows
+        .filter((r) => r[0] && r[1])
+        .map((r) => ({
+          nis: String(r[0]).trim(),
+          name: String(r[1]).trim(),
+          class_id: String(r[2] || '').trim(),
+          gender: String(r[3] || '').toLowerCase().includes('perempuan') ? 'P' : 'L',
+          rfid_uid: r[4] && r[4] !== '-' ? String(r[4]).trim() : '',
+          card_code: r[5] && r[5] !== '-' ? String(r[5]).trim() : String(r[0]).trim(),
+          parent_name: r[6] && r[6] !== '-' ? String(r[6]).trim() : '',
+          parent_email: r[7] && r[7] !== '-' ? String(r[7]).trim() : '',
+          created_at: nowIso,
+          updated_at: nowIso,
+        }));
+
+      const classes = kelasRows
+        .filter((r) => r[0] && r[1])
+        .map((r) => ({
+          id: String(r[0]).trim(),
+          name: String(r[1]).trim(),
+          grade: String(r[2] || '10').trim(),
+          major: String(r[3] || 'Umum').trim(),
+          homeroom_teacher_name: r[4] && r[4] !== '-' ? String(r[4]).trim() : `Wali Kelas ${r[1]}`,
+          homeroom_teacher_email: r[5] && r[5] !== '-' ? String(r[5]).trim() : '',
+          quota_limit: 2,
+          created_at: nowIso,
+          updated_at: nowIso,
+        }));
+
+      const sessions = sesiRows
+        .filter((r) => r[0] && r[1])
+        .map((r) => ({
+          id: String(r[0]).trim(),
+          name: String(r[1]).trim(),
+          start_time: String(r[2] || '06:00').trim(),
+          on_time_limit: String(r[3] || '07:00').trim(),
+          end_time: String(r[4] || '08:00').trim(),
+          late_tolerance_minutes: Number(r[5]) || 0,
+          active_days: String(r[6] || '1,2,3,4,5')
+            .split(',')
+            .map((x) => parseInt(x.trim(), 10))
+            .filter((n) => !Number.isNaN(n)),
+          is_active: !String(r[7] || '').toLowerCase().includes('nonaktif'),
+          created_at: nowIso,
+          updated_at: nowIso,
+        }));
+
+      return {
+        students,
+        classes,
+        ...(sessions.length > 0 ? { sessions } : {}),
+      };
+    } catch (err) {
+      console.warn('[GoogleSheetsClient] pullSpreadsheetDataWithToken warning:', err);
+      return null;
+    }
+  }
+
   /**
    * Schedule non-blocking debounced sync of entire DB to Google Drive & Google Sheets
    */
@@ -243,7 +443,10 @@ export class GoogleSheetsClient {
   /**
    * Synchronize all tables to Google Sheets and JSON backup to Google Drive
    */
-  public async syncFullDatabase(db: any): Promise<void> {
+  public async syncFullDatabase(
+    db: any,
+    options?: { allowEmptyOverwrite?: boolean }
+  ): Promise<{ abortedEmptyOverwrite?: boolean; discoveredBackupFileId?: string } | void> {
     const useServiceAccount = Boolean(this.isConfigured && this.sheetsService && this.driveService);
     const useOAuthToken = !useServiceAccount && this.hasValidOAuthToken();
     if (!useServiceAccount && !useOAuthToken) return;
@@ -259,6 +462,26 @@ export class GoogleSheetsClient {
       (db?.settings?.google_drive_folder_id && db.settings.google_drive_folder_id !== 'folder_kesiswaan_puncak_darussalam'
         ? db.settings.google_drive_folder_id
         : '');
+
+    // Empty-overwrite guard: if server DB has no students/classes/attendance/violations,
+    // verify whether Drive backup or Google Sheets already holds real data before overwriting!
+    if (!this.hasRealData(db) && !options?.allowEmptyOverwrite) {
+      const existingBackup = await this.pullDriveBackupWithToken(
+        db?.settings?.google_drive_backup_file_id,
+        targetFolderId
+      );
+      if (existingBackup && this.hasRealData(existingBackup.data)) {
+        console.warn('[GoogleSheetsClient] Aborted empty DB overwrite because Google Drive backup contains real school data.');
+        return { abortedEmptyOverwrite: true, discoveredBackupFileId: existingBackup.backupFileId };
+      }
+      if (targetSheetId && useOAuthToken) {
+        const existingSheet = await this.pullSpreadsheetDataWithToken(targetSheetId);
+        if (existingSheet && this.hasRealData(existingSheet)) {
+          console.warn('[GoogleSheetsClient] Aborted empty DB overwrite because Google Sheets contains real school data.');
+          return { abortedEmptyOverwrite: true };
+        }
+      }
+    }
 
     await writeQueue.enqueue(async () => {
       const students = db.students || [];
