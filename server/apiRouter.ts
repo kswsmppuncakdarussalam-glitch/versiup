@@ -169,6 +169,31 @@ async function restoreFromCloudIfEmpty(
 }
 
 /**
+ * Automatic boot-time synchronization (t = 0) when server credentials / persisted session exist.
+ */
+export async function runBootCloudSync(): Promise<void> {
+  if (!googleSheetsClient.isConnected) return;
+  try {
+    await restoreFromCloudIfEmpty();
+    const snap = await storage.getFullSnapshot();
+    if (!googleSheetsClient.isConnected) return;
+    if (googleSheetsClient.hasRealData(snap.db)) {
+      const outcome = await googleSheetsClient.syncFullDatabase(snap.db);
+      const patch: Record<string, any> = {
+        google_last_synced_at: new Date().toISOString(),
+        google_oauth_connected: true,
+      };
+      if (outcome && outcome.discoveredBackupFileId) {
+        patch.google_drive_backup_file_id = outcome.discoveredBackupFileId;
+      }
+      await storage.updateSettings(patch);
+    }
+  } catch (err: any) {
+    console.warn('[BootCloudSync Warning]:', err?.message || err);
+  }
+}
+
+/**
  * Main API Handler routing requests based on path
  */
 export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
@@ -188,12 +213,21 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
   try {
     // 1. SETUP: /api/setup
     if (pathname === '/api/setup') {
+      if (googleSheetsClient.isPermanentAutoSync) {
+        const preSnap = await storage.getFullSnapshot();
+        if (!googleSheetsClient.hasRealData(preSnap.db)) {
+          await restoreFromCloudIfEmpty();
+        }
+      }
       const fullSnapshot = await storage.getFullSnapshot();
       return JsonResponse.ok({
         success: true,
         message: 'Sistem dan basis data berhasil diinisialisasi.',
         googleSheetsConnected: storage.isSheetsConnected(),
         serverDriveSyncActive: googleSheetsClient.isConnected,
+        permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
+        driveSyncMode: googleSheetsClient.getSyncMode(),
+        bridgeStatus: googleSheetsClient.getBridgeStatus(),
         oauthTokenExpired: googleSheetsClient.isOAuthExpired,
         version: fullSnapshot.version,
       });
@@ -540,6 +574,8 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
             ...syncResult,
             googleSheetsConnected: storage.isSheetsConnected(),
             serverDriveSyncActive: googleSheetsClient.isConnected,
+            permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
+            driveSyncMode: googleSheetsClient.getSyncMode(),
             oauthTokenExpired: googleSheetsClient.isOAuthExpired,
           },
           {
@@ -551,12 +587,20 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       }
 
       const sinceVer = parseInt(query.since || '0', 10);
+      if (sinceVer === 0 && googleSheetsClient.isPermanentAutoSync) {
+        const preSnap = await storage.getFullSnapshot();
+        if (!googleSheetsClient.hasRealData(preSnap.db)) {
+          await restoreFromCloudIfEmpty();
+        }
+      }
       const syncResult = await storage.getSyncData(sinceVer);
       return JsonResponse.ok(
         {
           ...syncResult,
           googleSheetsConnected: storage.isSheetsConnected(),
           serverDriveSyncActive: googleSheetsClient.isConnected,
+          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
+          driveSyncMode: googleSheetsClient.getSyncMode(),
           oauthTokenExpired: googleSheetsClient.isOAuthExpired,
         },
         {
@@ -573,6 +617,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       if (method === 'GET') {
         return JsonResponse.ok({
           serverDriveSyncActive: googleSheetsClient.isConnected,
+          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
+          driveSyncMode: googleSheetsClient.getSyncMode(),
+          bridgeStatus: googleSheetsClient.getBridgeStatus(),
           oauthTokenExpired: googleSheetsClient.isOAuthExpired,
         });
       }
@@ -585,6 +632,8 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           return JsonResponse.ok({
             success: true,
             serverDriveSyncActive: googleSheetsClient.isConnected,
+            permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
+            driveSyncMode: googleSheetsClient.getSyncMode(),
           });
         }
 
@@ -611,10 +660,99 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         return JsonResponse.ok({
           success: true,
           serverDriveSyncActive: googleSheetsClient.isConnected,
+          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
+          driveSyncMode: googleSheetsClient.getSyncMode(),
           oauthTokenExpired: false,
           restoredFromCloud: restoreRes.restored,
           restoredSource: restoreRes.source,
           restoredCounts: restoreRes.counts,
+        });
+      }
+    }
+
+    // 3b1. ZERO-CLICK PERMANENT DRIVE & SHEETS BRIDGE: /api/google-sync/bridge
+    if (pathname === '/api/google-sync/bridge') {
+      if (method === 'GET') {
+        return JsonResponse.ok({
+          success: true,
+          bridgeStatus: googleSheetsClient.getBridgeStatus(),
+          serverDriveSyncActive: googleSheetsClient.isConnected,
+          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
+          driveSyncMode: googleSheetsClient.getSyncMode(),
+        });
+      }
+
+      const validRes = await authService.validateActiveSession(token);
+      if (!validRes.valid) {
+        return JsonResponse.unauthorized('Silakan masuk sebagai Admin untuk mengubah konfigurasi Auto-Sync permanen.');
+      }
+
+      if (method === 'POST') {
+        const { mode, serviceAccountJson, clientEmail, privateKey, appsScriptUrl } = req.body || {};
+        if (mode === 'service_account') {
+          let emailToSave = (clientEmail || '').trim();
+          let keyToSave = (privateKey || '').trim();
+          if (serviceAccountJson && typeof serviceAccountJson === 'string') {
+            let parsed: any = null;
+            try {
+              parsed = JSON.parse(serviceAccountJson);
+            } catch {
+              return JsonResponse.badRequest('Format JSON Service Account tidak valid.');
+            }
+            emailToSave = (parsed?.client_email || emailToSave).trim();
+            keyToSave = (parsed?.private_key || keyToSave).trim();
+          }
+          try {
+            googleSheetsClient.setServiceAccountCredentials(emailToSave, keyToSave);
+          } catch (e: any) {
+            return JsonResponse.badRequest(e?.message || 'Kredensial Service Account tidak valid.');
+          }
+        } else if (mode === 'apps_script') {
+          try {
+            googleSheetsClient.setAppsScriptWebhookUrl(appsScriptUrl);
+          } catch (e: any) {
+            return JsonResponse.badRequest(e?.message || 'URL Google Apps Script tidak valid.');
+          }
+        } else {
+          return JsonResponse.badRequest('Mode bridge tidak dikenali (pilih service_account atau apps_script).');
+        }
+
+        // Immediately sync / test connection
+        const restoreRes = await restoreFromCloudIfEmpty();
+        const snap = await storage.getFullSnapshot();
+        let syncOutcome: any = null;
+        let syncError = '';
+        try {
+          syncOutcome = await googleSheetsClient.syncFullDatabase(snap.db);
+          await storage.updateSettings({
+            google_last_synced_at: new Date().toISOString(),
+            google_oauth_connected: true,
+          });
+        } catch (err: any) {
+          syncError = err?.message || 'Tersimpan di server, namun uji koneksi ke Google gagal. Periksa izin berbagi folder/sheet atau URL Web App.';
+        }
+
+        return JsonResponse.ok({
+          success: !syncError,
+          error: syncError || undefined,
+          restoredFromCloud: restoreRes.restored,
+          abortedEmptyOverwrite: Boolean(syncOutcome?.abortedEmptyOverwrite),
+          bridgeStatus: googleSheetsClient.getBridgeStatus(),
+          serverDriveSyncActive: googleSheetsClient.isConnected,
+          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
+          driveSyncMode: googleSheetsClient.getSyncMode(),
+        });
+      }
+
+      if (method === 'DELETE') {
+        const modeToClear = (req.body?.mode || query.mode) as 'service_account' | 'apps_script' | undefined;
+        googleSheetsClient.clearPermanentBridge(modeToClear);
+        return JsonResponse.ok({
+          success: true,
+          bridgeStatus: googleSheetsClient.getBridgeStatus(),
+          serverDriveSyncActive: googleSheetsClient.isConnected,
+          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
+          driveSyncMode: googleSheetsClient.getSyncMode(),
         });
       }
     }
@@ -678,7 +816,11 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         });
       }
       const nowIso = new Date().toISOString();
-      await storage.updateSettings({ google_last_synced_at: nowIso });
+      const settingsPatch: Record<string, any> = { google_last_synced_at: nowIso };
+      if (pushOutcome && pushOutcome.discoveredBackupFileId) {
+        settingsPatch.google_drive_backup_file_id = pushOutcome.discoveredBackupFileId;
+      }
+      await storage.updateSettings(settingsPatch);
       return JsonResponse.ok({
         success: true,
         restoredFromCloud: restoreRes.restored,

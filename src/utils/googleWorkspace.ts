@@ -167,6 +167,11 @@ export const getTokenExpiresInSeconds = (): number => {
   return Math.max(60, Math.floor((inMemoryTokenExpiresAt - Date.now()) / 1000));
 };
 
+export const getTokenRemainingMs = (): number => {
+  if (!inMemoryAccessToken || !inMemoryTokenExpiresAt) return 0;
+  return Math.max(0, inMemoryTokenExpiresAt - 60000 - Date.now());
+};
+
 export const setInMemoryToken = (token: string | null, expiresInSeconds?: number) => {
   inMemoryAccessToken = token;
   if (!token) {
@@ -237,6 +242,143 @@ export const isKnownCloudConsoleOrigin = (): boolean => {
   );
 };
 
+export interface SilentTokenRefreshResult {
+  success: boolean;
+  accessToken?: string;
+  accountInfo?: ConnectedGoogleAccount;
+  expiresIn?: number;
+  reason?: 'popup_blocked' | 'interaction_required' | 'login_required' | 'consent_required' | 'access_denied' | 'cancelled' | 'timeout' | 'missing_client_id' | 'gis_unavailable' | 'other';
+  error?: string;
+}
+
+/**
+ * Silently refreshes Google OAuth 2.0 token using prompt='none' without account chooser or consent UI.
+ * Calls requestAccessToken synchronously when GIS is already loaded so transient user gestures are preserved.
+ */
+export const requestSilentGoogleToken = async (
+  customClientId?: string,
+  loginHint?: string
+): Promise<SilentTokenRefreshResult> => {
+  if (typeof window === 'undefined') {
+    return { success: false, reason: 'gis_unavailable' };
+  }
+  const effectiveHint = loginHint || 'kswsmp.puncakdarussalam@gmail.com';
+  const clientId = (customClientId && normalizeGoogleClientId(customClientId)) || getGoogleClientId();
+  if (!clientId) {
+    return { success: false, reason: 'missing_client_id' };
+  }
+
+  // Must execute synchronously inside user click without awaiting to preserve transient user activation
+  const google = (window as any).google;
+  if (!google?.accounts?.oauth2) {
+    ensureGisLoaded().catch(() => {});
+    return { success: false, reason: 'gis_unavailable' };
+  }
+
+  registerGoogleClientIdToJs(clientId);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (res: SilentTokenRefreshResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      resolve(res);
+    };
+
+    const timeoutTimer = setTimeout(() => {
+      finish({ success: false, reason: 'timeout' });
+    }, 8000);
+
+    try {
+      const client = google.accounts.oauth2.initTokenClient({
+        client_id: clientId,
+        scope: SCOPES.join(' '),
+        include_granted_scopes: true,
+        prompt: 'none',
+        hint: effectiveHint,
+        callback: async (tokenResponse: any) => {
+          if (tokenResponse?.error) {
+            const errCode = String(tokenResponse.error || '');
+            const sub = String(tokenResponse.error_subtype || '');
+            if (errCode === 'popup_blocked_by_browser' || sub === 'popup_blocked') {
+              return finish({ success: false, reason: 'popup_blocked', error: errCode });
+            }
+            if (errCode === 'interaction_required' || errCode === 'consent_required' || errCode === 'login_required' || errCode === 'access_denied') {
+              return finish({ success: false, reason: errCode as any, error: errCode });
+            }
+            if (errCode === 'popup_closed_by_user' || errCode === 'cancelled' || sub === 'user_cancel') {
+              return finish({ success: false, reason: 'cancelled', error: errCode });
+            }
+            return finish({
+              success: false,
+              reason: 'other',
+              error: tokenResponse.error_description || errCode,
+            });
+          }
+
+          const token = tokenResponse?.access_token;
+          if (!token) {
+            return finish({ success: false, reason: 'other', error: 'Missing access_token' });
+          }
+
+          const expiresIn = Number(tokenResponse.expires_in) || 3500;
+          setInMemoryToken(token, expiresIn);
+
+          try {
+            const credential = GoogleAuthProvider.credential(null, token);
+            await signInWithCredential(firebaseAuth, credential);
+          } catch {}
+
+          try {
+            const userRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            const userData = await userRes.json();
+            const accountInfo: ConnectedGoogleAccount = {
+              email: userData.email || effectiveHint,
+              name: userData.name || userData.email || 'Kesiswaan SMP Puncak Darussalam',
+              photo: userData.picture || undefined,
+              uid: userData.sub || `g_${Date.now()}`,
+              connectedAt: new Date().toISOString(),
+            };
+            return finish({ success: true, accessToken: token, accountInfo, expiresIn });
+          } catch {
+            return finish({
+              success: true,
+              accessToken: token,
+              expiresIn,
+              accountInfo: {
+                email: effectiveHint,
+                name: 'Kesiswaan SMP Puncak Darussalam',
+                uid: `g_${Date.now()}`,
+                connectedAt: new Date().toISOString(),
+              },
+            });
+          }
+        },
+        error_callback: (err: any) => {
+          const t = String(err?.type || '');
+          if (t === 'popup_blocked') {
+            return finish({ success: false, reason: 'popup_blocked', error: t });
+          }
+          if (t === 'popup_closed' || t === 'user_cancel') {
+            return finish({ success: false, reason: 'cancelled', error: t });
+          }
+          return finish({ success: false, reason: 'other', error: err?.message || t });
+        },
+      });
+
+      client.requestAccessToken({
+        prompt: 'none',
+        hint: effectiveHint,
+      });
+    } catch (err: any) {
+      finish({ success: false, reason: 'other', error: err?.message });
+    }
+  });
+};
+
 /**
  * Request Google OAuth 2.0 token via Google Identity Services (GIS)
  * Strictly uses Google Cloud Console OAuth 2.0 Web Client without bypasses.
@@ -262,7 +404,9 @@ export const requestGoogleIdentityToken = async (
   // Ensure Client ID is registered in browser JS runtime
   registerGoogleClientIdToJs(clientId);
 
-  await ensureGisLoaded();
+  if (!(window as any).google?.accounts?.oauth2) {
+    await ensureGisLoaded();
+  }
 
   const google = (window as any).google;
   if (!google?.accounts?.oauth2) {

@@ -65,8 +65,32 @@ interface AppContextType {
   // Google Workspace & Email Integration
   googleAccount: ConnectedGoogleAccount | null;
   googleSyncing: boolean;
+  googleAutoRefreshing: boolean;
+  googleNeedsInteractiveReauth: boolean;
   googleOAuthActive: boolean;
   serverDriveSyncActive: boolean;
+  permanentDriveSync: boolean;
+  driveSyncMode: 'service_account' | 'apps_script' | 'oauth_session' | 'none';
+  driveBridgeStatus: {
+    permanentAutoSync: boolean;
+    mode: 'service_account' | 'apps_script' | 'oauth_session' | 'none';
+    serviceAccountConfigured: boolean;
+    serviceAccountEmail: string;
+    appsScriptConfigured: boolean;
+    appsScriptUrlMasked: string;
+    oauthActive: boolean;
+    oauthExpired: boolean;
+    oauthEmail: string;
+  } | null;
+  refreshDriveBridgeStatus: () => Promise<void>;
+  saveDriveBridgeConfig: (payload: {
+    mode: 'service_account' | 'apps_script';
+    serviceAccountJson?: string;
+    clientEmail?: string;
+    privateKey?: string;
+    appsScriptUrl?: string;
+  }) => Promise<{ success: boolean; error?: string }>;
+  removeDriveBridgeConfig: (mode?: 'service_account' | 'apps_script') => Promise<boolean>;
   connectGoogle: (promptSelect?: boolean, emailHint?: string, overrideClientId?: string) => Promise<{ success: boolean; error?: string }>;
   disconnectGoogle: () => Promise<void>;
   linkEmailDirectly: (email: string, name?: string) => Promise<{ success: boolean; error?: string }>;
@@ -260,6 +284,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   });
   const [googleSyncing, setGoogleSyncing] = useState<boolean>(false);
+  const [googleAutoRefreshing, setGoogleAutoRefreshing] = useState<boolean>(false);
+  const [googleNeedsInteractiveReauth, setGoogleNeedsInteractiveReauth] = useState<boolean>(false);
   const [googleOAuthActive, setGoogleOAuthActive] = useState<boolean>(() => hasValidGoogleToken());
   const [serverDriveSyncActive, setServerDriveSyncActive] = useState<boolean>(() => {
     try {
@@ -268,6 +294,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return false;
     }
   });
+  const [permanentDriveSync, setPermanentDriveSync] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('dkb_cache_permanent_drive_sync') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [driveSyncMode, setDriveSyncMode] = useState<'service_account' | 'apps_script' | 'oauth_session' | 'none'>('none');
+  const [driveBridgeStatus, setDriveBridgeStatus] = useState<AppContextType['driveBridgeStatus']>(null);
   const [isKioskFullscreen, setIsKioskFullscreen] = useState<boolean>(false);
   const [manualSessionOverrideId, setManualSessionOverrideId] = useState<string | null>(() => {
     try {
@@ -922,6 +957,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           localStorage.setItem('dkb_cache_server_drive_active', String(active));
         } catch {}
       }
+      if (data.permanentDriveSync !== undefined) {
+        const perm = Boolean(data.permanentDriveSync);
+        setPermanentDriveSync((prev) => (prev !== perm ? perm : prev));
+        if (perm) {
+          setGoogleNeedsInteractiveReauth(false);
+        }
+        try {
+          localStorage.setItem('dkb_cache_permanent_drive_sync', String(perm));
+        } catch {}
+      }
+      if (data.oauthTokenExpired && !data.permanentDriveSync) {
+        setServerDriveSyncActive(false);
+        setGoogleNeedsInteractiveReauth(true);
+        try {
+          localStorage.setItem('dkb_cache_server_drive_active', 'false');
+        } catch {}
+      } else if (data.serverDriveSyncActive && !data.oauthTokenExpired) {
+        setGoogleNeedsInteractiveReauth(false);
+      }
+      if (data.driveSyncMode) {
+        setDriveSyncMode(data.driveSyncMode);
+      }
 
       const hasVersionChanged = data.version !== versionRef.current;
 
@@ -1069,10 +1126,127 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [session, applyDeltaChanges, showToast, broadcastSync, serverDriveSyncActive]);
 
-  // Initial Sync on Mount (Instant and non-blocking)
+  // Initial Sync & Drive Bridge Check on Mount (Zero-click automatic)
+  const refreshDriveBridgeStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/google-sync/bridge');
+      if (!res.ok) return;
+      const data = await res.json().catch(() => null);
+      if (data?.bridgeStatus) {
+        setDriveBridgeStatus(data.bridgeStatus);
+        const perm = Boolean(data.permanentDriveSync ?? data.bridgeStatus.permanentAutoSync);
+        const srvActive = Boolean(data.serverDriveSyncActive);
+        const expired = Boolean(data.bridgeStatus.oauthExpired && !perm);
+        setPermanentDriveSync(perm);
+        setDriveSyncMode(data.driveSyncMode || data.bridgeStatus.mode || 'none');
+        setServerDriveSyncActive(srvActive);
+        setGoogleNeedsInteractiveReauth(expired);
+        try {
+          localStorage.setItem('dkb_cache_permanent_drive_sync', String(perm));
+          localStorage.setItem('dkb_cache_server_drive_active', String(srvActive));
+        } catch {}
+        if (perm) {
+          setGoogleNeedsInteractiveReauth(false);
+          setGoogleSheetsConnected(true);
+        }
+      }
+    } catch {}
+  }, []);
+
+  const saveDriveBridgeConfig = useCallback(
+    async (payload: {
+      mode: 'service_account' | 'apps_script';
+      serviceAccountJson?: string;
+      clientEmail?: string;
+      privateKey?: string;
+      appsScriptUrl?: string;
+    }): Promise<{ success: boolean; error?: string }> => {
+      try {
+        setGoogleSyncing(true);
+        const res = await fetch('/api/google-sync/bridge', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+          },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const errMsg = data?.error || 'Gagal menyimpan konfigurasi Auto-Sync Drive permanen.';
+          showToast(errMsg, 'error');
+          return { success: false, error: errMsg };
+        }
+        if (data.bridgeStatus) {
+          setDriveBridgeStatus(data.bridgeStatus);
+        }
+        const perm = Boolean(data.permanentDriveSync ?? data.serverDriveSyncActive);
+        setPermanentDriveSync(perm);
+        setServerDriveSyncActive(Boolean(data.serverDriveSyncActive ?? perm));
+        setDriveSyncMode(data.driveSyncMode || (perm ? payload.mode : 'none'));
+        setGoogleNeedsInteractiveReauth(false);
+        setGoogleSheetsConnected(true);
+        try {
+          localStorage.setItem('dkb_cache_server_drive_active', String(Boolean(data.serverDriveSyncActive ?? perm)));
+          localStorage.setItem('dkb_cache_permanent_drive_sync', String(perm));
+        } catch {}
+
+        await syncNow(false, true);
+
+        if (data.error) {
+          showToast(data.error, 'info');
+          return { success: false, error: data.error };
+        }
+        showToast(
+          'Auto-Sync Google Drive & Sheets Permanen (0-Klik) aktif! Setiap perubahan langsung tersinkron otomatis tanpa login ulang.',
+          'success'
+        );
+        return { success: true };
+      } catch (err: any) {
+        const msg = err?.message || 'Gagal menghubungkan bridge permanen.';
+        showToast(msg, 'error');
+        return { success: false, error: msg };
+      } finally {
+        setGoogleSyncing(false);
+      }
+    },
+    [session?.token, showToast, syncNow]
+  );
+
+  const removeDriveBridgeConfig = useCallback(
+    async (mode?: 'service_account' | 'apps_script'): Promise<boolean> => {
+      try {
+        const res = await fetch('/api/google-sync/bridge', {
+          method: 'DELETE',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+          },
+          body: JSON.stringify({ mode }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          if (data.bridgeStatus) setDriveBridgeStatus(data.bridgeStatus);
+          setPermanentDriveSync(Boolean(data.permanentDriveSync));
+          setServerDriveSyncActive(Boolean(data.serverDriveSyncActive));
+          setDriveSyncMode(data.driveSyncMode || 'none');
+          try {
+            localStorage.setItem('dkb_cache_permanent_drive_sync', String(Boolean(data.permanentDriveSync)));
+            localStorage.setItem('dkb_cache_server_drive_active', String(Boolean(data.serverDriveSyncActive)));
+          } catch {}
+          showToast('Konfigurasi Auto-Sync permanen dihapus dari server.', 'info');
+          return true;
+        }
+      } catch {}
+      return false;
+    },
+    [session?.token, showToast]
+  );
+
   useEffect(() => {
     syncNow();
-  }, [syncNow]);
+    refreshDriveBridgeStatus();
+  }, [syncNow, refreshDriveBridgeStatus]);
 
   // Adaptive Multi-Device Real-Time Polling, Storage Event & Cross-Tab Broadcast Synchronization
   useEffect(() => {
@@ -1665,8 +1839,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     async (
       accessToken: string,
       info?: { email?: string; name?: string; clientId?: string; expiresIn?: number }
-    ) => {
-      if (!accessToken) return;
+    ): Promise<{ serverDriveSyncActive: boolean; restoredFromCloud?: boolean }> => {
+      if (!accessToken) return { serverDriveSyncActive: false };
       try {
         const res = await fetch('/api/google-sync/session', {
           method: 'POST',
@@ -1684,16 +1858,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (res.ok) {
           const data = await res.json().catch(() => ({}));
           const active = Boolean(data.serverDriveSyncActive ?? true);
+          const perm = Boolean(data.permanentDriveSync);
           setServerDriveSyncActive(active);
+          if (data.permanentDriveSync !== undefined) {
+            setPermanentDriveSync(perm);
+          }
+          if (data.driveSyncMode) {
+            setDriveSyncMode(data.driveSyncMode);
+          }
+          setGoogleNeedsInteractiveReauth(false);
           try {
             localStorage.setItem('dkb_cache_server_drive_active', String(active));
+            if (data.permanentDriveSync !== undefined) {
+              localStorage.setItem('dkb_cache_permanent_drive_sync', String(perm));
+            }
           } catch {}
+          if (data.restoredFromCloud) {
+            await syncNow(false, true);
+          }
+          return { serverDriveSyncActive: active, restoredFromCloud: Boolean(data.restoredFromCloud) };
         }
       } catch (e) {
         console.warn('[Google Session Bridge Warning]:', e);
       }
+      return { serverDriveSyncActive: false };
     },
-    []
+    [syncNow]
   );
 
   // Google Workspace Integration Actions (Strict Google OAuth 2.0)
@@ -1719,6 +1909,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setGoogleAccount(accountInfo);
       setGoogleSheetsConnected(true);
       setGoogleOAuthActive(hasValidGoogleToken());
+      setGoogleNeedsInteractiveReauth(false);
       showToast(`OAuth 2.0 terverifikasi (${accountInfo.email}). Menghubungkan sinkron permanen...`, 'info');
 
       const resolvedClientId = targetClientId || latestSettings.google_client_id || '';
@@ -1836,6 +2027,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setGoogleSheetsConnected(false);
       setGoogleOAuthActive(false);
       setServerDriveSyncActive(false);
+      setGoogleAutoRefreshing(false);
+      setGoogleNeedsInteractiveReauth(false);
       try {
         localStorage.removeItem('dkb_cache_server_drive_active');
       } catch {}
@@ -1901,7 +2094,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const syncGoogleSheetsNow = async (emailHint?: string, overrideClientId?: string) => {
     try {
       setGoogleSyncing(true);
-      let token = await getAccessToken();
+      let token = hasValidGoogleToken() ? await getAccessToken() : null;
       const latestSettings = settingsRef.current;
       const targetHint = emailHint || latestSettings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com';
       const targetClientId =
@@ -1912,8 +2105,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         registerGoogleClientIdToJs(targetClientId);
       }
 
-      // If browser in-memory token was cleared after refresh/reopen, reuse persisted server OAuth session first (no popup)
-      if (!token && serverDriveSyncActive) {
+      // If browser in-memory token was cleared after refresh/reopen, reuse permanent bridge or active server OAuth session first (no popup)
+      if (!token && (permanentDriveSync || (serverDriveSyncActive && !googleNeedsInteractiveReauth))) {
         try {
           const pushRes = await fetch('/api/google-sync/push', {
             method: 'POST',
@@ -1924,17 +2117,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             if (pushData.success && !pushData.oauthTokenExpired) {
               lastAutoSheetSigRef.current = driveSheetSignature;
               setServerDriveSyncActive(true);
+              setGoogleNeedsInteractiveReauth(false);
               try {
                 localStorage.setItem('dkb_cache_server_drive_active', 'true');
               } catch {}
-              showToast('Sinkronisasi Google Drive & Sheets berhasil melalui koneksi OAuth tersimpan!', 'success');
+              showToast(
+                permanentDriveSync
+                  ? 'Sinkronisasi Google Drive & Sheets berhasil melalui Auto-Sync Server 0-Klik!'
+                  : 'Sinkronisasi Google Drive & Sheets berhasil melalui koneksi OAuth tersimpan!',
+                'success'
+              );
               return { success: true };
             }
             if (pushData.oauthTokenExpired) {
               setServerDriveSyncActive(false);
+              setGoogleNeedsInteractiveReauth(true);
               try {
                 localStorage.setItem('dkb_cache_server_drive_active', 'false');
               } catch {}
+              showToast('Sesi Drive di server kedaluwarsa — klik sekali lagi tombol Sinkron Drive untuk otorisasi ulang.', 'info');
+              return { success: false };
             }
           }
         } catch {}
@@ -1955,6 +2157,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setGoogleAccount(res.accountInfo);
         setGoogleSheetsConnected(true);
         setGoogleOAuthActive(hasValidGoogleToken());
+        setGoogleNeedsInteractiveReauth(false);
       }
 
       await registerGoogleSessionOnServer(token, {
@@ -3309,6 +3512,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               }
             } else if (pushData.oauthTokenExpired || pushData.needsReauth) {
               setServerDriveSyncActive(false);
+              setGoogleNeedsInteractiveReauth(true);
               try {
                 localStorage.setItem('dkb_cache_server_drive_active', 'false');
               } catch {}
@@ -3319,7 +3523,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         console.warn('[Auto Drive & Sheets Sync]:', err);
         if (err?.statusCode === 401) {
           setGoogleOAuthActive(false);
-          showToast('Sesi OAuth 2.0 Google berakhir. Klik tombol OAuth 2.0 di header untuk melanjutkan auto-sync.', 'info');
+          setGoogleNeedsInteractiveReauth(true);
         }
       } finally {
         isAutoSheetSyncingRef.current = false;
@@ -3382,8 +3586,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         googleSheetsConnected,
         googleAccount,
         googleSyncing,
+        googleAutoRefreshing,
+        googleNeedsInteractiveReauth,
         googleOAuthActive,
         serverDriveSyncActive,
+        permanentDriveSync,
+        driveSyncMode,
+        driveBridgeStatus,
+        refreshDriveBridgeStatus,
+        saveDriveBridgeConfig,
+        removeDriveBridgeConfig,
         connectGoogle,
         disconnectGoogle,
         linkEmailDirectly,

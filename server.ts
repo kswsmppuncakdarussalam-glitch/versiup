@@ -1,6 +1,7 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { handleVercelRequest } from './server/vercelHandler.ts';
+import { runBootCloudSync } from './server/apiRouter.ts';
 
 const app = express();
 const PORT = 3000;
@@ -41,6 +42,10 @@ async function init() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Disiplin Kita Bisa dev server running at http://0.0.0.0:${PORT}`);
+    // Non-blocking boot-time cloud restore & sync (t = 0)
+    runBootCloudSync().catch((err) => {
+      console.warn('[Boot Cloud Sync Skipped]:', err?.message || err);
+    });
   });
 }
 

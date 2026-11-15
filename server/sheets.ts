@@ -7,9 +7,24 @@ import { buildSessionRecapData } from './sessionHelper.ts';
 const IS_VERCEL_SHEETS = Boolean(process.env.VERCEL || process.env.NOW_REGION || process.env.AWS_LAMBDA_FUNCTION_NAME);
 const SHEETS_DATA_DIR = IS_VERCEL_SHEETS ? path.join('/tmp', 'dkb_data') : path.resolve(process.cwd(), '.data');
 const OAUTH_SESSION_FILE = path.join(SHEETS_DATA_DIR, 'oauth_session.json');
+const DRIVE_BRIDGE_FILE = path.join(SHEETS_DATA_DIR, 'drive_bridge.json');
+
+export type DriveSyncMode = 'service_account' | 'apps_script' | 'oauth_session' | 'none';
+
+export interface DriveBridgeStatus {
+  permanentAutoSync: boolean;
+  mode: DriveSyncMode;
+  serviceAccountConfigured: boolean;
+  serviceAccountEmail: string;
+  appsScriptConfigured: boolean;
+  appsScriptUrlMasked: string;
+  oauthActive: boolean;
+  oauthExpired: boolean;
+  oauthEmail: string;
+}
 
 /**
- * Google Sheets API Integration with Service Account credentials
+ * Google Sheets API Integration with Service Account credentials, Apps Script Webhook, or OAuth 2.0 Bridge
  */
 
 export class GoogleSheetsClient {
@@ -18,9 +33,55 @@ export class GoogleSheetsClient {
   private spreadsheetId: string = '';
   private driveFolderId: string = '';
   private isConfigured: boolean = false;
+  private serviceAccountEmail: string = '';
+  private appsScriptUrl: string = '';
+  private autoSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  private driveBackupFileId: string = '';
+  private oauthAccessToken: string = '';
+  private oauthExpiresAt: number = 0;
+  private oauthEmail: string = '';
+  private oauthTokenExpired: boolean = false;
 
   constructor() {
     this.init();
+  }
+
+  private loadPersistedBridge(): {
+    serviceAccountEmail?: string;
+    privateKey?: string;
+    appsScriptUrl?: string;
+  } {
+    try {
+      if (!fs.existsSync(DRIVE_BRIDGE_FILE)) return {};
+      const raw = fs.readFileSync(DRIVE_BRIDGE_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private savePersistedBridge(data: {
+    serviceAccountEmail?: string;
+    privateKey?: string;
+    appsScriptUrl?: string;
+  }): void {
+    try {
+      if (!fs.existsSync(SHEETS_DATA_DIR)) {
+        fs.mkdirSync(SHEETS_DATA_DIR, { recursive: true });
+      }
+      const existing = this.loadPersistedBridge();
+      const merged = {
+        ...existing,
+        ...data,
+        updatedAt: new Date().toISOString(),
+      };
+      const tmp = `${DRIVE_BRIDGE_FILE}.tmp.${Date.now()}`;
+      fs.writeFileSync(tmp, JSON.stringify(merged), 'utf-8');
+      fs.renameSync(tmp, DRIVE_BRIDGE_FILE);
+    } catch (err) {
+      console.warn('[GoogleSheetsClient] Failed to persist drive bridge config:', err);
+    }
   }
 
   private loadPersistedOAuthSession(): void {
@@ -78,9 +139,11 @@ export class GoogleSheetsClient {
 
   private init() {
     this.loadPersistedOAuthSession();
+    const persisted = this.loadPersistedBridge();
 
-    const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-    const rawKey = process.env.GOOGLE_PRIVATE_KEY;
+    const email = (process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || persisted.serviceAccountEmail || '').trim();
+    const rawKey = (process.env.GOOGLE_PRIVATE_KEY || persisted.privateKey || '').trim();
+    this.appsScriptUrl = (process.env.GOOGLE_APPS_SCRIPT_URL || persisted.appsScriptUrl || '').trim();
     this.spreadsheetId = process.env.SPREADSHEET_ID || '';
     this.driveFolderId = process.env.DRIVE_FOLDER_ID || '';
 
@@ -98,26 +161,34 @@ export class GoogleSheetsClient {
 
         this.sheetsService = google.sheets({ version: 'v4', auth });
         this.driveService = google.drive({ version: 'v3', auth });
+        this.serviceAccountEmail = email;
         this.isConfigured = true;
         console.log('[GoogleSheetsClient] Initialized successfully with Service Account:', email);
       } catch (err) {
         console.error('[GoogleSheetsClient] Failed to initialize Google Auth:', err);
+        this.sheetsService = null;
+        this.driveService = null;
+        this.serviceAccountEmail = '';
         this.isConfigured = false;
       }
     } else {
+      this.sheetsService = null;
+      this.driveService = null;
+      this.serviceAccountEmail = '';
       this.isConfigured = false;
     }
   }
 
-  private autoSyncTimer: ReturnType<typeof setTimeout> | null = null;
-  private driveBackupFileId: string = '';
-  private oauthAccessToken: string = '';
-  private oauthExpiresAt: number = 0;
-  private oauthEmail: string = '';
-  private oauthTokenExpired: boolean = false;
+  public hasAppsScript(): boolean {
+    return Boolean(this.appsScriptUrl && this.appsScriptUrl.startsWith('https://'));
+  }
+
+  get isPermanentAutoSync(): boolean {
+    return this.isConfigured || this.hasAppsScript();
+  }
 
   get isConnected(): boolean {
-    return this.isConfigured || this.hasValidOAuthToken();
+    return this.isConfigured || this.hasAppsScript() || this.hasValidOAuthToken();
   }
 
   get isOAuthExpired(): boolean {
@@ -126,6 +197,84 @@ export class GoogleSheetsClient {
 
   get sheetId(): string {
     return this.spreadsheetId;
+  }
+
+  public getSyncMode(): DriveSyncMode {
+    if (this.isConfigured) return 'service_account';
+    if (this.hasAppsScript()) return 'apps_script';
+    if (this.hasValidOAuthToken()) return 'oauth_session';
+    return 'none';
+  }
+
+  private maskUrl(url: string): string {
+    if (!url) return '';
+    if (url.length <= 42) return url;
+    return `${url.slice(0, 32)}...${url.slice(-10)}`;
+  }
+
+  public getBridgeStatus(): DriveBridgeStatus {
+    const oauthActive = this.hasValidOAuthToken();
+    return {
+      permanentAutoSync: this.isPermanentAutoSync,
+      mode: this.getSyncMode(),
+      serviceAccountConfigured: this.isConfigured,
+      serviceAccountEmail: this.serviceAccountEmail,
+      appsScriptConfigured: this.hasAppsScript(),
+      appsScriptUrlMasked: this.maskUrl(this.appsScriptUrl),
+      oauthActive,
+      oauthExpired: this.oauthTokenExpired,
+      oauthEmail: this.oauthEmail,
+    };
+  }
+
+  public setServiceAccountCredentials(email: string, privateKey: string): void {
+    const cleanEmail = (email || '').trim();
+    const cleanKey = (privateKey || '').trim();
+    if (!cleanEmail || !cleanKey) {
+      throw new Error('Email dan Private Key Service Account wajib diisi.');
+    }
+    if (!cleanKey.includes('BEGIN') || !cleanKey.includes('PRIVATE KEY')) {
+      throw new Error('Format Private Key Service Account tidak valid (harus berisi PEM PRIVATE KEY).');
+    }
+    this.savePersistedBridge({
+      serviceAccountEmail: cleanEmail,
+      privateKey: cleanKey,
+    });
+    this.init();
+    if (!this.isConfigured) {
+      throw new Error('Gagal memverifikasi format Service Account Key.');
+    }
+  }
+
+  public setAppsScriptWebhookUrl(url: string): void {
+    const cleanUrl = (url || '').trim();
+    if (!cleanUrl || !cleanUrl.startsWith('https://script.google.com/')) {
+      throw new Error('URL Google Apps Script harus diawali https://script.google.com/...');
+    }
+    this.savePersistedBridge({
+      appsScriptUrl: cleanUrl,
+    });
+    this.appsScriptUrl = cleanUrl;
+  }
+
+  public clearPermanentBridge(mode?: 'service_account' | 'apps_script'): void {
+    const existing = this.loadPersistedBridge();
+    if (!mode || mode === 'service_account') {
+      delete existing.serviceAccountEmail;
+      delete existing.privateKey;
+    }
+    if (!mode || mode === 'apps_script') {
+      delete existing.appsScriptUrl;
+    }
+    try {
+      if (!fs.existsSync(SHEETS_DATA_DIR)) {
+        fs.mkdirSync(SHEETS_DATA_DIR, { recursive: true });
+      }
+      const tmp = `${DRIVE_BRIDGE_FILE}.tmp.${Date.now()}`;
+      fs.writeFileSync(tmp, JSON.stringify(existing), 'utf-8');
+      fs.renameSync(tmp, DRIVE_BRIDGE_FILE);
+    } catch {}
+    this.init();
   }
 
   public hasValidOAuthToken(): boolean {
@@ -324,6 +473,31 @@ export class GoogleSheetsClient {
       }
     }
 
+    if (this.hasAppsScript()) {
+      try {
+        const scriptRes = await fetch(this.appsScriptUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'pull',
+            folderId: validFolderId,
+            backupFileId: targetFileId,
+          }),
+          redirect: 'follow',
+        });
+        if (scriptRes.ok) {
+          const parsed = await scriptRes.json().catch(() => null);
+          const data = parsed?.data?.data || parsed?.data || parsed;
+          if (data && typeof data === 'object' && this.hasRealData(data)) {
+            if (parsed?.backupFileId) this.driveBackupFileId = parsed.backupFileId;
+            return { backupFileId: parsed?.backupFileId || targetFileId || 'apps_script_backup', data };
+          }
+        }
+      } catch (err) {
+        console.warn('[GoogleSheetsClient] pullDriveBackup Apps Script warning:', err);
+      }
+    }
+
     return null;
   }
 
@@ -340,24 +514,34 @@ export class GoogleSheetsClient {
         : this.spreadsheetId;
     if (!sid) return null;
     const token = this.getActiveOAuthToken(overrideToken);
-    if (!token) return null;
+    if (!token && !(this.isConfigured && this.sheetsService)) return null;
 
     try {
-      const ranges = encodeURIComponent('Siswa!A2:I5000');
-      const r2 = encodeURIComponent('Kelas!A2:F500');
-      const r3 = encodeURIComponent('Sesi_Presensi!A2:I100');
-      const res = await fetch(
-        `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values:batchGet?ranges=${ranges}&ranges=${r2}&ranges=${r3}`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (res.status === 401) {
-        this.handleOAuth401();
-        return null;
-      }
-      if (!res.ok) return null;
+      let valueRanges: any[] = [];
+      if (token) {
+        const ranges = encodeURIComponent('Siswa!A2:I5000');
+        const r2 = encodeURIComponent('Kelas!A2:F500');
+        const r3 = encodeURIComponent('Sesi_Presensi!A2:I100');
+        const res = await fetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${sid}/values:batchGet?ranges=${ranges}&ranges=${r2}&ranges=${r3}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (res.status === 401) {
+          this.handleOAuth401();
+          return null;
+        }
+        if (!res.ok) return null;
 
-      const json = await res.json().catch(() => null);
-      const valueRanges = json?.valueRanges || [];
+        const json = await res.json().catch(() => null);
+        valueRanges = json?.valueRanges || [];
+      } else if (this.isConfigured && this.sheetsService) {
+        const res = await this.sheetsService.spreadsheets.values.batchGet({
+          spreadsheetId: sid,
+          ranges: ['Siswa!A2:I5000', 'Kelas!A2:F500', 'Sesi_Presensi!A2:I100'],
+        });
+        valueRanges = res.data?.valueRanges || [];
+      }
+
       const siswaRows: any[][] = valueRanges[0]?.values || [];
       const kelasRows: any[][] = valueRanges[1]?.values || [];
       const sesiRows: any[][] = valueRanges[2]?.values || [];
@@ -448,8 +632,9 @@ export class GoogleSheetsClient {
     options?: { allowEmptyOverwrite?: boolean }
   ): Promise<{ abortedEmptyOverwrite?: boolean; discoveredBackupFileId?: string } | void> {
     const useServiceAccount = Boolean(this.isConfigured && this.sheetsService && this.driveService);
-    const useOAuthToken = !useServiceAccount && this.hasValidOAuthToken();
-    if (!useServiceAccount && !useOAuthToken) return;
+    const useAppsScript = !useServiceAccount && this.hasAppsScript();
+    const useOAuthToken = !useServiceAccount && !useAppsScript && this.hasValidOAuthToken();
+    if (!useServiceAccount && !useAppsScript && !useOAuthToken) return;
 
     const targetSheetId =
       this.spreadsheetId ||
@@ -483,7 +668,7 @@ export class GoogleSheetsClient {
       }
     }
 
-    await writeQueue.enqueue(async () => {
+    return await writeQueue.enqueue(async () => {
       const students = db.students || [];
       const classes = db.classes || [];
       const sessions = db.sessions || [];
@@ -767,7 +952,51 @@ export class GoogleSheetsClient {
             this.removePersistedOAuthSession();
           }
         }
-        return;
+        const resolvedId =
+          backupFileId && backupFileId !== 'backup_kesiswaan_puncak_darussalam' ? backupFileId : undefined;
+        return { discoveredBackupFileId: resolvedId };
+      }
+
+      if (useAppsScript) {
+        const res = await fetch(this.appsScriptUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'sync',
+            spreadsheetId: targetSheetId,
+            folderId: targetFolderId,
+            backupFileId: this.driveBackupFileId || db?.settings?.google_drive_backup_file_id || '',
+            sheets: buildDataPayload(),
+            snapshot: {
+              app: 'DISIPLIN KITA BISA',
+              syncedAt: new Date().toISOString(),
+              data: {
+                settings: db.settings,
+                notification_settings: db.notification_settings,
+                classes: db.classes,
+                sessions: db.sessions,
+                students: db.students,
+                violation_types: db.violation_types,
+                attendance: db.attendance,
+                out_of_class: db.out_of_class,
+                violations: db.violations,
+                leave_requests: db.leave_requests,
+              },
+            },
+          }),
+          redirect: 'follow',
+        });
+        if (!res.ok) {
+          throw new Error(`Apps Script merespons HTTP ${res.status}`);
+        }
+        const json = await res.json().catch(() => ({}));
+        if (json?.error) {
+          throw new Error(json.error);
+        }
+        if (json?.backupFileId) {
+          this.driveBackupFileId = json.backupFileId;
+        }
+        return { discoveredBackupFileId: this.driveBackupFileId || undefined };
       }
 
       // 1. Service-account sync to Google Sheets if a valid Spreadsheet ID is available
@@ -827,37 +1056,58 @@ export class GoogleSheetsClient {
         );
 
         let fileId = this.driveBackupFileId || db?.settings?.google_drive_backup_file_id || '';
-        if (!fileId) {
-          const listRes = await this.driveService.files.list({
-            q: `name='${backupFilename}' and '${targetFolderId}' in parents and trashed=false`,
-            fields: 'files(id)',
-          });
-          fileId = listRes.data?.files?.[0]?.id || '';
+        const makeStream = () => {
+          const s = new Readable();
+          s.push(snapshotBody);
+          s.push(null);
+          return s;
+        };
+
+        let updatedExisting = false;
+        if (fileId && fileId !== 'backup_kesiswaan_puncak_darussalam') {
+          try {
+            await this.driveService.files.update({
+              fileId,
+              media: { mimeType: 'application/json', body: makeStream() },
+            });
+            this.driveBackupFileId = fileId;
+            updatedExisting = true;
+          } catch (updateErr: any) {
+            console.warn('[GoogleSheetsClient] Service Account files.update fallback:', updateErr?.message || updateErr);
+          }
         }
 
-        const stream = new Readable();
-        stream.push(snapshotBody);
-        stream.push(null);
-
-        if (fileId) {
-          await this.driveService.files.update({
-            fileId,
-            media: { mimeType: 'application/json', body: stream },
-          });
-          this.driveBackupFileId = fileId;
-        } else {
-          const created = await this.driveService.files.create({
-            requestBody: {
-              name: backupFilename,
-              parents: [targetFolderId],
-              mimeType: 'application/json',
-            },
-            media: { mimeType: 'application/json', body: stream },
-            fields: 'id',
-          });
-          this.driveBackupFileId = created.data?.id || '';
+        if (!updatedExisting) {
+          try {
+            const listRes = await this.driveService.files.list({
+              q: `name='${backupFilename}' and '${targetFolderId}' in parents and trashed=false`,
+              fields: 'files(id)',
+            });
+            const foundId = listRes.data?.files?.[0]?.id || '';
+            if (foundId) {
+              await this.driveService.files.update({
+                fileId: foundId,
+                media: { mimeType: 'application/json', body: makeStream() },
+              });
+              this.driveBackupFileId = foundId;
+            } else {
+              const created = await this.driveService.files.create({
+                requestBody: {
+                  name: backupFilename,
+                  parents: [targetFolderId],
+                  mimeType: 'application/json',
+                },
+                media: { mimeType: 'application/json', body: makeStream() },
+                fields: 'id',
+              });
+              this.driveBackupFileId = created.data?.id || '';
+            }
+          } catch (driveErr: any) {
+            console.warn('[GoogleSheetsClient] Service Account Drive folder sync warning:', driveErr?.message || driveErr);
+          }
         }
       }
+      return { discoveredBackupFileId: this.driveBackupFileId || undefined };
     });
   }
 
