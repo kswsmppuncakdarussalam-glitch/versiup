@@ -110,14 +110,25 @@ function setupAppsScript() {
   ensureSheetsAndHeaders_(ss);
   ensureSeedData_(ss);
   var folderId = getDriveFolderId_();
+  var resolvedFolderId = folderId || '';
   if (folderId) {
-    DriveApp.getFolderById(folderId).getName();
+    try {
+      DriveApp.getFolderById(folderId).getName();
+    } catch (eFolder) {
+      try {
+        resolvedFolderId = getOrCreateAppDriveFolder_().getId();
+      } catch (eFallback) {}
+    }
+  } else {
+    try {
+      resolvedFolderId = getOrCreateAppDriveFolder_().getId();
+    } catch (eFallback2) {}
   }
   return {
     ok: true,
     spreadsheetId: ss.getId(),
     spreadsheetName: ss.getName(),
-    driveFolderId: folderId,
+    driveFolderId: resolvedFolderId,
     senderEmail: getActiveSenderEmail_(),
   };
 }
@@ -1544,29 +1555,99 @@ function syncSessionRecapSheet_(ss, targetDate) {
 // GOOGLE DRIVE PHOTO UPLOAD & READ
 // ============================================================================
 
-function uploadPhotoToDrive_(base64Data, fileName) {
-  var cleanBase64 = String(base64Data || '').replace(/^data:image\/\w+;base64,/, '');
-  var bytes = Utilities.base64Decode(cleanBase64);
-  var blob = Utilities.newBlob(bytes, 'image/jpeg', fileName || ('foto_' + Date.now() + '.jpg'));
-  var folderId = getDriveFolderId_();
-  var file;
-  if (folderId) {
-    var folder = DriveApp.getFolderById(folderId);
-    file = folder.createFile(blob);
-  } else {
-    file = DriveApp.createFile(blob);
-  }
-  return file.getId();
+function extractDriveFileId_(raw) {
+  var s = String(raw === undefined || raw === null ? '' : raw).trim();
+  if (!s) return '';
+  var mFile = s.match(/\/file\/d\/([a-zA-Z0-9_-]{8,200})/i);
+  if (mFile && mFile[1]) return mFile[1];
+  var mD = s.match(/\/d\/([a-zA-Z0-9_-]{8,200})/i);
+  if (mD && mD[1]) return mD[1];
+  var mQuery = s.match(/[?&]id=([a-zA-Z0-9_-]{8,200})/i);
+  if (mQuery && mQuery[1]) return mQuery[1];
+  if (/^[a-zA-Z0-9_-]{8,200}$/.test(s)) return s;
+  return '';
 }
 
-function getPhotoFromDrive_(fileId) {
-  var file = DriveApp.getFileById(fileId);
-  var blob = file.getBlob();
-  return {
-    mimeType: blob.getContentType() || 'image/jpeg',
-    fileName: file.getName(),
-    base64: Utilities.base64Encode(blob.getBytes()),
-  };
+function getOrCreateAppDriveFolder_() {
+  var folderName = 'DISIPLIN KITA BISA - Foto';
+  var existing = DriveApp.getFoldersByName(folderName);
+  if (existing.hasNext()) {
+    return existing.next();
+  }
+  return DriveApp.createFolder(folderName);
+}
+
+function uploadPhotoToDrive_(base64Data, fileName) {
+  var rawStr = String(base64Data || '').trim();
+  if (!rawStr) throw new Error('Data base64 foto wajib diisi.');
+
+  var mimeType = 'image/jpeg';
+  var cleanBase64 = rawStr;
+  var dataMatch = rawStr.match(/^data:([^;]+);base64,(.+)$/i);
+  if (dataMatch) {
+    mimeType = String(dataMatch[1] || 'image/jpeg').trim() || 'image/jpeg';
+    cleanBase64 = dataMatch[2];
+  } else {
+    cleanBase64 = rawStr.replace(/^data:[^;]*;base64,/i, '');
+  }
+
+  var bytes = Utilities.base64Decode(cleanBase64);
+  if (!bytes || bytes.length === 0) {
+    throw new Error('Data foto kosong atau tidak valid.');
+  }
+
+  var safeName = String(fileName || ('foto_' + Date.now() + '.jpg')).trim();
+  var blob = Utilities.newBlob(bytes, mimeType, safeName);
+  var folderId = getDriveFolderId_();
+  var file = null;
+
+  if (folderId) {
+    try {
+      var targetFolder = DriveApp.getFolderById(folderId);
+      file = targetFolder.createFile(blob);
+    } catch (eFolder) {
+      file = null;
+    }
+  }
+
+  if (!file) {
+    try {
+      var appFolder = getOrCreateAppDriveFolder_();
+      file = appFolder.createFile(blob);
+    } catch (eAppFolder) {
+      file = DriveApp.createFile(blob);
+    }
+  }
+
+  var createdId = file && file.getId ? file.getId() : '';
+  if (!createdId) {
+    throw new Error('Gagal mendapatkan ID file setelah mengunggah ke Google Drive.');
+  }
+  return createdId;
+}
+
+function getPhotoFromDrive_(fileIdOrUrl) {
+  var resolvedId = extractDriveFileId_(fileIdOrUrl);
+  if (!resolvedId) {
+    return { notFound: true, error: 'Parameter id file Drive tidak valid.' };
+  }
+  try {
+    var file = DriveApp.getFileById(resolvedId);
+    if (file.isTrashed && file.isTrashed()) {
+      return { notFound: true, error: 'Foto sudah dihapus di Google Drive.' };
+    }
+    var blob = file.getBlob();
+    return {
+      mimeType: blob.getContentType() || 'image/jpeg',
+      fileName: file.getName(),
+      base64: Utilities.base64Encode(blob.getBytes()),
+    };
+  } catch (err) {
+    return {
+      notFound: true,
+      error: 'Foto tidak ditemukan atau tidak memiliki akses di Google Drive: ' + ((err && err.message) ? err.message : String(err)),
+    };
+  }
 }
 
 // ============================================================================
@@ -2211,11 +2292,14 @@ function dispatchRoute_(req) {
     // 2. /api/photos
     if (pathname === '/api/photos') {
       if (method === 'GET') {
-        var fileId = String(query.id || '').trim();
-        if (!fileId || !/^[a-zA-Z0-9_-]{10,200}$/.test(fileId)) {
+        var fileId = extractDriveFileId_(query.id || '');
+        if (!fileId) {
           return makeResp_(400, { error: 'Parameter id file Drive tidak valid.' });
         }
         var photo = getPhotoFromDrive_(fileId);
+        if (photo.notFound) {
+          return makeResp_(404, { error: photo.error || 'Foto tidak ditemukan di Google Drive.' });
+        }
         return makeResp_(200, {
           success: true,
           mimeType: photo.mimeType,
@@ -2747,8 +2831,9 @@ function dispatchRoute_(req) {
       }
 
       if (method === 'PUT') {
-        var sessPut = verifyJwt_(token);
-        if (!sessPut) return makeResp_(401, { error: 'Unauthorized' });
+        var vAttPut = validateTokenAgainstSheet_(token);
+        if (!vAttPut.valid) return makeResp_(401, { error: vAttPut.reason || 'Unauthorized', sessionInvalidated: Boolean(vAttPut.invalidated) });
+        var sessPut = vAttPut.session;
         var lockPut = LockService.getScriptLock();
         lockPut.waitLock(15000);
         try {
@@ -2782,8 +2867,9 @@ function dispatchRoute_(req) {
       }
 
       if (method === 'DELETE') {
-        var sessDel = verifyJwt_(token);
-        if (!sessDel) return makeResp_(401, { error: 'Unauthorized' });
+        var vAttDel = validateTokenAgainstSheet_(token);
+        if (!vAttDel.valid) return makeResp_(401, { error: vAttDel.reason || 'Unauthorized', sessionInvalidated: Boolean(vAttDel.invalidated) });
+        var sessDel = vAttDel.session;
         var okDel = softDeleteRow_(ssAtt, {
           tabName: SHEET_TABS.PRESENSI,
           id: body.id,
@@ -2986,8 +3072,9 @@ function dispatchRoute_(req) {
         }
       }
       if (method === 'DELETE') {
-        var sessVDel = verifyJwt_(token);
-        if (!sessVDel) return makeResp_(401, { error: 'Unauthorized' });
+        var vVDel = validateTokenAgainstSheet_(token);
+        if (!vVDel.valid) return makeResp_(401, { error: vVDel.reason || 'Unauthorized', sessionInvalidated: Boolean(vVDel.invalidated) });
+        var sessVDel = vVDel.session;
         var okVDel = softDeleteRow_(ssVio, {
           tabName: SHEET_TABS.PELANGGARAN,
           id: body.id,
@@ -3002,8 +3089,9 @@ function dispatchRoute_(req) {
     if (pathname === '/api/violation-types') {
       var ssVt = getSpreadsheet_();
       if (method === 'GET') return makeResp_(200, { types: getFullDatabase_().violation_types });
-      var sessVt = verifyJwt_(token);
-      if (!sessVt) return makeResp_(401, { error: 'Unauthorized' });
+      var vVt = validateTokenAgainstSheet_(token);
+      if (!vVt.valid) return makeResp_(401, { error: vVt.reason || 'Unauthorized', sessionInvalidated: Boolean(vVt.invalidated) });
+      var sessVt = vVt.session;
 
       if (method === 'POST') {
         if (!body.name || !body.code || !body.category) return makeResp_(400, { error: 'Nama, kode, dan kategori wajib diisi.' });
@@ -3053,8 +3141,9 @@ function dispatchRoute_(req) {
     if (pathname === '/api/students') {
       var ssStu = getSpreadsheet_();
       if (method === 'GET') return makeResp_(200, { students: getFullDatabase_().students });
-      var sessStu = verifyJwt_(token);
-      if (!sessStu) return makeResp_(401, { error: 'Unauthorized' });
+      var vStu = validateTokenAgainstSheet_(token);
+      if (!vStu.valid) return makeResp_(401, { error: vStu.reason || 'Unauthorized', sessionInvalidated: Boolean(vStu.invalidated) });
+      var sessStu = vStu.session;
       var actorStu = sessStu.name || 'Admin';
 
       if (method === 'POST') {
@@ -3064,49 +3153,137 @@ function dispatchRoute_(req) {
           if (query.action === 'batch_import') {
             var listIn = body.students;
             if (!Array.isArray(listIn) || listIn.length === 0) return makeResp_(400, { error: 'Daftar siswa kosong.' });
+
+            var nowBatch = new Date().toISOString();
+
+            // 1. Auto-create missing classes in ONE batch append
+            var existingClsRows = readTabWithRowNumbers_(ssStu, SHEET_TABS.KELAS);
+            var activeClsMap = {};
+            existingClsRows.forEach(function (cr) {
+              if (cr.data.status !== 'dihapus' && cr.data.id) {
+                activeClsMap[String(cr.data.id).trim().toLowerCase()] = String(cr.data.id).trim();
+              }
+            });
+            var newClassesMap = {};
+            var newClassesArr = [];
+            listIn.forEach(function (s) {
+              var cid = String((s && s.class_id) || '').trim();
+              if (!cid) return;
+              var normCid = cid.toLowerCase();
+              if (!activeClsMap[normCid] && !newClassesMap[normCid]) {
+                var grade = '10';
+                var gMatch = cid.match(/^(10|11|12)/i) || cid.match(/^(X|XI|XII)\b/i);
+                if (gMatch) {
+                  var gUp = String(gMatch[1]).toUpperCase();
+                  grade = gUp === 'X' ? '10' : gUp === 'XI' ? '11' : gUp === 'XII' ? '12' : gUp;
+                }
+                var majorParts = cid.split('-');
+                var major = majorParts.length > 1 ? String(majorParts[1]).trim() : 'Umum';
+                var clsRec = {
+                  id: cid,
+                  name: cid,
+                  grade: grade,
+                  major: major || 'Umum',
+                  homeroom_teacher_name: 'Wali Kelas ' + cid,
+                  homeroom_teacher_email: cid.toLowerCase().replace(/[^a-z0-9]/g, '.') + '@sekolah.sch.id',
+                  quota_limit: 2,
+                  created_at: nowBatch,
+                  updated_at: nowBatch,
+                  status: 'aktif',
+                  diubah_pada: nowBatch,
+                };
+                newClassesMap[normCid] = true;
+                activeClsMap[normCid] = cid;
+                newClassesArr.push(clsRec);
+              }
+            });
+            if (newClassesArr.length > 0) {
+              appendRows_(ssStu, SHEET_TABS.KELAS, newClassesArr);
+            }
+
+            // 2. Read Siswa tab ONCE and batch updates/appends without per-row re-reads
             var existingStu = readTabWithRowNumbers_(ssStu, SHEET_TABS.SISWA);
             var existingMap = {};
             existingStu.forEach(function (r) { existingMap[r.data.id] = r; });
 
-            var nowBatch = new Date().toISOString();
+            var stuHeaders = SHEET_HEADERS[SHEET_TABS.SISWA];
+            var stuSheet = ssStu.getSheetByName(SHEET_TABS.SISWA);
             var toAppendStu = [];
             var updatedStu = 0;
 
             listIn.forEach(function (s) {
-              if (!s.nis || !s.name || !s.class_id) return;
+              if (!s || !s.nis || !s.name || !s.class_id) return;
               var nis = String(s.nis).trim();
+              var rawClassId = String(s.class_id).trim();
+              var resolvedClassId = activeClsMap[rawClassId.toLowerCase()] || rawClassId;
+              var existingEntry = existingMap[nis];
+              var hasActiveExisting = Boolean(existingEntry && existingEntry.data.status !== 'dihapus');
+              var preservedPhoto = String(s.photo_url || '').trim() || (hasActiveExisting ? String(existingEntry.data.photo_url || '').trim() : '');
+
               var rec = {
-                id: nis, nis: nis, nisn: String(s.nisn || '').trim(),
-                name: String(s.name).trim(), class_id: String(s.class_id).trim(),
+                id: nis,
+                nis: nis,
+                nisn: String(s.nisn || '').trim(),
+                name: String(s.name).trim(),
+                class_id: resolvedClassId,
                 gender: s.gender === 'P' ? 'P' : 'L',
                 rfid_uid: String(s.rfid_uid || ('RFID-' + nis)).trim(),
-                card_code: String(s.card_code || s.rfid_uid || ('RFID-' + nis)).trim(),
-                photo_url: String(s.photo_url || '').trim(),
+                card_code: String(s.card_code || s.rfid_uid || nis).trim(),
+                photo_url: preservedPhoto,
                 parent_name: String(s.parent_name || '').trim(),
                 parent_email: String(s.parent_email || '').trim(),
-                created_at: s.created_at || nowBatch,
-                updated_at: nowBatch, status: 'aktif', diubah_pada: nowBatch,
+                created_at: (hasActiveExisting && existingEntry.data.created_at) ? existingEntry.data.created_at : (s.created_at || nowBatch),
+                updated_at: nowBatch,
+                status: 'aktif',
+                diubah_pada: nowBatch,
               };
-              if (existingMap[nis] && existingMap[nis].data.status !== 'dihapus') {
-                updateRowPartial_(ssStu, {
-                  tabName: SHEET_TABS.SISWA, id: nis, newRowObj: rec,
-                  forceOverwrite: true, actorName: actorStu, reason: 'Impor Excel batch',
-                });
-                updatedStu++;
+
+              if (hasActiveExisting) {
+                var oldData = existingEntry.data;
+                var changedFields = false;
+                for (var hi = 0; hi < stuHeaders.length; hi++) {
+                  var colName = stuHeaders[hi];
+                  if (colName === 'updated_at' || colName === 'diubah_pada') continue;
+                  var oldVal = oldData[colName] !== undefined ? String(oldData[colName]) : '';
+                  var newVal = rec[colName] !== undefined && rec[colName] !== null ? String(rec[colName]) : '';
+                  if (oldVal !== newVal) {
+                    changedFields = true;
+                    break;
+                  }
+                }
+                if (changedFields && stuSheet) {
+                  stuSheet.getRange(existingEntry.rowNumber, 1, 1, stuHeaders.length).setValues([objToRowArray_(SHEET_TABS.SISWA, rec)]);
+                  existingEntry.data = rec;
+                  updatedStu++;
+                }
               } else {
                 toAppendStu.push(rec);
+                existingMap[nis] = { rowNumber: -1, data: rec };
               }
             });
 
             if (toAppendStu.length > 0) {
               appendRows_(ssStu, SHEET_TABS.SISWA, toAppendStu);
+            }
+            if (toAppendStu.length > 0 || updatedStu > 0 || newClassesArr.length > 0) {
               appendLog_(ssStu, {
-                waktu: nowBatch, pengguna: actorStu, id_data: 'batch_' + toAppendStu.length,
-                tabel: SHEET_TABS.SISWA, aksi: 'tambah',
-                nilai_baru: JSON.stringify({ count: toAppendStu.length }), reason: 'Impor Excel batch'
+                waktu: nowBatch,
+                pengguna: actorStu,
+                id_data: 'batch_' + (toAppendStu.length + updatedStu),
+                tabel: SHEET_TABS.SISWA,
+                aksi: 'tambah',
+                nilai_baru: JSON.stringify({ inserted: toAppendStu.length, updated: updatedStu, classesCreated: newClassesArr.length }),
+                reason: 'Impor Excel/CSV batch',
               });
             }
-            return makeResp_(200, { success: true, inserted: toAppendStu.length, updated: updatedStu, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+            return makeResp_(200, {
+              success: true,
+              inserted: toAppendStu.length,
+              updated: updatedStu,
+              classesCreated: newClassesArr.length,
+              serverTime: new Date().toISOString(),
+              snapshot: buildDatabasePayload_(),
+            });
           }
 
           if (!body.nis || !body.name || !body.class_id) return makeResp_(400, { error: 'NIS, Nama, dan Kelas wajib diisi.' });
@@ -3177,8 +3354,9 @@ function dispatchRoute_(req) {
     if (pathname === '/api/classes') {
       var ssCls = getSpreadsheet_();
       if (method === 'GET') return makeResp_(200, { classes: getFullDatabase_().classes });
-      var sessCls = verifyJwt_(token);
-      if (!sessCls) return makeResp_(401, { error: 'Unauthorized' });
+      var vCls = validateTokenAgainstSheet_(token);
+      if (!vCls.valid) return makeResp_(401, { error: vCls.reason || 'Unauthorized', sessionInvalidated: Boolean(vCls.invalidated) });
+      var sessCls = vCls.session;
       var actorCls = sessCls.name || 'Admin';
 
       if (method === 'POST') {
@@ -3232,8 +3410,9 @@ function dispatchRoute_(req) {
     if (pathname === '/api/sessions') {
       var ssSess = getSpreadsheet_();
       if (method === 'GET') return makeResp_(200, { sessions: getFullDatabase_().sessions });
-      var sessAuth = verifyJwt_(token);
-      if (!sessAuth) return makeResp_(401, { error: 'Unauthorized' });
+      var vSess = validateTokenAgainstSheet_(token);
+      if (!vSess.valid) return makeResp_(401, { error: vSess.reason || 'Unauthorized', sessionInvalidated: Boolean(vSess.invalidated) });
+      var sessAuth = vSess.session;
       var actorSess = sessAuth.name || 'Admin';
 
       if (method === 'POST') {
@@ -3280,8 +3459,9 @@ function dispatchRoute_(req) {
     // 12. /api/settings
     if (pathname === '/api/settings') {
       if (method === 'GET') return makeResp_(200, { settings: getFullDatabase_().settings });
-      var sessSet = verifyJwt_(token);
-      if (!sessSet) return makeResp_(401, { error: 'Unauthorized' });
+      var vSet = validateTokenAgainstSheet_(token);
+      if (!vSet.valid) return makeResp_(401, { error: vSet.reason || 'Unauthorized', sessionInvalidated: Boolean(vSet.invalidated) });
+      var sessSet = vSet.session;
       var lockSet = LockService.getScriptLock();
       lockSet.waitLock(15000);
       try {
@@ -3313,8 +3493,11 @@ function dispatchRoute_(req) {
       }
       var actorN = 'Admin';
       if (token && token !== 'undefined' && token !== 'null') {
-        var sn = verifyJwt_(token);
-        if (sn && sn.name) actorN = sn.name;
+        var vn = validateTokenAgainstSheet_(token);
+        if (!vn.valid && vn.invalidated) {
+          return makeResp_(401, { error: vn.reason || 'Unauthorized', sessionInvalidated: true });
+        }
+        if (vn.valid && vn.session && vn.session.name) actorN = vn.session.name;
       }
       if (query.action === 'test_email') {
         if (!body.email) return makeResp_(400, { error: 'Email tujuan wajib diisi.' });
@@ -3367,8 +3550,9 @@ function dispatchRoute_(req) {
         }
       }
       if (method === 'PUT') {
-        var sessLr = verifyJwt_(token);
-        if (!sessLr) return makeResp_(401, { error: 'Unauthorized' });
+        var vLr = validateTokenAgainstSheet_(token);
+        if (!vLr.valid) return makeResp_(401, { error: vLr.reason || 'Unauthorized', sessionInvalidated: Boolean(vLr.invalidated) });
+        var sessLr = vLr.session;
         var lockLrPut = LockService.getScriptLock();
         lockLrPut.waitLock(15000);
         try {

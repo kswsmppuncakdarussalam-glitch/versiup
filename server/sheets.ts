@@ -26,6 +26,9 @@ const SCOPES = [
   'https://www.googleapis.com/auth/gmail.send',
 ];
 
+const DEFAULT_SPREADSHEET_ID = '14MkgrDI6iFV4J8b5rS_LkUZrHtYX_zzuGJUihjKdxU4';
+const DEFAULT_DRIVE_FOLDER_ID = '1vHFHbjW2E8Zo_-nuft4ns1NonyXcQY7K';
+
 export const SHEET_TABS = {
   SISWA: 'Siswa',
   KELAS: 'Kelas',
@@ -281,6 +284,28 @@ export class ConflictError extends Error {
     this.name = 'ConflictError';
     this.current = current;
   }
+}
+
+export class DriveNotFoundError extends Error {
+  public readonly statusCode = 404;
+
+  constructor(message = 'Foto tidak ditemukan atau tidak memiliki akses di Google Drive.') {
+    super(message);
+    this.name = 'DriveNotFoundError';
+  }
+}
+
+export function extractDriveFileId(raw?: string | null): string {
+  const s = String(raw ?? '').trim();
+  if (!s) return '';
+  const mFile = s.match(/\/file\/d\/([a-zA-Z0-9_-]{8,200})/i);
+  if (mFile?.[1]) return mFile[1];
+  const mD = s.match(/\/d\/([a-zA-Z0-9_-]{8,200})/i);
+  if (mD?.[1]) return mD[1];
+  const mQuery = s.match(/[?&]id=([a-zA-Z0-9_-]{8,200})/i);
+  if (mQuery?.[1]) return mQuery[1];
+  if (/^[a-zA-Z0-9_-]{8,200}$/.test(s)) return s;
+  return '';
 }
 
 function colIndexToLetter(index: number): string {
@@ -641,7 +666,7 @@ export class SheetsDatabaseService {
       } catch {}
     }
 
-    let spreadsheetId = (process.env.SPREADSHEET_ID || '').trim();
+    let spreadsheetId = (process.env.SPREADSHEET_ID || DEFAULT_SPREADSHEET_ID).trim();
     const sheetUrlMatch = spreadsheetId.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
     if (sheetUrlMatch?.[1]) {
       spreadsheetId = sheetUrlMatch[1];
@@ -649,7 +674,7 @@ export class SheetsDatabaseService {
       spreadsheetId = spreadsheetId.split(/[?#/\s]/)[0].trim();
     }
 
-    let driveFolderId = (process.env.DRIVE_FOLDER_ID || '').trim();
+    let driveFolderId = (process.env.DRIVE_FOLDER_ID || DEFAULT_DRIVE_FOLDER_ID).trim();
     const folderUrlMatch = driveFolderId.match(/\/folders\/([a-zA-Z0-9_-]+)/);
     if (folderUrlMatch?.[1]) {
       driveFolderId = folderUrlMatch[1];
@@ -1226,14 +1251,16 @@ export class SheetsDatabaseService {
   }
 
   public async uploadPhotoToDrive(base64Input: string, fileName: string): Promise<string> {
-    const { drive, driveFolderId, isOAuthMode } = this.createClients(true);
+    const { drive, driveFolderId } = this.createClients(true);
     let cleanBase64 = (base64Input || '').trim();
     let mimeType = 'image/jpeg';
 
-    const match = cleanBase64.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+    const match = cleanBase64.match(/^data:([^;]+);base64,(.+)$/i);
     if (match) {
-      mimeType = match[1];
+      mimeType = match[1] || 'image/jpeg';
       cleanBase64 = match[2];
+    } else {
+      cleanBase64 = cleanBase64.replace(/^data:[^;]*;base64,/i, '');
     }
 
     const buffer = Buffer.from(cleanBase64, 'base64');
@@ -1267,12 +1294,17 @@ export class SheetsDatabaseService {
         res = await createInFolder(appFolderId);
       }
     } catch (err: any) {
+      if (err instanceof GoogleAuthExpiredError) throw err;
       const status = err?.code || err?.status || err?.response?.status;
-      if (isOAuthMode && (status === 403 || status === 404)) {
-        // Under drive.file scope, pre-existing folders created outside this app cannot be targeted directly;
-        // automatically fall back to an app-owned Drive folder.
-        const appFolderId = await this.ensureAppDriveFolder(drive);
-        res = await createInFolder(appFolderId);
+      const msg = String(err?.message || '').toLowerCase();
+      if (status === 403 || status === 404 || msg.includes('not found') || msg.includes('permission') || msg.includes('insufficient')) {
+        try {
+          const appFolderId = await this.ensureAppDriveFolder(drive);
+          res = await createInFolder(appFolderId);
+        } catch (fallbackErr: any) {
+          if (fallbackErr instanceof GoogleAuthExpiredError) throw fallbackErr;
+          res = await createInFolder(undefined);
+        }
       } else {
         throw err;
       }
@@ -1285,36 +1317,52 @@ export class SheetsDatabaseService {
     return fileId;
   }
 
-  public async getPhotoFromDrive(fileId: string): Promise<{ buffer: Buffer; mimeType: string }> {
-    const cleanId = (fileId || '').trim();
-    if (!/^[a-zA-Z0-9_-]{8,128}$/.test(cleanId)) {
-      throw new Error('ID file Drive tidak valid.');
+  public async getPhotoFromDrive(fileIdOrUrl: string): Promise<{ buffer: Buffer; mimeType: string }> {
+    const cleanId = extractDriveFileId(fileIdOrUrl);
+    if (!cleanId) {
+      throw new DriveNotFoundError('ID file Drive tidak valid.');
     }
     const { drive } = this.createClients(false);
 
-    const metaRes = await this.withRetry429(() =>
-      drive.files.get({
-        fileId: cleanId,
-        fields: 'id,mimeType,name',
-        supportsAllDrives: true,
-      })
-    );
-
-    const mediaRes = await this.withRetry429(() =>
-      drive.files.get(
-        {
+    try {
+      const metaRes = await this.withRetry429(() =>
+        drive.files.get({
           fileId: cleanId,
-          alt: 'media',
+          fields: 'id,mimeType,name,trashed',
           supportsAllDrives: true,
-        },
-        { responseType: 'arraybuffer' }
-      )
-    );
+        })
+      );
 
-    return {
-      buffer: Buffer.from(mediaRes.data as ArrayBuffer),
-      mimeType: metaRes.data.mimeType || 'image/jpeg',
-    };
+      if (metaRes.data.trashed) {
+        throw new DriveNotFoundError('Foto sudah dihapus di Google Drive.');
+      }
+
+      const mediaRes = await this.withRetry429(() =>
+        drive.files.get(
+          {
+            fileId: cleanId,
+            alt: 'media',
+            supportsAllDrives: true,
+          },
+          { responseType: 'arraybuffer' }
+        )
+      );
+
+      return {
+        buffer: Buffer.from(mediaRes.data as ArrayBuffer),
+        mimeType: metaRes.data.mimeType || 'image/jpeg',
+      };
+    } catch (err: any) {
+      if (err instanceof GoogleAuthExpiredError || err instanceof DriveNotFoundError) {
+        throw err;
+      }
+      const status = err?.code || err?.status || err?.response?.status;
+      const msg = String(err?.message || '').toLowerCase();
+      if (status === 404 || status === 403 || msg.includes('file not found') || msg.includes('not found')) {
+        throw new DriveNotFoundError('Foto tidak ditemukan atau tidak memiliki akses di Google Drive.');
+      }
+      throw err;
+    }
   }
 
   /**
@@ -1797,65 +1845,152 @@ export class SheetsDatabaseService {
   public async batchSaveStudents(
     incomingStudents: Partial<Student>[],
     actorName = 'Admin'
-  ): Promise<{ inserted: number; updated: number }> {
+  ): Promise<{ inserted: number; updated: number; classesCreated: number }> {
     const nowIso = new Date().toISOString();
+    const { sheets, spreadsheetId } = this.createClients(false);
+
+    // 1. Auto-create missing classes in ONE batch append
+    const existingClassRows = await this.readTabWithRowNumbers(SHEET_TABS.KELAS);
+    const activeClassMap = new Map<string, string>();
+    for (const cr of existingClassRows) {
+      if (cr.data.status !== 'dihapus' && cr.data.id) {
+        activeClassMap.set(cr.data.id.trim().toLowerCase(), cr.data.id.trim());
+      }
+    }
+
+    const newClassesToAppend: Record<string, any>[] = [];
+    for (const s of incomingStudents) {
+      const cid = String(s?.class_id || '').trim();
+      if (!cid) continue;
+      const norm = cid.toLowerCase();
+      if (!activeClassMap.has(norm)) {
+        let grade = '10';
+        const gMatch = cid.match(/^(10|11|12)/i) || cid.match(/^(X|XI|XII)\b/i);
+        if (gMatch) {
+          const gUp = gMatch[1].toUpperCase();
+          grade = gUp === 'X' ? '10' : gUp === 'XI' ? '11' : gUp === 'XII' ? '12' : gUp;
+        }
+        const majorParts = cid.split('-');
+        const major = majorParts.length > 1 ? majorParts[1].trim() : 'Umum';
+        newClassesToAppend.push({
+          id: cid,
+          name: cid,
+          grade,
+          major: major || 'Umum',
+          homeroom_teacher_name: `Wali Kelas ${cid}`,
+          homeroom_teacher_email: `${cid.toLowerCase().replace(/[^a-z0-9]/g, '.')}@sekolah.sch.id`,
+          quota_limit: 2,
+          created_at: nowIso,
+          updated_at: nowIso,
+          status: 'aktif',
+          diubah_pada: nowIso,
+        });
+        activeClassMap.set(norm, cid);
+      }
+    }
+    if (newClassesToAppend.length > 0) {
+      await this.appendRows(SHEET_TABS.KELAS, newClassesToAppend);
+    }
+
+    // 2. Read Siswa tab ONCE and collect all row updates into a single batchUpdate
     const existingRows = await this.readTabWithRowNumbers(SHEET_TABS.SISWA);
     const existingMap = new Map(existingRows.map((r) => [r.data.id, r]));
+    const headers = SHEET_HEADERS[SHEET_TABS.SISWA];
+    const lastColLetter = colIndexToLetter(headers.length - 1);
 
     const toAppend: Record<string, any>[] = [];
+    const batchRowUpdates: sheets_v4.Schema$ValueRange[] = [];
     let updatedCount = 0;
 
     for (const s of incomingStudents) {
       if (!s.nis || !s.name || !s.class_id) continue;
       const nis = String(s.nis).trim();
+      const rawClassId = String(s.class_id).trim();
+      const resolvedClassId = activeClassMap.get(rawClassId.toLowerCase()) || rawClassId;
+      const existing = existingMap.get(nis);
+      const hasActiveExisting = Boolean(existing && existing.data.status !== 'dihapus');
+      const preservedPhoto =
+        String(s.photo_url || '').trim() ||
+        (hasActiveExisting ? String(existing!.data.photo_url || '').trim() : '');
+
       const record: Student & { id: string; status: string } = {
         id: nis,
         nis,
         nisn: String(s.nisn || '').trim(),
         name: String(s.name).trim(),
-        class_id: String(s.class_id).trim(),
+        class_id: resolvedClassId,
         gender: s.gender === 'P' ? 'P' : 'L',
         rfid_uid: String(s.rfid_uid || `RFID-${nis}`).trim(),
-        card_code: String(s.card_code || s.rfid_uid || `RFID-${nis}`).trim(),
-        photo_url: String(s.photo_url || '').trim(),
+        card_code: String(s.card_code || s.rfid_uid || nis).trim(),
+        photo_url: preservedPhoto,
         parent_name: String(s.parent_name || '').trim(),
         parent_email: String(s.parent_email || '').trim(),
-        created_at: s.created_at || nowIso,
+        created_at: (hasActiveExisting && existing!.data.created_at) || s.created_at || nowIso,
         updated_at: nowIso,
         diubah_pada: nowIso,
         status: 'aktif',
       };
 
-      const existing = existingMap.get(nis);
-      if (existing && existing.data.status !== 'dihapus') {
-        await this.updateRowPartial({
-          tabName: SHEET_TABS.SISWA,
-          id: nis,
-          newRowObj: record,
-          forceOverwrite: true,
-          actorName,
-          reason: 'Impor Excel batch',
+      if (hasActiveExisting) {
+        const oldData = existing!.data;
+        const hasRealChanges = headers.some((col) => {
+          if (col === 'updated_at' || col === 'diubah_pada') return false;
+          const oldVal = oldData[col] ?? '';
+          const newVal = String((record as any)[col] ?? '');
+          return oldVal !== newVal;
         });
-        updatedCount++;
+
+        if (hasRealChanges) {
+          batchRowUpdates.push({
+            range: `${SHEET_TABS.SISWA}!A${existing!.rowNumber}:${lastColLetter}${existing!.rowNumber}`,
+            values: [this.objectToRowArray(SHEET_TABS.SISWA, record)],
+          });
+          existing!.data = record as any;
+          updatedCount++;
+        }
       } else {
         toAppend.push(record);
+        existingMap.set(nis, { rowNumber: -1, data: record as any });
+      }
+    }
+
+    if (batchRowUpdates.length > 0) {
+      for (let i = 0; i < batchRowUpdates.length; i += 250) {
+        const slice = batchRowUpdates.slice(i, i + 250);
+        await this.withRetry429(() =>
+          sheets.spreadsheets.values.batchUpdate({
+            spreadsheetId,
+            requestBody: {
+              valueInputOption: 'RAW',
+              data: slice,
+            },
+          })
+        );
       }
     }
 
     if (toAppend.length > 0) {
       await this.appendRows(SHEET_TABS.SISWA, toAppend);
+    }
+
+    if (toAppend.length > 0 || updatedCount > 0 || newClassesToAppend.length > 0) {
       await this.appendLog({
         waktu: nowIso,
         pengguna: actorName,
-        id_data: `batch_${toAppend.length}`,
+        id_data: `batch_${toAppend.length + updatedCount}`,
         tabel: SHEET_TABS.SISWA,
         aksi: 'tambah',
-        nilai_baru: JSON.stringify({ count: toAppend.length, sample: toAppend.slice(0, 3).map((x) => x.nis) }),
-        reason: 'Impor Excel batch',
+        nilai_baru: JSON.stringify({
+          inserted: toAppend.length,
+          updated: updatedCount,
+          classesCreated: newClassesToAppend.length,
+          sample: toAppend.slice(0, 3).map((x) => x.nis),
+        }),
+        reason: 'Impor Excel/CSV batch',
       });
     }
 
-    return { inserted: toAppend.length, updated: updatedCount };
+    return { inserted: toAppend.length, updated: updatedCount, classesCreated: newClassesToAppend.length };
   }
 
   public async deleteStudent(nis: string, actorName = 'Admin'): Promise<boolean> {

@@ -112,8 +112,10 @@ export interface StudentImportRow {
   Kelas: string;
   Jenis_Kelamin?: 'L' | 'P';
   UID_RFID?: string;
+  Kode_Kartu?: string;
   Nama_Orang_Tua?: string;
   Email_Orang_Tua?: string;
+  Status_Keaktifan?: string;
   isValid?: boolean;
   errors?: string[];
   sheetSource?: string;
@@ -134,9 +136,9 @@ function cleanClassName(raw: string): string {
   if (!val) return '';
 
   // Convert roman numerals at start: X -> 10, XI -> 11, XII -> 12
-  val = val.replace(/^X\b/i, '10')
+  val = val.replace(/^XII\b/i, '12')
            .replace(/^XI\b/i, '11')
-           .replace(/^XII\b/i, '12');
+           .replace(/^X\b/i, '10');
 
   // Replace spaces with hyphens if not already separated
   if (val.includes(' ') && !val.includes('-')) {
@@ -178,7 +180,6 @@ export async function parseStudentExcel(file: File, fallbackClassId: string = '1
       if (!Array.isArray(row)) continue;
 
       const tempMap: Record<string, number> = {};
-      let matches = 0;
 
       row.forEach((cell, colIdx) => {
         const text = normalizeKey(String(cell));
@@ -186,17 +187,20 @@ export async function parseStudentExcel(file: File, fallbackClassId: string = '1
 
         // 1. Email MUST be checked first (since Email Orang Tua has orangtua in it)
         if (['email', 'emailorangtua', 'emailwali', 'kontak'].some((k) => text === k || text.includes('email') || text.includes('mail'))) {
-          tempMap['parent_email'] = colIdx;
-          matches++;
+          if (tempMap['parent_email'] === undefined) tempMap['parent_email'] = colIdx;
         } else if (['namaorangtua', 'orangtua', 'namawali', 'wali', 'ayah', 'namaayah', 'ibu', 'namaibu', 'parent', 'parentname'].some((k) => text === k || text.includes('orangtua') || text.includes('wali') || text.includes('parent') || text.includes('ayah') || text.includes('ibu'))) {
-          tempMap['parent_name'] = colIdx;
-          matches++;
+          if (tempMap['parent_name'] === undefined) tempMap['parent_name'] = colIdx;
+        } else if (['statuskeaktifan', 'statusaktif', 'keaktifan', 'statussiswa', 'status'].some((k) => text === k || text.includes('keaktifan'))) {
+          if (tempMap['status_keaktifan'] === undefined) tempMap['status_keaktifan'] = colIdx;
         } else if (['jeniskelamin', 'jk', 'gender', 'sex', 'lp'].some((k) => text === k || text.includes('kelamin') || text === 'jk' || text === 'lp')) {
-          tempMap['gender'] = colIdx;
-          matches++;
+          if (tempMap['gender'] === undefined) tempMap['gender'] = colIdx;
         } else if (['nisn', 'nomornisn'].some((k) => text === k || text.includes('nisn'))) {
-          tempMap['nisn'] = colIdx;
-          matches++;
+          if (tempMap['nisn'] === undefined) tempMap['nisn'] = colIdx;
+        } else if (['kodekartu', 'kodekartunis', 'cardcode', 'kodebarcode', 'barcode'].some((k) => text === k || text.includes('kodekartu') || text.includes('cardcode'))) {
+          // Check Kode Kartu/NIS BEFORE RFID UID so "Kode Kartu/NIS" never overwrites "RFID UID"
+          if (tempMap['card_code'] === undefined) tempMap['card_code'] = colIdx;
+        } else if (['rfid', 'uidrfid', 'rfiduid', 'uid', 'nomorkartu', 'kartu'].some((k) => text === k || text.includes('rfid') || text.includes('uid'))) {
+          if (tempMap['rfid'] === undefined) tempMap['rfid'] = colIdx;
         } else if (
           text === 'nis' ||
           text === 'noinduk' ||
@@ -206,22 +210,16 @@ export async function parseStudentExcel(file: File, fallbackClassId: string = '1
           text === 'nomor' ||
           (text.startsWith('nis') && !text.includes('kelamin') && !text.includes('nisn'))
         ) {
-          tempMap['nis'] = colIdx;
-          matches++;
+          if (tempMap['nis'] === undefined) tempMap['nis'] = colIdx;
         } else if (
           ['namasiswa', 'namapesertadidik', 'namalengkap', 'namamurid', 'namapeserta', 'studentname', 'fullname', 'pesertadidik', 'murid', 'nama', 'name'].some((k) => text === k || text.includes('siswa') || text.includes('pesertadidik') || text.includes('murid') || text.includes('student')) ||
           text === 'nama' ||
           text === 'name' ||
           (text.startsWith('nama') && !text.includes('tua') && !text.includes('wali') && !text.includes('ayah') && !text.includes('ibu') && !text.includes('kelas') && !text.includes('sekolah'))
         ) {
-          tempMap['nama'] = colIdx;
-          matches++;
+          if (tempMap['nama'] === undefined) tempMap['nama'] = colIdx;
         } else if (['kelas', 'rombel', 'rombonganbelajar', 'tingkat', 'tingkatkelas', 'kelasrombel', 'class', 'grade'].some((k) => text === k || text.includes('kelas') || text.includes('rombel') || text.includes('class'))) {
-          tempMap['kelas'] = colIdx;
-          matches++;
-        } else if (['rfid', 'uidrfid', 'uid', 'kartu', 'nomorkartu', 'rfiduid', 'cardcode'].some((k) => text === k || text.includes('rfid') || text.includes('kartu'))) {
-          tempMap['rfid'] = colIdx;
-          matches++;
+          if (tempMap['kelas'] === undefined) tempMap['kelas'] = colIdx;
         }
       });
 
@@ -246,7 +244,7 @@ export async function parseStudentExcel(file: File, fallbackClassId: string = '1
         let nameLikeCount = 0;
         for (let r = headerRowIdx + 1; r < Math.min(rawData.length, headerRowIdx + 6); r++) {
           const val = String(rawData[r]?.[c] ?? '').trim();
-          if (val && val.length > 2 && /^[a-zA-Z\s.,'-]+$/.test(val) && !val.match(/^(L|P|X|XI|XII|10|11|12)$/i)) {
+          if (val && val.length > 2 && /^[a-zA-Z\s.,'-]+$/.test(val) && !val.match(/^(L|P|X|XI|XII|10|11|12|Aktif|Nonaktif)$/i)) {
             nameLikeCount++;
           }
         }
@@ -286,15 +284,23 @@ export async function parseStudentExcel(file: File, fallbackClassId: string = '1
       let rawKelas = getColVal('kelas');
       const rawGender = getColVal('gender');
       const rawRfid = getColVal('rfid');
+      const rawCardCode = getColVal('card_code');
       const parentName = getColVal('parent_name');
       const parentEmail = getColVal('parent_email');
+      const statusKeaktifan = getColVal('status_keaktifan');
 
       // Fallback: if nama is still empty, scan row cells for a cell that looks like a name
       if (!nama) {
         for (let ci = 0; ci < row.length; ci++) {
-          if (ci === colMap['nis'] || ci === colMap['kelas'] || ci === colMap['gender'] || ci === colMap['parent_name']) continue;
+          if (
+            ci === colMap['nis'] ||
+            ci === colMap['kelas'] ||
+            ci === colMap['gender'] ||
+            ci === colMap['parent_name'] ||
+            ci === colMap['status_keaktifan']
+          ) continue;
           const cellVal = String(row[ci] ?? '').trim();
-          if (cellVal && cellVal.length > 2 && /^[a-zA-Z\s.,'-]+$/.test(cellVal) && !cellVal.match(/^(L|P|Laki-laki|Perempuan|X|XI|XII)$/i)) {
+          if (cellVal && cellVal.length > 2 && /^[a-zA-Z\s.,'-]+$/.test(cellVal) && !cellVal.match(/^(L|P|Laki-laki|Perempuan|X|XI|XII|Aktif|Nonaktif)$/i)) {
             nama = cellVal;
             break;
           }
@@ -319,6 +325,7 @@ export async function parseStudentExcel(file: File, fallbackClassId: string = '1
 
       const gender = (rawGender.toUpperCase().startsWith('P') ? 'P' : 'L') as 'L' | 'P';
       const rfid = rawRfid || `RFID-${nis}`;
+      const cardCode = rawCardCode || nis;
 
       allRows.push({
         NIS: nis,
@@ -327,8 +334,10 @@ export async function parseStudentExcel(file: File, fallbackClassId: string = '1
         Kelas: kelas,
         Jenis_Kelamin: gender,
         UID_RFID: rfid,
+        Kode_Kartu: cardCode,
         Nama_Orang_Tua: parentName,
         Email_Orang_Tua: parentEmail,
+        Status_Keaktifan: statusKeaktifan || 'Aktif',
         sheetSource: sheetName,
       });
     }
@@ -345,23 +354,25 @@ export async function downloadStudentTemplate(classList: { id: string }[] = []) 
   const sampleData = [
     {
       NIS: '20261011',
-      NISN: '0081234011',
-      Nama: 'Muhammad Faiz',
+      'Nama Siswa': 'Muhammad Faiz',
       Kelas: firstClass,
-      Jenis_Kelamin: 'L',
-      UID_RFID: 'RFID-8821911',
-      Nama_Orang_Tua: 'Bambang Faiz',
-      Email_Orang_Tua: 'faiz.parent@example.com',
+      'Jenis Kelamin': 'L',
+      'RFID UID': 'RFID-8821911',
+      'Kode Kartu/NIS': '20261011',
+      'Nama Orang Tua': 'Bambang Faiz',
+      'Email Orang Tua': 'faiz.parent@example.com',
+      'Status Keaktifan': 'Aktif',
     },
     {
       NIS: '20261012',
-      NISN: '0081234012',
-      Nama: 'Nadia Putri',
+      'Nama Siswa': 'Nadia Putri',
       Kelas: firstClass,
-      Jenis_Kelamin: 'P',
-      UID_RFID: 'RFID-8821912',
-      Nama_Orang_Tua: 'Rudi Hermanto',
-      Email_Orang_Tua: 'nadia.parent@example.com',
+      'Jenis Kelamin': 'P',
+      'RFID UID': 'RFID-8821912',
+      'Kode Kartu/NIS': '20261012',
+      'Nama Orang Tua': 'Rudi Hermanto',
+      'Email Orang Tua': 'nadia.parent@example.com',
+      'Status Keaktifan': 'Aktif',
     },
   ];
 
@@ -370,13 +381,14 @@ export async function downloadStudentTemplate(classList: { id: string }[] = []) 
 
   const instructions = [
     { Kolom: 'NIS', Keterangan: 'Nomor Induk Siswa (Wajib, Unik, angka/teks)', Contoh: '20261011' },
-    { Kolom: 'NISN', Keterangan: 'Nomor Induk Siswa Nasional (Opsional)', Contoh: '0081234011' },
-    { Kolom: 'Nama', Keterangan: 'Nama Lengkap Siswa (Wajib)', Contoh: 'Muhammad Faiz' },
-    { Kolom: 'Kelas', Keterangan: `ID Kelas terdaftar (${classNames})`, Contoh: firstClass },
-    { Kolom: 'Jenis_Kelamin', Keterangan: 'L (Laki-laki) atau P (Perempuan)', Contoh: 'L' },
-    { Kolom: 'UID_RFID', Keterangan: 'Kode UID kartu RFID / Barcode (Wajib unik)', Contoh: 'RFID-8821911' },
-    { Kolom: 'Nama_Orang_Tua', Keterangan: 'Nama Orang Tua / Wali', Contoh: 'Bambang Faiz' },
-    { Kolom: 'Email_Orang_Tua', Keterangan: 'Alamat email aktif untuk notifikasi presensi & kedisiplinan', Contoh: 'faiz.parent@example.com' },
+    { Kolom: 'Nama Siswa', Keterangan: 'Nama Lengkap Siswa (Wajib)', Contoh: 'Muhammad Faiz' },
+    { Kolom: 'Kelas', Keterangan: `ID Kelas terdaftar (${classNames}) — kelas baru akan otomatis dibuat jika belum ada`, Contoh: firstClass },
+    { Kolom: 'Jenis Kelamin', Keterangan: 'L (Laki-laki) atau P (Perempuan)', Contoh: 'L' },
+    { Kolom: 'RFID UID', Keterangan: 'Kode UID kartu RFID (opsional, otomatis RFID-<NIS> jika kosong)', Contoh: 'RFID-8821911' },
+    { Kolom: 'Kode Kartu/NIS', Keterangan: 'Kode alternatif barcode/kartu (opsional, default NIS)', Contoh: '20261011' },
+    { Kolom: 'Nama Orang Tua', Keterangan: 'Nama Orang Tua / Wali', Contoh: 'Bambang Faiz' },
+    { Kolom: 'Email Orang Tua', Keterangan: 'Alamat email aktif untuk notifikasi presensi & kedisiplinan', Contoh: 'faiz.parent@example.com' },
+    { Kolom: 'Status Keaktifan', Keterangan: 'Aktif / Nonaktif (hanya baris aktif yang akan diimpor)', Contoh: 'Aktif' },
   ];
   const wsInstructions = XLSX.utils.json_to_sheet(instructions);
   XLSX.utils.book_append_sheet(wb, wsInstructions, 'Petunjuk Format');

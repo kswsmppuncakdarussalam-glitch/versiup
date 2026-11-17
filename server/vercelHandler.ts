@@ -1,26 +1,59 @@
 import { handleApiRoute, type ApiRequest } from './apiRouter.ts';
 
 export async function handleVercelRequest(req: any, res: any) {
-  let requestUrl: string =
+  let rawUrl: string =
     req.headers?.['x-forwarded-uri'] ||
     req.headers?.['x-matched-path'] ||
     req.url ||
-    '/';
+    '/api/setup';
 
-  if (requestUrl === '/api' || requestUrl === '/api/') {
-    if (req.query?.path) {
-      const p = Array.isArray(req.query.path) ? req.query.path.join('/') : req.query.path;
-      requestUrl = `/api/${p}`;
-    } else {
-      requestUrl = '/api/setup';
+  const parsedUrl = new URL(rawUrl, 'http://localhost');
+  const queryObj: Record<string, string> = {};
+
+  if (req.query && typeof req.query === 'object') {
+    for (const [k, v] of Object.entries(req.query)) {
+      if (v === undefined || v === null) continue;
+      queryObj[k] = Array.isArray(v) ? String(v[0] ?? '') : String(v);
+    }
+  }
+  parsedUrl.searchParams.forEach((v, k) => {
+    queryObj[k] = v;
+  });
+
+  let pathname = parsedUrl.pathname || '/api/setup';
+  const rewritePath = queryObj['__path'] || queryObj['path'];
+  if ((pathname === '/api' || pathname === '/api/') && rewritePath) {
+    const cleanSub = String(rewritePath).replace(/^\/+/, '');
+    pathname = cleanSub ? `/api/${cleanSub}` : '/api/setup';
+    delete queryObj['__path'];
+    delete queryObj['path'];
+    parsedUrl.searchParams.delete('__path');
+    parsedUrl.searchParams.delete('path');
+  } else if (pathname === '/api' || pathname === '/api/') {
+    pathname = '/api/setup';
+  }
+
+  const finalSearch = new URLSearchParams();
+  for (const [k, v] of Object.entries(queryObj)) {
+    finalSearch.set(k, v);
+  }
+  const searchStr = finalSearch.toString();
+  const requestUrl = searchStr ? `${pathname}?${searchStr}` : pathname;
+
+  let parsedBody = req.body;
+  if (typeof parsedBody === 'string' && parsedBody.trim()) {
+    try {
+      parsedBody = JSON.parse(parsedBody);
+    } catch {
+      // Keep original string if not JSON
     }
   }
 
   const apiReq: ApiRequest = {
     method: req.method || 'GET',
     url: requestUrl,
-    query: (req.query as Record<string, string>) || {},
-    body: req.body,
+    query: queryObj,
+    body: parsedBody,
     headers: (req.headers as Record<string, string | undefined>) || {},
   };
 

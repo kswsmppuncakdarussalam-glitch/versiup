@@ -58,35 +58,128 @@ export async function compressPhotoMax800Jpeg(
   }
 }
 
+const driveBlobCache = new Map<string, string>();
+const driveMissingCache = new Map<string, number>();
+const MISSING_CACHE_TTL_MS = 60_000;
+
+function getStoredAppToken(): string {
+  try {
+    const raw = localStorage.getItem('dkb_session');
+    if (!raw) return '';
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.token === 'string' ? parsed.token : '';
+  } catch {
+    return '';
+  }
+}
+
+async function refreshStoredAppToken(): Promise<string> {
+  const currentTok = getStoredAppToken();
+  if (!currentTok) return '';
+  try {
+    const gToken = getGoogleAccessToken();
+    const res = await apiFetch('/api/auth?action=refresh_session', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${currentTok}`,
+        ...(gToken ? { 'X-Google-Access-Token': gToken } : {}),
+      },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data?.token) {
+      window.dispatchEvent(new CustomEvent('dkb-app-token-refreshed', { detail: { token: data.token } }));
+      return data.token as string;
+    }
+    if (res.status === 401 && data?.googleAuthExpired) {
+      window.dispatchEvent(new CustomEvent('dkb-google-auth-expired', { detail: data }));
+    }
+  } catch {}
+  return '';
+}
+
+function handlePhotoAuth401(data: any) {
+  if (data?.googleAuthExpired || data?.googleDeploymentUnauthorized) {
+    window.dispatchEvent(new CustomEvent('dkb-google-auth-expired', { detail: data }));
+  }
+}
+
+export function extractDriveFileId(val?: string | null): string {
+  if (!val) return '';
+  const trimmed = val.trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('data:') || trimmed.startsWith('blob:') || trimmed.startsWith('/')) {
+    return '';
+  }
+  if (/^(https?:\/\/)/i.test(trimmed)) {
+    const fileMatch = trimmed.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/i);
+    if (fileMatch) return fileMatch[1];
+    const queryMatch = trimmed.match(/drive\.google\.com\/(?:uc|open|thumbnail)\b[^#]*[?&]id=([a-zA-Z0-9_-]+)/i);
+    if (queryMatch) return queryMatch[1];
+    const lh3Match = trimmed.match(/lh3\.googleusercontent\.com\/d\/([a-zA-Z0-9_-]+)/i);
+    if (lh3Match) return lh3Match[1];
+    return '';
+  }
+  if (/^[a-zA-Z0-9_-]{15,}$/.test(trimmed)) {
+    return trimmed;
+  }
+  return '';
+}
+
 export async function uploadPhotoToBackend(
   input: File | Blob | string,
   fileName?: string
 ): Promise<string> {
   const { base64 } = await compressPhotoMax800Jpeg(input);
-  const googleToken = getGoogleAccessToken();
-  const res = await apiFetch('/api/photos', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(googleToken ? { 'X-Google-Access-Token': googleToken } : {}),
-    },
-    body: JSON.stringify({
-      base64,
-      fileName: fileName || `foto_${Date.now()}.jpg`,
-    }),
-  });
-  const data = await res.json().catch(() => ({}));
+
+  const sendUpload = async (appTokOverride?: string) => {
+    const googleToken = getGoogleAccessToken();
+    const appToken = appTokOverride || getStoredAppToken();
+    const res = await apiFetch('/api/photos', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(appToken ? { Authorization: `Bearer ${appToken}` } : {}),
+        ...(googleToken ? { 'X-Google-Access-Token': googleToken } : {}),
+      },
+      body: JSON.stringify({
+        base64,
+        fileName: fileName || `foto_${Date.now()}.jpg`,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    return { res, data };
+  };
+
+  let { res, data } = await sendUpload();
+  if (res.status === 401) {
+    if (data?.googleAuthExpired || data?.googleDeploymentUnauthorized) {
+      handlePhotoAuth401(data);
+      throw new Error(data.error || 'Sesi akses Google berakhir. Silakan masuk ulang.');
+    }
+    const nextTok = await refreshStoredAppToken();
+    if (nextTok) {
+      const retried = await sendUpload(nextTok);
+      res = retried.res;
+      data = retried.data;
+    }
+  }
+
   if (!res.ok || !data.fileId) {
     throw new Error(data.error || `Gagal mengunggah foto ke Google Drive (HTTP ${res.status}).`);
   }
+  driveMissingCache.delete(data.fileId);
   return data.fileId;
 }
-
-const driveBlobCache = new Map<string, string>();
 
 export function isDirectPhotoUrl(val?: string | null): boolean {
   if (!val) return false;
   const trimmed = val.trim();
+  if (!trimmed) return false;
+  if (extractDriveFileId(trimmed)) {
+    return false;
+  }
   return (
     trimmed.startsWith('data:') ||
     trimmed.startsWith('http://') ||
@@ -110,12 +203,18 @@ function base64ToBlob(base64: string, mimeType = 'image/jpeg'): Blob {
  * Fetch Drive photo securely via Apps Script or X-Google-Access-Token and cache object URL in memory.
  */
 export async function fetchAuthorizedDrivePhotoUrl(fileId: string): Promise<string> {
-  const clean = fileId.trim();
-  if (!clean) return '';
-  if (isDirectPhotoUrl(clean)) return clean;
+  const trimmed = (fileId || '').trim();
+  if (!trimmed) return '';
+  if (isDirectPhotoUrl(trimmed)) return trimmed;
 
+  const clean = extractDriveFileId(trimmed) || trimmed;
   const cached = driveBlobCache.get(clean);
   if (cached) return cached;
+
+  const missingAt = driveMissingCache.get(clean);
+  if (missingAt && Date.now() - missingAt < MISSING_CACHE_TTL_MS) {
+    return '';
+  }
 
   const appsScriptUrl = getAppsScriptUrl();
   const googleToken = getGoogleAccessToken();
@@ -123,39 +222,57 @@ export async function fetchAuthorizedDrivePhotoUrl(fileId: string): Promise<stri
     return `/api/photos?id=${encodeURIComponent(clean)}`;
   }
 
-  const res = await apiFetch(`/api/photos?id=${encodeURIComponent(clean)}`, {
-    method: 'GET',
-    headers: googleToken ? { 'X-Google-Access-Token': googleToken } : {},
-  });
-  if (!res.ok) {
+  try {
+    const appToken = getStoredAppToken();
+    const res = await apiFetch(`/api/photos?id=${encodeURIComponent(clean)}`, {
+      method: 'GET',
+      headers: {
+        ...(appToken ? { Authorization: `Bearer ${appToken}` } : {}),
+        ...(googleToken ? { 'X-Google-Access-Token': googleToken } : {}),
+      },
+    });
+    if (!res.ok) {
+      if (res.status === 401) {
+        const errData = await res.json().catch(() => ({}));
+        handlePhotoAuth401(errData);
+      } else if (res.status === 404 || res.status === 400) {
+        driveMissingCache.set(clean, Date.now());
+      }
+      return '';
+    }
+
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('application/json') || appsScriptUrl) {
+      const data = await res.json().catch(() => ({}));
+      if (data?.notFound) {
+        driveMissingCache.set(clean, Date.now());
+        return '';
+      }
+      if (data?.base64) {
+        const blob = base64ToBlob(data.base64, data.mimeType || 'image/jpeg');
+        const objectUrl = URL.createObjectURL(blob);
+        driveBlobCache.set(clean, objectUrl);
+        return objectUrl;
+      }
+      if (data?.dataUrl) {
+        driveBlobCache.set(clean, data.dataUrl);
+        return data.dataUrl;
+      }
+      return '';
+    }
+
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    driveBlobCache.set(clean, objectUrl);
+    return objectUrl;
+  } catch {
     return '';
   }
-
-  const contentType = res.headers.get('content-type') || '';
-  if (contentType.includes('application/json') || appsScriptUrl) {
-    const data = await res.json().catch(() => ({}));
-    if (data?.base64) {
-      const blob = base64ToBlob(data.base64, data.mimeType || 'image/jpeg');
-      const objectUrl = URL.createObjectURL(blob);
-      driveBlobCache.set(clean, objectUrl);
-      return objectUrl;
-    }
-    if (data?.dataUrl) {
-      driveBlobCache.set(clean, data.dataUrl);
-      return data.dataUrl;
-    }
-    return '';
-  }
-
-  const blob = await res.blob();
-  const objectUrl = URL.createObjectURL(blob);
-  driveBlobCache.set(clean, objectUrl);
-  return objectUrl;
 }
 
 /**
  * Mengubah nilai ID file Drive menjadi URL proxy backend (/api/photos?id=<fileId>)
- * sambil mempertahankan URL preset SVG atau http(s)://.
+ * sambil mempertahankan URL preset SVG atau http(s):// non-Drive.
  */
 export function resolvePhotoSrc(val?: string | null): string {
   if (!val) return '';
@@ -164,8 +281,13 @@ export function resolvePhotoSrc(val?: string | null): string {
   if (isDirectPhotoUrl(trimmed)) {
     return trimmed;
   }
-  const cached = driveBlobCache.get(trimmed);
+  const clean = extractDriveFileId(trimmed) || trimmed;
+  const cached = driveBlobCache.get(clean);
   if (cached) return cached;
-  return `/api/photos?id=${encodeURIComponent(trimmed)}`;
+  if (driveMissingCache.has(clean)) {
+    const at = driveMissingCache.get(clean)!;
+    if (Date.now() - at < MISSING_CACHE_TTL_MS) return '';
+  }
+  return `/api/photos?id=${encodeURIComponent(clean)}`;
 }
 

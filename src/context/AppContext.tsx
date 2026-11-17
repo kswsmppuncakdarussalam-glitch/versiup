@@ -165,6 +165,7 @@ interface AppContextType {
   lockCurrentMenu: () => void;
   logout: () => void;
   updateSessionToken: (newToken: string) => void;
+  refreshAuthSession: (forceLogoutOn401?: boolean) => Promise<string | null>;
   refreshFromSheets: (
     silent?: boolean,
     overrideGoogleToken?: string,
@@ -220,7 +221,13 @@ interface AppContextType {
   deleteStudent: (nis: string) => Promise<boolean>;
   deleteStudents: (nisses: string[]) => Promise<boolean>;
   clearAllStudents: () => Promise<boolean>;
-  batchImportStudents: (students: Student[]) => Promise<{ success: boolean; added: number; updated: number }>;
+  batchImportStudents: (students: Student[]) => Promise<{
+    success: boolean;
+    added: number;
+    updated: number;
+    classesCreated?: number;
+    error?: string;
+  }>;
 
   saveClass: (cls: SchoolClass) => Promise<boolean>;
   deleteClass: (id: string) => Promise<boolean>;
@@ -639,11 +646,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }
 
           if (res.status === 401 && !data?.googleAuthExpired && !data?.googleDeploymentUnauthorized) {
-            if (data?.sessionInvalidated || forceLogoutOn401) {
-              clearExpiredAppSession(
-                data?.error || 'Sesi login telah berakhir atau kata sandi diubah. Silakan masuk kembali.'
-              );
-            }
+            clearExpiredAppSession(
+              data?.error || 'Sesi login telah berakhir atau kata sandi diubah. Silakan masuk kembali.'
+            );
           }
           return null;
         } catch {
@@ -808,6 +813,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (handlePossibleGoogleTokenExpiry(res.status, data)) {
           setSyncStatus('error');
           return;
+        }
+
+        if (res.status === 401 && sessionRef.current?.token) {
+          await refreshAuthSessionIfNeeded(true);
         }
 
         if (res.status === 503) {
@@ -1166,11 +1175,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setSyncStatus('offline');
     };
 
+    const handleGoogleAuthExpiredEvent = (evt: Event) => {
+      const detail = (evt as CustomEvent)?.detail || {};
+      handlePossibleGoogleTokenExpiry(401, detail);
+    };
+
+    const handleAppTokenRefreshedEvent = (evt: Event) => {
+      const nextToken = (evt as CustomEvent)?.detail?.token;
+      if (typeof nextToken === 'string' && nextToken) {
+        updateSessionToken(nextToken);
+      }
+    };
+
     document.addEventListener('visibilitychange', handleVisibilityOrFocus);
     window.addEventListener('focus', handleVisibilityOrFocus);
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
     window.addEventListener('storage', handleStorageEvent);
+    window.addEventListener('dkb-google-auth-expired', handleGoogleAuthExpiredEvent);
+    window.addEventListener('dkb-app-token-refreshed', handleAppTokenRefreshedEvent);
 
     return () => {
       clearInterval(interval);
@@ -1179,12 +1202,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
       window.removeEventListener('storage', handleStorageEvent);
+      window.removeEventListener('dkb-google-auth-expired', handleGoogleAuthExpiredEvent);
+      window.removeEventListener('dkb-app-token-refreshed', handleAppTokenRefreshedEvent);
       try {
         bc?.close();
       } catch {}
       syncChannelRef.current = null;
     };
-  }, [refreshFromSheets, flushOfflineAttendanceScans]);
+  }, [refreshFromSheets, flushOfflineAttendanceScans, handlePossibleGoogleTokenExpiry, refreshAuthSessionIfNeeded]);
 
   // Flush the 3-second batch of scans to POST /api/attendance
   const flushScanBatch = useCallback(async () => {
@@ -1924,20 +1949,107 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const batchImportStudents = async (newStudents: Student[]) => {
-    const res = await runWriteRequest({
-      url: '/api/students?action=batch_import',
-      method: 'POST',
-      body: { students: newStudents },
-      silentToast: true,
-    });
-    if (res.ok && res.data) {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      const offlineMsg = 'Tidak ada koneksi internet. Impor massal memerlukan koneksi ke server.';
+      setSaveErrorState(offlineMsg);
+      showToast(offlineMsg, 'error');
+      return { success: false, added: 0, updated: 0, classesCreated: 0, error: offlineMsg };
+    }
+
+    if (!Array.isArray(newStudents) || newStudents.length === 0) {
+      return { success: false, added: 0, updated: 0, classesCreated: 0, error: 'Tidak ada data siswa untuk diimpor.' };
+    }
+
+    setSavingState();
+    latestMutationSeqRef.current += 1;
+
+    const CHUNK_SIZE = 150;
+    let totalAdded = 0;
+    let totalUpdated = 0;
+    let totalClassesCreated = 0;
+    let lastSnapshot: any = null;
+    let lastServerTime: string | undefined;
+
+    try {
+      for (let i = 0; i < newStudents.length; i += CHUNK_SIZE) {
+        const chunk = newStudents.slice(i, i + CHUNK_SIZE);
+
+        const sendChunk = async (tokOverride?: string) => {
+          const res = await apiFetch('/api/students?action=batch_import', {
+            method: 'POST',
+            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, tokOverride),
+            body: JSON.stringify({ students: chunk }),
+          });
+          const data = await res.json().catch(() => ({}));
+          return { res, data };
+        };
+
+        let { res, data } = await sendChunk();
+        if (handlePossibleGoogleTokenExpiry(res.status, data)) {
+          const msg = data.error || 'Sesi Google berakhir. Silakan masuk ulang.';
+          setSaveErrorState(msg);
+          return {
+            success: false,
+            added: totalAdded,
+            updated: totalUpdated,
+            classesCreated: totalClassesCreated,
+            error: msg,
+          };
+        }
+
+        if (res.status === 401 && sessionRef.current?.token) {
+          const refreshedTok = await refreshAuthSessionIfNeeded(true);
+          if (refreshedTok) {
+            const retried = await sendChunk(refreshedTok);
+            res = retried.res;
+            data = retried.data;
+          }
+        }
+
+        if (!res.ok || data?.success === false) {
+          const errMsg = data?.error || `Gagal mengimpor data siswa (HTTP ${res.status}).`;
+          setSaveErrorState(errMsg);
+          return {
+            success: false,
+            added: totalAdded,
+            updated: totalUpdated,
+            classesCreated: totalClassesCreated,
+            error: errMsg,
+          };
+        }
+
+        totalAdded += Number(data.inserted || 0);
+        totalUpdated += Number(data.updated || 0);
+        totalClassesCreated += Number(data.classesCreated || 0);
+        if (data.snapshot) lastSnapshot = data.snapshot;
+        if (data.serverTime) lastServerTime = data.serverTime;
+      }
+
+      if (lastSnapshot) {
+        applyDatabaseSnapshot(lastSnapshot, lastServerTime);
+      } else {
+        await refreshFromSheets(true, undefined, { afterWrite: true });
+      }
+      setSavedState('Tersimpan & Tersinkron');
+      broadcastSyncEvent('DATA_MUTATED');
+
       return {
         success: true,
-        added: res.data.inserted || 0,
-        updated: res.data.updated || 0,
+        added: totalAdded,
+        updated: totalUpdated,
+        classesCreated: totalClassesCreated,
+      };
+    } catch (err: any) {
+      const errMsg = err?.message || 'Gagal menghubungi server saat impor data siswa.';
+      setSaveErrorState(errMsg);
+      return {
+        success: false,
+        added: totalAdded,
+        updated: totalUpdated,
+        classesCreated: totalClassesCreated,
+        error: errMsg,
       };
     }
-    return { success: false, added: 0, updated: 0 };
   };
 
   const saveClass = async (cls: SchoolClass) => {
@@ -2079,14 +2191,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     try {
-      const res = await apiFetch('/api/notifications?action=test_email', {
-        method: 'POST',
-        headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ email }),
-      });
-      const data = await res.json().catch(() => ({}));
+      const executeTestEmail = async (tokOverride?: string) => {
+        const res = await apiFetch('/api/notifications?action=test_email', {
+          method: 'POST',
+          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, tokOverride),
+          body: JSON.stringify({ email }),
+        });
+        const data = await res.json().catch(() => ({}));
+        return { res, data };
+      };
+
+      let { res, data } = await executeTestEmail();
       if (handlePossibleGoogleTokenExpiry(res.status, data)) {
         return { success: false, message: data.error || 'Sesi Google berakhir.' };
+      }
+      if (res.status === 401 && sessionRef.current?.token) {
+        const refreshedTok = await refreshAuthSessionIfNeeded(true);
+        if (refreshedTok) {
+          const retried = await executeTestEmail(refreshedTok);
+          res = retried.res;
+          data = retried.data;
+        }
       }
       return { success: Boolean(res.ok && data.success), message: data.message || data.error || 'Selesai' };
     } catch {
@@ -2109,14 +2234,30 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     try {
-      const res = await apiFetch('/api/notifications?action=send_weekly_recap', {
-        method: 'POST',
-        headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ classId }),
-      });
-      const data = await res.json().catch(() => ({}));
+      const executeWeeklyRecap = async (tokOverride?: string) => {
+        const res = await apiFetch('/api/notifications?action=send_weekly_recap', {
+          method: 'POST',
+          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, tokOverride),
+          body: JSON.stringify({ classId }),
+        });
+        const data = await res.json().catch(() => ({}));
+        return { res, data };
+      };
+
+      let { res, data } = await executeWeeklyRecap();
       if (handlePossibleGoogleTokenExpiry(res.status, data)) {
         return { success: false, message: data.error || 'Sesi Google berakhir.' };
+      }
+      if (res.status === 401 && sessionRef.current?.token) {
+        const refreshedTok = await refreshAuthSessionIfNeeded(true);
+        if (refreshedTok) {
+          const retried = await executeWeeklyRecap(refreshedTok);
+          res = retried.res;
+          data = retried.data;
+        }
+      }
+      if (!res.ok) {
+        return { success: false, message: data.error || `Gagal mengirim rekap mingguan (HTTP ${res.status}).` };
       }
       refreshFromSheets(true);
       if (classId) {
@@ -2212,6 +2353,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         lockCurrentMenu,
         logout,
         updateSessionToken,
+        refreshAuthSession: refreshAuthSessionIfNeeded,
         refreshFromSheets,
         recordAttendance,
         updateAttendance,

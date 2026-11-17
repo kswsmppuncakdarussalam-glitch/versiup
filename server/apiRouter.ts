@@ -1,4 +1,4 @@
-import { sheetsDb, SheetsConfigError, GoogleAuthExpiredError, ConflictError } from './sheets.ts';
+import { sheetsDb, SheetsConfigError, GoogleAuthExpiredError, ConflictError, DriveNotFoundError, extractDriveFileId } from './sheets.ts';
 import { authService } from './auth.ts';
 import { notificationService } from './emailer.ts';
 import { resolveSessionSchedule } from './sessionHelper.ts';
@@ -53,11 +53,14 @@ export class JsonResponse {
     };
   }
 
-  static unauthorized(message = 'Unauthorized'): ApiResponse {
+  static unauthorized(message = 'Unauthorized', sessionInvalidated = false): ApiResponse {
     return {
       statusCode: 401,
       headers: { 'Content-Type': 'application/json' },
-      body: { error: message },
+      body: {
+        error: message,
+        ...(sessionInvalidated ? { sessionInvalidated: true } : {}),
+      },
     };
   }
 
@@ -123,6 +126,9 @@ export class JsonResponse {
     }
     if (err instanceof ConflictError) {
       return JsonResponse.conflict(err.message, err.current);
+    }
+    if (err instanceof DriveNotFoundError) {
+      return JsonResponse.notFound(err.message);
     }
     return {
       statusCode: 500,
@@ -230,8 +236,8 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       }
 
       if (method === 'GET') {
-        const fileId = (query.id || '').trim();
-        if (!fileId || !/^[a-zA-Z0-9_-]{10,200}$/.test(fileId)) {
+        const fileId = extractDriveFileId(query.id || '');
+        if (!fileId) {
           return JsonResponse.badRequest('Parameter id file Drive tidak valid.');
         }
         const fileData = await sheetsDb.getPhotoFromDrive(fileId);
@@ -274,7 +280,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       if (!action && method === 'GET') {
         if (!token) return JsonResponse.unauthorized('Token sesi tidak ditemukan.');
         const validRes = await authService.validateActiveSession(token);
-        if (!validRes.valid) return JsonResponse.unauthorized(validRes.reason);
+        if (!validRes.valid) {
+          return JsonResponse.unauthorized(validRes.reason || 'Unauthorized', Boolean(validRes.invalidated));
+        }
         return JsonResponse.ok({ valid: true, session: validRes.session });
       }
 
@@ -865,7 +873,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       if (method === 'PUT') {
         const { id, updates, reason, expected_updated_at, forceOverwrite } = req.body;
         const validRes = await authService.validateActiveSession(token);
-        if (!validRes.valid) return JsonResponse.unauthorized();
+        if (!validRes.valid) {
+          return JsonResponse.unauthorized(validRes.reason || 'Unauthorized', Boolean(validRes.invalidated));
+        }
         const updated = await sheetsDb.updateAttendance(
           id,
           updates,
@@ -881,7 +891,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       if (method === 'DELETE') {
         const { id, reason } = req.body;
         const validRes = await authService.validateActiveSession(token);
-        if (!validRes.valid) return JsonResponse.unauthorized();
+        if (!validRes.valid) {
+          return JsonResponse.unauthorized(validRes.reason || 'Unauthorized', Boolean(validRes.invalidated));
+        }
         const success = await sheetsDb.deleteAttendance(
           id,
           validRes.session?.name || 'Petugas',
@@ -1081,7 +1093,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       if (method === 'DELETE') {
         const { id, reason } = req.body;
         const validRes = await authService.validateActiveSession(token);
-        if (!validRes.valid) return JsonResponse.unauthorized();
+        if (!validRes.valid) {
+          return JsonResponse.unauthorized(validRes.reason || 'Unauthorized', Boolean(validRes.invalidated));
+        }
         const success = await sheetsDb.deleteViolation(
           id,
           validRes.session?.name || 'Admin',
@@ -1099,7 +1113,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       }
 
       const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) return JsonResponse.unauthorized();
+      if (!validRes.valid) {
+        return JsonResponse.unauthorized(validRes.reason || 'Unauthorized', Boolean(validRes.invalidated));
+      }
 
       if (method === 'POST') {
         const vtype = req.body;
@@ -1182,7 +1198,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       }
 
       const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) return JsonResponse.unauthorized();
+      if (!validRes.valid) {
+        return JsonResponse.unauthorized(validRes.reason || 'Unauthorized', Boolean(validRes.invalidated));
+      }
       const actorName = validRes.session?.name || 'Admin';
 
       if (method === 'POST') {
@@ -1238,7 +1256,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         return JsonResponse.ok({ classes });
       }
       const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) return JsonResponse.unauthorized();
+      if (!validRes.valid) {
+        return JsonResponse.unauthorized(validRes.reason || 'Unauthorized', Boolean(validRes.invalidated));
+      }
       const actorName = validRes.session?.name || 'Admin';
 
       if (method === 'POST') {
@@ -1279,7 +1299,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         return JsonResponse.ok({ sessions });
       }
       const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) return JsonResponse.unauthorized();
+      if (!validRes.valid) {
+        return JsonResponse.unauthorized(validRes.reason || 'Unauthorized', Boolean(validRes.invalidated));
+      }
       const actorName = validRes.session?.name || 'Admin';
 
       if (method === 'POST') {
@@ -1300,7 +1322,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         return JsonResponse.ok({ settings });
       }
       const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) return JsonResponse.unauthorized();
+      if (!validRes.valid) {
+        return JsonResponse.unauthorized(validRes.reason || 'Unauthorized', Boolean(validRes.invalidated));
+      }
       const body = { ...(req.body || {}) };
       if (body.logoBase64) {
         body.logo_url = await sheetsDb.uploadPhotoToDrive(
@@ -1331,8 +1355,8 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       let actorName = 'Admin';
       if (cleanToken) {
         const validRes = await authService.validateActiveSession(cleanToken);
-        if (!validRes.valid && validRes.reason === 'Session invalidated by password or account change') {
-          return JsonResponse.unauthorized(validRes.reason);
+        if (!validRes.valid && validRes.invalidated) {
+          return JsonResponse.unauthorized(validRes.reason || 'Session invalidated', true);
         }
         if (validRes.valid && validRes.session?.name) {
           actorName = validRes.session.name;
@@ -1380,7 +1404,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
 
       if (method === 'PUT') {
         const validRes = await authService.validateActiveSession(token);
-        if (!validRes.valid) return JsonResponse.unauthorized();
+        if (!validRes.valid) {
+          return JsonResponse.unauthorized(validRes.reason || 'Unauthorized', Boolean(validRes.invalidated));
+        }
 
         const { id, status, rejectionReason, expected_updated_at, forceOverwrite } = req.body;
         const requests = await sheetsDb.getLeaveRequests();
@@ -1532,7 +1558,8 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
     if (
       err instanceof SheetsConfigError ||
       err instanceof GoogleAuthExpiredError ||
-      err instanceof ConflictError
+      err instanceof ConflictError ||
+      err instanceof DriveNotFoundError
     ) {
       return JsonResponse.serverError(err);
     }

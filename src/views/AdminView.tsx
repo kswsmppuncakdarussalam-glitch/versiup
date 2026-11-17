@@ -121,6 +121,7 @@ export const AdminView: React.FC = () => {
     speak,
     showToast,
     updateSessionToken,
+    refreshAuthSession,
     refreshFromSheets,
   } = useApp();
 
@@ -142,6 +143,7 @@ export const AdminView: React.FC = () => {
   const [editingStudent, setEditingStudent] = useState<Partial<Student> | null>(null);
   const [importRows, setImportRows] = useState<StudentImportRow[] | null>(null);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [isImportingStudents, setIsImportingStudents] = useState(false);
   const [printCardStudent, setPrintCardStudent] = useState<Student | null>(null);
   const [selectedStudentNis, setSelectedStudentNis] = useState<Set<string>>(new Set());
   const [studentSearchQuery, setStudentSearchQuery] = useState('');
@@ -268,13 +270,41 @@ export const AdminView: React.FC = () => {
     }
   };
 
-  const getAdminHeaders = (extra?: Record<string, string>): Record<string, string> => {
+  const getAdminHeaders = (extra?: Record<string, string>, overrideToken?: string): Record<string, string> => {
     const gToken = googleAccessToken || getGoogleAccessToken();
+    const appTok = overrideToken || session?.token;
     return {
-      ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+      ...(appTok ? { Authorization: `Bearer ${appTok}` } : {}),
       ...(gToken ? { 'X-Google-Access-Token': gToken } : {}),
       ...(extra || {}),
     };
+  };
+
+  const fetchAdminWithRetry = async (url: string, options: RequestInit & { extraHeaders?: Record<string, string> } = {}) => {
+    const { extraHeaders, ...rest } = options;
+    let res = await apiFetch(url, {
+      ...rest,
+      headers: getAdminHeaders(extraHeaders),
+    });
+    let data = await safeReadJson(res);
+
+    if (res.status === 401) {
+      if (data?.googleAuthExpired || data?.googleDeploymentUnauthorized) {
+        window.dispatchEvent(new CustomEvent('dkb-google-auth-expired', { detail: data }));
+        return { res, data };
+      }
+      if (session?.token) {
+        const refreshedTok = await refreshAuthSession(true);
+        if (refreshedTok) {
+          res = await apiFetch(url, {
+            ...rest,
+            headers: getAdminHeaders(extraHeaders, refreshedTok),
+          });
+          data = await safeReadJson(res);
+        }
+      }
+    }
+    return { res, data };
   };
 
   // Fetch all user accounts from server (with automatic 401 session renewal)
@@ -282,32 +312,7 @@ export const AdminView: React.FC = () => {
     if (!session?.token || configError || (needsGoogleAuth && !appsScriptUrl)) return;
     setLoadingUsers(true);
     try {
-      const res = await apiFetch('/api/auth?action=manage_accounts', {
-        headers: getAdminHeaders(),
-      });
-      const data = await safeReadJson(res);
-      if (res.status === 401 && !data?.googleAuthExpired && !data?.googleDeploymentUnauthorized) {
-        const refreshRes = await apiFetch('/api/auth?action=refresh_session', {
-          method: 'POST',
-          headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
-          body: JSON.stringify({}),
-        });
-        const refreshData = await safeReadJson(refreshRes);
-        if (refreshRes.ok && refreshData?.token) {
-          updateSessionToken(refreshData.token);
-          const retryRes = await apiFetch('/api/auth?action=manage_accounts', {
-            headers: {
-              ...getAdminHeaders(),
-              Authorization: `Bearer ${refreshData.token}`,
-            },
-          });
-          const retryData = await safeReadJson(retryRes);
-          if (retryRes.ok && Array.isArray(retryData.users)) {
-            setUsersList(retryData.users);
-          }
-          return;
-        }
-      }
+      const { res, data } = await fetchAdminWithRetry('/api/auth?action=manage_accounts');
       if (res.ok && Array.isArray(data.users)) {
         setUsersList(data.users);
       }
@@ -336,15 +341,14 @@ export const AdminView: React.FC = () => {
 
     setUpdatingPassword(true);
     try {
-      const res = await apiFetch('/api/auth?action=manage_accounts', {
+      const { res, data } = await fetchAdminWithRetry('/api/auth?action=manage_accounts', {
         method: 'POST',
-        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
+        extraHeaders: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           targetUserId: targetUser.id,
           newPassword: newPass.trim(),
         }),
       });
-      const data = await safeReadJson(res);
       if (!res.ok) {
         showToast(data.error || 'Gagal mengubah password.', 'error');
         return;
@@ -381,9 +385,9 @@ export const AdminView: React.FC = () => {
 
     setUpdatingPassword(true);
     try {
-      const res = await apiFetch('/api/auth?action=manage_accounts', {
+      const { res, data } = await fetchAdminWithRetry('/api/auth?action=manage_accounts', {
         method: 'POST',
-        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
+        extraHeaders: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           targetRole,
           newPassword: newPass.trim(),
@@ -391,7 +395,6 @@ export const AdminView: React.FC = () => {
           universalHomeroom: targetRole === 'homeroom' && classId === 'all',
         }),
       });
-      const data = await safeReadJson(res);
       if (!res.ok) {
         showToast(data.error || 'Gagal mengubah password.', 'error');
         return false;
@@ -445,15 +448,14 @@ export const AdminView: React.FC = () => {
     };
 
     try {
-      const res = await apiFetch('/api/auth?action=manage_accounts', {
+      const { res, data } = await fetchAdminWithRetry('/api/auth?action=manage_accounts', {
         method: 'POST',
-        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
+        extraHeaders: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user: payload,
           newPassword: newAccountPassword.trim(),
         }),
       });
-      const data = await safeReadJson(res);
       if (!res.ok) {
         showToast(data.error || 'Gagal membuat akun.', 'error');
         return;
@@ -484,12 +486,11 @@ export const AdminView: React.FC = () => {
     if (!confirmed) return;
 
     try {
-      const res = await apiFetch('/api/auth?action=manage_accounts', {
+      const { res, data } = await fetchAdminWithRetry('/api/auth?action=manage_accounts', {
         method: 'DELETE',
-        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
+        extraHeaders: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id }),
       });
-      const data = await safeReadJson(res);
       if (!res.ok) {
         showToast(data.error || 'Gagal menghapus akun.', 'error');
         return;
@@ -528,12 +529,20 @@ export const AdminView: React.FC = () => {
         seenNisInBatch.add(r.NIS);
 
         if (!r.Nama) errors.push('Nama wajib diisi');
-        
+
         // Auto-assign class if missing
         const kelas = r.Kelas?.trim() || fallbackClass;
 
         if (r.Email_Orang_Tua && !r.Email_Orang_Tua.includes('@')) {
           errors.push('Format email orang tua tidak valid');
+        }
+
+        const statusNorm = (r.Status_Keaktifan || '').trim().toLowerCase();
+        if (
+          statusNorm &&
+          ['nonaktif', 'non-aktif', 'tidak aktif', 'keluar', 'mutasi', 'lulus', 'alumni', 'dihapus', 'inactive', 'off', 'false', '0'].includes(statusNorm)
+        ) {
+          errors.push(`Status siswa tidak aktif (${r.Status_Keaktifan})`);
         }
 
         return {
@@ -554,77 +563,48 @@ export const AdminView: React.FC = () => {
   };
 
   const handleConfirmImport = async () => {
-    if (!importRows) return;
+    if (!importRows || isImportingStudents) return;
     const validRows = importRows.filter((r) => r.isValid);
     if (validRows.length === 0) {
       showToast('Tidak ada baris data valid untuk diimpor.', 'error');
       return;
     }
 
-    // 1. Otomatis deteksi & buat kelas baru yang belum ada di data kelas
-    const existingClassIds = new Set(classes.map((c) => c.id.toLowerCase().trim()));
-    const uniqueNewClasses = new Map<string, string>();
-    for (const r of validRows) {
-      if (r.Kelas && !existingClassIds.has(r.Kelas.toLowerCase().trim())) {
-        uniqueNewClasses.set(r.Kelas.trim(), r.Kelas.trim());
+    setIsImportingStudents(true);
+    try {
+      const nowIso = new Date().toISOString();
+      const studentsToSave: Student[] = validRows.map((r) => ({
+        nis: r.NIS,
+        nisn: r.NISN || '',
+        name: r.Nama,
+        class_id: r.Kelas.trim(),
+        gender: r.Jenis_Kelamin || 'L',
+        rfid_uid: r.UID_RFID || `RFID-${r.NIS}`,
+        card_code: r.Kode_Kartu || r.NIS,
+        photo_url: '',
+        parent_name: r.Nama_Orang_Tua || '',
+        parent_email: r.Email_Orang_Tua || '',
+        created_at: nowIso,
+        updated_at: nowIso,
+      }));
+
+      const res = await batchImportStudents(studentsToSave);
+      if (!res.success) {
+        showToast(res.error || 'Impor data siswa gagal disimpan. Periksa koneksi & coba lagi.', 'error');
+        return;
       }
-    }
 
-    // Buat kelas-kelas baru secara otomatis di basis data
-    for (const classCode of uniqueNewClasses.keys()) {
-      let grade = '10';
-      const gradeMatch = classCode.match(/^(10|11|12)/i) || classCode.match(/^(X|XI|XII)/i);
-      if (gradeMatch) {
-        const g = gradeMatch[1].toUpperCase();
-        grade = g === 'X' ? '10' : g === 'XI' ? '11' : g === 'XII' ? '12' : g;
-      }
+      setIsImportModalOpen(false);
+      setImportRows(null);
 
-      let major = '';
-      const majorParts = classCode.split('-');
-      if (majorParts.length > 1) {
-        major = majorParts[1].trim();
-      }
-
-      await saveClass({
-        id: classCode,
-        name: classCode,
-        grade,
-        major: major || 'Umum',
-        homeroom_teacher_name: `Wali Kelas ${classCode}`,
-        homeroom_teacher_email: `${classCode.toLowerCase().replace(/[^a-z0-9]/g, '.')}@sekolah.sch.id`,
-        quota_limit: 2,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      });
-    }
-
-    // 2. Simpan data seluruh siswa yang valid
-    const studentsToSave: Student[] = validRows.map((r) => ({
-      nis: r.NIS,
-      nisn: r.NISN || '',
-      name: r.Nama,
-      class_id: r.Kelas.trim(),
-      gender: r.Jenis_Kelamin || 'L',
-      rfid_uid: r.UID_RFID || `RFID-${r.NIS}`,
-      card_code: r.NIS,
-      photo_url: '',
-      parent_name: r.Nama_Orang_Tua || '',
-      parent_email: r.Email_Orang_Tua || '',
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    }));
-
-    await batchImportStudents(studentsToSave);
-    setIsImportModalOpen(false);
-    setImportRows(null);
-
-    if (uniqueNewClasses.size > 0) {
-      showToast(
-        `Impor sukses! ${studentsToSave.length} siswa tersimpan & ${uniqueNewClasses.size} kelas baru (${Array.from(uniqueNewClasses.keys()).join(', ')}) otomatis ditambahkan ke Data Kelas.`,
-        'success'
-      );
-    } else {
-      showToast(`Impor sukses! ${studentsToSave.length} data siswa berhasil disimpan.`, 'success');
+      const parts: string[] = [];
+      if (res.added > 0) parts.push(`${res.added} siswa baru`);
+      if (res.updated > 0) parts.push(`${res.updated} siswa diperbarui`);
+      if ((res.classesCreated || 0) > 0) parts.push(`${res.classesCreated} kelas baru otomatis dibuat`);
+      const summaryText = parts.length > 0 ? parts.join(', ') : `${studentsToSave.length} siswa tersimpan`;
+      showToast(`Impor sukses & tersinkron: ${summaryText}.`, 'success');
+    } finally {
+      setIsImportingStudents(false);
     }
   };
 
@@ -690,12 +670,11 @@ export const AdminView: React.FC = () => {
     setSimulationResult(null);
 
     try {
-      const res = await apiFetch('/api/simulate', {
+      const { data } = await fetchAdminWithRetry('/api/simulate', {
         method: 'POST',
-        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
+        extraHeaders: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ testType }),
       });
-      const data = await safeReadJson(res);
       setSimulationResult(data);
     } catch (err: any) {
       setSimulationResult({ error: err.message });
@@ -3688,17 +3667,24 @@ export const AdminView: React.FC = () => {
               <div className="flex gap-2">
                 <button
                   type="button"
+                  disabled={isImportingStudents}
                   onClick={() => setIsImportModalOpen(false)}
-                  className="px-3 py-1.5 text-slate-600"
+                  className="px-3 py-1.5 text-slate-600 disabled:opacity-50"
                 >
                   Batal
                 </button>
                 <button
                   type="button"
+                  disabled={isImportingStudents || importRows.filter((r) => r.isValid).length === 0}
                   onClick={handleConfirmImport}
-                  className="px-4 py-1.5 rounded bg-emerald-600 text-white font-semibold hover:bg-emerald-700"
+                  className="px-4 py-1.5 rounded bg-emerald-600 text-white font-semibold hover:bg-emerald-700 disabled:opacity-50 inline-flex items-center gap-1.5"
                 >
-                  Konfirmasi Impor ({importRows.filter((r) => r.isValid).length} Siswa)
+                  {isImportingStudents && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                  <span>
+                    {isImportingStudents
+                      ? 'Mengimpor Data...'
+                      : `Konfirmasi Impor (${importRows.filter((r) => r.isValid).length} Siswa)`}
+                  </span>
                 </button>
               </div>
             </div>
