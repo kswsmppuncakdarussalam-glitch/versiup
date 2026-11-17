@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
 import { ActiveTab } from '../../types/index.js';
+import { resolvePhotoSrc } from '../../utils/photo.js';
 import { PWAInstallButton } from '../pwa/PWAInstallButton.js';
 
 interface SidebarProps {
@@ -28,11 +29,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
     activeTab,
     setActiveTab,
     syncStatus,
+    saveStatus,
     lastSyncTime,
-    syncNow,
     logout,
     settings,
   } = useApp();
+
+  const logoSrc = resolvePhotoSrc(settings.logo_url);
 
   const handleMenuClick = (tab: ActiveTab) => {
     onClose();
@@ -65,7 +68,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
 
   return (
     <>
-      {/* Mobile Backdrop */}
       {isOpen && (
         <div
           className="fixed inset-0 z-40 bg-black/40 lg:hidden"
@@ -81,9 +83,9 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
         {/* Header / Brand */}
         <div className="flex items-center justify-between p-4 border-b border-slate-200 dark:border-slate-800">
           <div className="flex items-center gap-3 min-w-0">
-            {settings.logo_url ? (
+            {logoSrc ? (
               <img
-                src={settings.logo_url}
+                src={logoSrc}
                 alt="Logo Sekolah"
                 className="w-9 h-9 rounded-md object-contain bg-white dark:bg-slate-800 p-0.5 border border-slate-200 dark:border-slate-700 shadow-xs shrink-0"
               />
@@ -133,7 +135,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
           })}
         </nav>
 
-        {/* Footer / Sync Status & User Profile */}
+        {/* Footer / Read-only Sheets Auto-Refresh Status & User Profile */}
         <div className="p-3 border-t border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 space-y-2">
           {session?.lockedMenuRole && lockedRoleLabel && activeTab !== session.lockedMenuRole && (
             <button
@@ -149,59 +151,54 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
             </button>
           )}
 
-          {/* Real-time Sync Status indicator (Bagian 1 & 13) */}
-          <div className="flex items-center justify-between px-2 py-1.5 rounded text-[11px] bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
-            <div className="flex items-center gap-2">
-              {syncStatus === 'synced' && (
+          {/* Read-only Auto-Refresh Status indicator (No manual sync button) */}
+          <div className="flex items-center justify-between px-2.5 py-1.5 rounded text-[11px] bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+            <div className="flex items-center gap-2 min-w-0">
+              {saveStatus.state === 'saving' ? (
                 <>
-                  <span className="relative flex h-2 w-2">
+                  <RefreshCw className="w-3 h-3 text-sky-500 animate-spin shrink-0" />
+                  <span className="text-sky-600 dark:text-sky-400 font-medium truncate">Menyimpan...</span>
+                </>
+              ) : syncStatus === 'synced' ? (
+                <>
+                  <span className="relative flex h-2 w-2 shrink-0">
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                     <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                   </span>
-                  <span className="text-slate-600 dark:text-slate-300 font-medium">Tersinkron</span>
+                  <span className="text-slate-600 dark:text-slate-300 font-medium truncate">
+                    {saveStatus.state === 'saved' ? 'Tersimpan di Sheet' : 'Google Sheets Aktif'}
+                  </span>
                 </>
-              )}
-              {syncStatus === 'syncing' && (
+              ) : syncStatus === 'syncing' ? (
                 <>
-                  <RefreshCw className="w-3 h-3 text-amber-500 animate-spin" />
-                  <span className="text-amber-600 dark:text-amber-400 font-medium">Menyinkronkan...</span>
+                  <RefreshCw className="w-3 h-3 text-amber-500 animate-spin shrink-0" />
+                  <span className="text-amber-600 dark:text-amber-400 font-medium truncate">Memuat Sheets...</span>
                 </>
-              )}
-              {syncStatus === 'offline' && (
+              ) : syncStatus === 'offline' ? (
                 <>
-                  <WifiOff className="w-3 h-3 text-rose-500" />
-                  <span className="text-rose-600 dark:text-rose-400 font-medium">Offline</span>
+                  <WifiOff className="w-3 h-3 text-rose-500 shrink-0" />
+                  <span className="text-rose-600 dark:text-rose-400 font-medium truncate">Offline</span>
                 </>
-              )}
-              {syncStatus === 'error' && (
+              ) : (
                 <>
-                  <AlertCircle className="w-3 h-3 text-rose-500" />
-                  <span className="text-rose-600 dark:text-rose-400 font-medium">Gagal Sinkron</span>
+                  <AlertCircle className="w-3 h-3 text-rose-500 shrink-0" />
+                  <span className="text-rose-600 dark:text-rose-400 font-medium truncate">Koneksi Bermasalah</span>
                 </>
               )}
             </div>
-
-            <button
-              onClick={() => syncNow()}
-              title="Sinkronkan Sekarang"
-              className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors"
-            >
-              <RefreshCw className="w-3 h-3" />
-            </button>
+            <span className="text-[9px] font-mono text-slate-400 shrink-0">15d</span>
           </div>
 
           <div className="text-[10px] text-slate-400 text-center">
             {lastSyncTime
-              ? `Sinkron terakhir: ${lastSyncTime.toLocaleTimeString('id-ID')}`
-              : 'Belum sinkron'}
+              ? `Pembaruan otomatis: ${lastSyncTime.toLocaleTimeString('id-ID')}`
+              : 'Menghubungkan ke Sheets...'}
           </div>
 
-          {/* In-App PWA Offline Install Button */}
           <div className="pt-1">
             <PWAInstallButton />
           </div>
 
-          {/* User Info & Logout */}
           <div className="pt-1 flex items-center justify-between">
             <div className="min-w-0 pr-2">
               <p className="text-xs font-medium text-slate-800 dark:text-slate-200 truncate">

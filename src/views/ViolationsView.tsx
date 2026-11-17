@@ -17,6 +17,7 @@ import { useApp } from '../context/AppContext.js';
 import { CameraCaptureModal } from '../components/modals/CameraCaptureModal.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { exportToExcel } from '../utils/excel.js';
+import { resolvePhotoSrc } from '../utils/photo.js';
 import { Student, ViolationType, ViolationRecord } from '../types/index.js';
 
 export const ViolationsView: React.FC = () => {
@@ -609,7 +610,7 @@ export const ViolationsView: React.FC = () => {
                         <td className="py-2.5">
                           {v.evidence_photo_url ? (
                             <a
-                              href={v.evidence_photo_url}
+                              href={resolvePhotoSrc(v.evidence_photo_url)}
                               target="_blank"
                               rel="noreferrer"
                               className="text-blue-600 hover:underline flex items-center gap-1"
@@ -669,13 +670,13 @@ export const ViolationsView: React.FC = () => {
                       className="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden bg-slate-50 dark:bg-slate-800 flex flex-col justify-between"
                     >
                       <a
-                        href={v.evidence_photo_url}
+                        href={resolvePhotoSrc(v.evidence_photo_url)}
                         target="_blank"
                         rel="noreferrer"
                         className="block aspect-video bg-black/10 overflow-hidden"
                       >
                         <img
-                          src={v.evidence_photo_url}
+                          src={resolvePhotoSrc(v.evidence_photo_url)}
                           alt={v.type_name}
                           className="w-full h-full object-cover hover:scale-105 transition-transform"
                         />

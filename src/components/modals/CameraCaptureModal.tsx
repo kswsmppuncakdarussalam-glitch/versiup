@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Camera, RefreshCw, Upload, X, AlertCircle, Check } from 'lucide-react';
+import { compressPhotoMax800Jpeg } from '../../utils/photo.js';
 
 interface CameraCaptureModalProps {
   isOpen: boolean;
@@ -83,19 +84,25 @@ export const CameraCaptureModal: React.FC<CameraCaptureModalProps> = ({
     };
   }, [isOpen, facingMode, capturedImage]);
 
-  const handleCapture = () => {
+  const handleCapture = async () => {
     if (!videoRef.current || !canvasRef.current) return;
     const video = videoRef.current;
     const canvas = canvasRef.current;
 
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
+    const rawWidth = video.videoWidth || 640;
+    const rawHeight = video.videoHeight || 480;
+    const maxW = 800;
+    const targetW = rawWidth > maxW ? maxW : rawWidth;
+    const targetH = rawWidth > maxW ? Math.max(1, Math.round((rawHeight * maxW) / rawWidth)) : rawHeight;
+
+    canvas.width = targetW;
+    canvas.height = targetH;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+    ctx.drawImage(video, 0, 0, targetW, targetH);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
     setCapturedImage(dataUrl);
     stopCamera();
   };
@@ -112,17 +119,23 @@ export const CameraCaptureModal: React.FC<CameraCaptureModalProps> = ({
     onClose();
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const dataUrl = event.target?.result as string;
+    try {
+      const { dataUrl } = await compressPhotoMax800Jpeg(file);
       setCapturedImage(dataUrl);
       stopCamera();
-    };
-    reader.readAsDataURL(file);
+    } catch {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const dataUrl = event.target?.result as string;
+        setCapturedImage(dataUrl);
+        stopCamera();
+      };
+      reader.readAsDataURL(file);
+    }
   };
 
   const toggleCameraFacing = () => {

@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../context/AppContext.js';
 import { formatServerTime, formatIndonesianDate, LiveClockText } from '../utils/time.js';
+import { resolvePhotoSrc } from '../utils/photo.js';
 import { AttendanceNotificationModal } from '../components/modals/AttendanceNotificationModal.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { Student, AttendanceRecord, AttendanceStatus } from '../types/index.js';
@@ -254,7 +255,7 @@ export const AttendanceView: React.FC = () => {
           <div className="flex items-center gap-3.5">
             {settings.logo_url && (
               <img
-                src={settings.logo_url}
+                src={resolvePhotoSrc(settings.logo_url)}
                 alt="Logo Sekolah"
                 className="w-12 h-12 rounded-lg object-contain bg-white dark:bg-slate-800 p-1 border border-slate-200 dark:border-slate-700 shadow-xs shrink-0"
               />
@@ -656,7 +657,7 @@ export const AttendanceView: React.FC = () => {
                   >
                     <div className="w-8 h-8 rounded-full border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 flex items-center justify-center font-bold text-slate-700 dark:text-slate-300 overflow-hidden shrink-0">
                       {student?.photo_url ? (
-                        <img src={student.photo_url} alt={student.name} className="w-full h-full object-cover" />
+                        <img src={resolvePhotoSrc(student.photo_url)} alt={student.name} className="w-full h-full object-cover" />
                       ) : (
                         student?.name.slice(0, 2).toUpperCase() || '!'
                       )}

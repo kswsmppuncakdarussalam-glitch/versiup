@@ -76,14 +76,15 @@ Aplikasi Web Presensi dan Kedisiplinan Siswa Sekolah berbasis React + Vite + Typ
 
 Aplikasi ini telah dirancang dengan arsitektur serverless function di folder `/api` dan konfigurasi `vercel.json`:
 
-1. Hubungkan repositori ke **Vercel**.
-2. Masukkan Environment Variables di Vercel Dashboard (*Settings ➔ Environment Variables*):
-   - `GOOGLE_SERVICE_ACCOUNT_EMAIL`
-   - `GOOGLE_PRIVATE_KEY` (Pastikan karakter `\n` ditangani dengan baik)
-   - `SPREADSHEET_ID`
-   - `DRIVE_FOLDER_ID`
-   - `JWT_SECRET`
+1. Siapkan **Google Cloud Service Account** (aktifkan *Google Sheets API* & *Google Drive API*, lalu unduh kunci JSON).
+2. Buat 1 **Google Spreadsheet** kosong & 1 **Folder Google Drive** privat, lalu **Bagikan (Share)** keduanya ke `client_email` Service Account sebagai **Editor**.
+3. Hubungkan repositori ke **Vercel** dan isi **Environment Variables** pada *Settings ➔ Environment Variables*:
+   - `GOOGLE_SERVICE_ACCOUNT_EMAIL` (`client_email` dari file JSON Service Account)
+   - `GOOGLE_PRIVATE_KEY` (`private_key` dari file JSON Service Account)
+   - `SPREADSHEET_ID` (ID Spreadsheet dari URL `https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit`)
+   - `DRIVE_FOLDER_ID` (ID Folder Drive dari URL `https://drive.google.com/drive/folders/<DRIVE_FOLDER_ID>`)
+   - `JWT_SECRET` (string acak rahasia untuk token sesi)
    - *(Opsional untuk email)* `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `MAIL_FROM_NAME`
-3. Klik **Deploy**. Vercel akan otomatis menjalankan `npm run build` dan memetakan `/api/*.ts` sebagai Serverless Functions.
+4. Klik **Deploy**. Vercel akan otomatis menjalankan `npm run build` dan memetakan `/api/index.ts` sebagai Serverless Function.
 
-*Catatan:* Bila kredensial Google Sheets belum diisi, aplikasi secara cerdas beralih ke penyimpanan lokal `.data/database.json` sehingga aplikasi tetap 100% fungsional untuk pengujian dan demonstrasi.
+*Catatan:* Demi keamanan, seluruh kredensial hanya disimpan di environment variable server dan foto disimpan di folder Drive privat melalui proxy `/api/photos?id=<fileId>`.

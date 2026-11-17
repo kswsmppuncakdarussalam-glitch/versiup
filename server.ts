@@ -1,7 +1,7 @@
+import 'dotenv/config';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { handleVercelRequest } from './server/vercelHandler.ts';
-import { runBootCloudSync } from './server/apiRouter.ts';
 
 const app = express();
 const PORT = 3000;
@@ -10,8 +10,8 @@ const PORT = 3000;
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
-// Forward all /api/* requests to the API router
-app.all('/api/*', async (req, res) => {
+// Forward all /api and /api/* requests to the API router
+app.all(['/api', '/api/*'], async (req, res) => {
   try {
     await handleVercelRequest(req, res);
   } catch (err: any) {
@@ -41,11 +41,7 @@ async function init() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Disiplin Kita Bisa dev server running at http://0.0.0.0:${PORT}`);
-    // Non-blocking boot-time cloud restore & sync (t = 0)
-    runBootCloudSync().catch((err) => {
-      console.warn('[Boot Cloud Sync Skipped]:', err?.message || err);
-    });
+    console.log(`Disiplin Kita Bisa server running at http://0.0.0.0:${PORT}`);
   });
 }
 

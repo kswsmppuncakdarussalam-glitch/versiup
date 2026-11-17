@@ -11,9 +11,12 @@ import {
   Calendar,
   User,
   RefreshCw,
+  CheckCircle2,
+  AlertCircle,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
-import { formatServerTime, formatIndonesianDate, LiveClockText } from '../../utils/time.js';
+import { formatIndonesianDate, LiveClockText } from '../../utils/time.js';
+import { resolvePhotoSrc } from '../../utils/photo.js';
 import { PWAInstallButton } from '../pwa/PWAInstallButton.js';
 
 interface HeaderProps {
@@ -33,27 +36,13 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
     lockCurrentMenu,
     settings,
     updateSettings,
-    googleOAuthActive,
-    serverDriveSyncActive,
-    googleSyncing,
-    googleAutoRefreshing,
-    googleNeedsInteractiveReauth,
-    syncGoogleSheetsNow,
-    permanentDriveSync,
     syncStatus,
-    syncNow,
-    serverVersion,
+    saveStatus,
+    envStatus,
   } = useApp();
 
-  const isAutoDriveActive = permanentDriveSync || googleOAuthActive || serverDriveSyncActive;
-  const isCloudConfiguredInDb = Boolean(
-    settings.google_oauth_connected ||
-      (settings.google_client_id?.trim() &&
-        settings.google_account_email?.trim() &&
-        (settings.google_sheet_id?.trim() || settings.google_drive_folder_id?.trim()))
-  );
-
   const isLockedMenuOpen = Boolean(session?.lockedMenuRole);
+  const logoSrc = resolvePhotoSrc(settings.logo_url);
 
   const toggleSound = () => {
     updateSettings({ tts_enabled: !settings.tts_enabled });
@@ -72,9 +61,9 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
 
         {/* Mobile School Logo & Title */}
         <div className="flex items-center gap-2 lg:hidden">
-          {settings.logo_url ? (
+          {logoSrc ? (
             <img
-              src={settings.logo_url}
+              src={logoSrc}
               alt="Logo"
               className="w-6 h-6 rounded object-contain bg-white dark:bg-slate-800 p-0.5 border border-slate-200 dark:border-slate-700"
             />
@@ -147,102 +136,56 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
         </div>
       </div>
 
-      {/* Right: Server Clock, Kiosk mode, Audio toggle, Lock indicator */}
+      {/* Right: Read-only Write/Sheets Status, Server Clock, Kiosk mode, Audio toggle */}
       <div className="flex items-center gap-2 sm:gap-3">
-        {/* In-App PWA Offline Install Button */}
         <PWAInstallButton compact={true} />
 
-        {/* Real-time Multi-Device Sync Indicator */}
-        <button
-          onClick={() => syncNow()}
-          title={
-            syncStatus === 'synced'
-              ? `Multi-Device Sinkron Real-Time Aktif (Versi Data: v${serverVersion}). Klik untuk sinkronkan manual.`
-              : syncStatus === 'syncing'
-              ? 'Sedang menyinkronkan data multi-perangkat...'
-              : syncStatus === 'offline'
-              ? 'Mode Offline Lokal Aktif'
-              : 'Sinkronisasi tertunda (Klik untuk mencoba lagi)'
-          }
-          className={`flex items-center gap-1.5 px-2 py-1 rounded text-[11px] border font-medium transition-all ${
-            syncStatus === 'synced'
+        {/* Read-only Write Status Pill ('Menyimpan...' / 'Tersimpan' / Error) */}
+        {saveStatus.state !== 'idle' && (
+          <div
+            className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-semibold border ${
+              saveStatus.state === 'saving'
+                ? 'bg-sky-50 dark:bg-sky-950/30 text-sky-700 dark:text-sky-300 border-sky-200 dark:border-sky-800'
+                : saveStatus.state === 'saved'
+                ? 'bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                : 'bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-300 border-rose-200 dark:border-rose-800'
+            }`}
+          >
+            {saveStatus.state === 'saving' && <RefreshCw className="w-3 h-3 animate-spin" />}
+            {saveStatus.state === 'saved' && <CheckCircle2 className="w-3 h-3" />}
+            {saveStatus.state === 'error' && <AlertCircle className="w-3 h-3" />}
+            <span className="max-w-[140px] truncate">{saveStatus.message}</span>
+          </div>
+        )}
+
+        {/* Read-only Google Sheets Direct API Status (Auto-refresh 15s) */}
+        <div
+          title="Membaca dan menulis langsung ke Google Sheets API v4 & Drive v3 Service Account (refresh otomatis tiap 15 detik)."
+          className={`hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border ${
+            !envStatus.sheetsConfigured
+              ? 'bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800'
+              : syncStatus === 'synced'
               ? 'bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800'
               : syncStatus === 'syncing'
-              ? 'bg-sky-50 dark:bg-sky-950/30 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800 animate-pulse'
+              ? 'bg-sky-50 dark:bg-sky-950/30 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800'
               : syncStatus === 'offline'
               ? 'bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800'
               : 'bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-800'
           }`}
         >
-          <span
-            className={`w-1.5 h-1.5 rounded-full ${
-              syncStatus === 'synced'
-                ? 'bg-emerald-500'
-                : syncStatus === 'syncing'
-                ? 'bg-sky-500 animate-ping'
-                : syncStatus === 'offline'
-                ? 'bg-amber-500'
-                : 'bg-rose-500'
-            }`}
-          />
-          <span className="hidden sm:inline">
-            {syncStatus === 'synced'
-              ? `Real-Time (v${serverVersion})`
+          <Database className="w-3 h-3" />
+          <span>
+            {!envStatus.sheetsConfigured
+              ? 'Sheets Belum Diset'
+              : syncStatus === 'synced'
+              ? 'Sheets Langsung (Auto 15d)'
               : syncStatus === 'syncing'
-              ? 'Sinkron...'
+              ? 'Memuat Sheets...'
               : syncStatus === 'offline'
-              ? 'Offline'
-              : 'Coba Ulang'}
+              ? 'Offline Lokal'
+              : 'Gangguan Koneksi'}
           </span>
-          <span className="sm:hidden font-mono text-[10px]">
-            v{serverVersion}
-          </span>
-        </button>
-
-        {/* Google Drive & Sheets Auto-Sync Status Pill */}
-        {googleSyncing || googleAutoRefreshing ? (
-          <div
-            title="Menyinkronkan data ke Google Drive & Google Sheets secara otomatis..."
-            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-sky-50 dark:bg-sky-950/30 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800"
-          >
-            <RefreshCw className="w-3 h-3 animate-spin" />
-            <span>{googleAutoRefreshing ? 'Menyegarkan Sesi Google...' : 'Sinkron Otomatis...'}</span>
-          </div>
-        ) : isAutoDriveActive ? (
-          <button
-            type="button"
-            onClick={() => syncGoogleSheetsNow()}
-            title={`Sinkronisasi otomatis aktif penuh (${settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}). Email, Database, Google Drive & Sheets langsung tersinkron setiap perubahan.`}
-            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:hover:bg-emerald-950/50 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800 transition-colors"
-          >
-            <Database className="w-3 h-3" />
-            <span>Auto-Sync Drive &amp; Sheets Aktif</span>
-          </button>
-        ) : (settings.google_oauth_connected || isCloudConfiguredInDb) && !googleNeedsInteractiveReauth ? (
-          <button
-            type="button"
-            onClick={() => syncGoogleSheetsNow()}
-            title={`Database Server, Sesi & Email (${settings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com'}) sinkron otomatis. Klik untuk sinkronisasi Google Drive & Sheets sekarang.`}
-            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:hover:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800 transition-colors"
-          >
-            <Database className="w-3 h-3" />
-            <span>Auto-Sync Mandiri • Drive</span>
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={() => syncGoogleSheetsNow()}
-            title={
-              googleNeedsInteractiveReauth
-                ? 'Database & Email tetap sinkron otomatis. Klik untuk memperbarui sesi Google Drive & Sheets.'
-                : 'Database & Email tetap sinkron otomatis. Klik untuk menghubungkan Google Drive & Sheets.'
-            }
-            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border-slate-300 dark:border-slate-700 transition-colors"
-          >
-            <Database className="w-3 h-3" />
-            <span>{googleNeedsInteractiveReauth ? 'Perbarui Sesi Google' : 'Hubungkan Google Drive'}</span>
-          </button>
-        )}
+        </div>
 
         {/* Date & Server Authoritative Clock */}
         <div className="flex items-center gap-2 px-2.5 py-1 rounded bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 text-xs">

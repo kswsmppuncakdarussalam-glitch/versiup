@@ -1,6 +1,6 @@
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import { storage } from './storage.ts';
+import { sheetsDb } from './sheets.ts';
 import type { UserRole } from './types.ts';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'disiplin-kita-bisa-secure-secret-key-2026';
@@ -51,12 +51,12 @@ export class AuthService {
       };
     }
 
-    const dutyUsers = await storage.findDutyUsers();
+    const dutyUsers = await sheetsDb.findDutyUsers();
     let matchedUser = dutyUsers.find((u) => bcrypt.compareSync(password, u.password_hash));
 
     // Also allow admin password to open duty session if needed
     if (!matchedUser) {
-      const adminUser = await storage.findUserByRole('admin');
+      const adminUser = await sheetsDb.findUserByRole('admin');
       if (adminUser && bcrypt.compareSync(password, adminUser.password_hash)) {
         matchedUser = adminUser;
       }
@@ -105,11 +105,11 @@ export class AuthService {
     const session = rawSession ? sanitizePayloadForSigning(rawSession) : null;
 
     const cleanName = (name || '').trim().toLowerCase();
-    const users = await storage.getUsers();
+    const users = await sheetsDb.getUsers();
     const homeroomUsers = users.filter((u) => u.role === 'homeroom' && u.is_active);
 
-    const adminUser = await storage.findUserByRole('admin');
-    const classes = await storage.getClasses();
+    const adminUser = await sheetsDb.findUserByRole('admin');
+    const classes = await sheetsDb.getClasses();
 
     // Match by name
     let matchedUser = homeroomUsers.find(
@@ -167,7 +167,7 @@ export class AuthService {
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         };
-        await storage.saveUser(newHrUser);
+        await sheetsDb.saveUser(newHrUser);
         matchedUser = newHrUser;
       }
     }
@@ -213,8 +213,8 @@ export class AuthService {
     const rawSession = currentSessionToken ? this.verifyToken(currentSessionToken) : null;
     const session = rawSession ? sanitizePayloadForSigning(rawSession) : null;
 
-    const saUser = await storage.findUserByRole('student_affairs');
-    const adminUser = await storage.findUserByRole('admin');
+    const saUser = await sheetsDb.findUserByRole('student_affairs');
+    const adminUser = await sheetsDb.findUserByRole('admin');
 
     const isValid = (saUser && bcrypt.compareSync(password, saUser.password_hash)) ||
                     (adminUser && bcrypt.compareSync(password, adminUser.password_hash));
@@ -245,7 +245,7 @@ export class AuthService {
     const rawSession = currentSessionToken ? this.verifyToken(currentSessionToken) : null;
     const session = rawSession ? sanitizePayloadForSigning(rawSession) : null;
 
-    const adminUser = await storage.findUserByRole('admin');
+    const adminUser = await sheetsDb.findUserByRole('admin');
     if (!adminUser || !bcrypt.compareSync(password, adminUser.password_hash)) {
       return { success: false, error: 'Password admin salah.' };
     }
@@ -295,7 +295,7 @@ export class AuthService {
       return { valid: false, reason: 'Invalid or expired token' };
     }
 
-    const users = await storage.getUsers();
+    const users = await sheetsDb.getUsers();
     const user = users.find((u) => u.id === session.userId);
     if (!user || !user.is_active) {
       return { valid: false, reason: 'User not found or inactive' };

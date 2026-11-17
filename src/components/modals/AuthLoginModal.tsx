@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Eye, EyeOff, Lock, ShieldAlert, GraduationCap, Sliders, AlertCircle, X } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
+import { resolvePhotoSrc } from '../../utils/photo.js';
 
 export const DutyLoginScreen: React.FC = () => {
   const { loginDuty, unlockHomeroom, unlockStudentAffairs, unlockAdmin, settings, classes } = useApp();
@@ -71,7 +72,7 @@ export const DutyLoginScreen: React.FC = () => {
         <div className="text-center mb-5">
           {settings.logo_url ? (
             <img
-              src={settings.logo_url}
+              src={resolvePhotoSrc(settings.logo_url)}
               alt="Logo Sekolah"
               className="inline-block w-14 h-14 rounded-xl object-contain bg-white dark:bg-slate-800 p-1 border border-slate-200 dark:border-slate-700 shadow-sm mb-2"
             />

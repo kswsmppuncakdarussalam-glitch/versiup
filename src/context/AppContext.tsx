@@ -3,6 +3,8 @@ import {
   AuthSession,
   ActiveTab,
   SyncStatus,
+  SaveStatusState,
+  ConflictState,
   AppSettings,
   SchoolClass,
   AttendanceSession,
@@ -15,25 +17,11 @@ import {
   NotificationSettings,
   NotificationLog,
   AuditLog,
-  DeltaChange,
 } from '../types/index.js';
 import { setServerClockOffset, getServerNow } from '../utils/time.js';
 import { resolveSessionSchedule, SessionScheduleState } from '../utils/sessionHelper.js';
 import { soundEffects } from '../utils/audio.js';
 import { ttsService } from '../utils/tts.js';
-import {
-  initGoogleAuth,
-  signInWithGoogle,
-  disconnectGoogleAccount,
-  syncAllDataToDriveAndSheets,
-  hasRealSyncData,
-  getAccessToken,
-  hasValidGoogleToken,
-  getTokenExpiresInSeconds,
-  setCustomGoogleClientId,
-  registerGoogleClientIdToJs,
-  ConnectedGoogleAccount,
-} from '../utils/googleWorkspace.js';
 
 interface ToastNotification {
   id: string;
@@ -41,13 +29,46 @@ interface ToastNotification {
   type: 'success' | 'error' | 'info';
 }
 
+export interface OfflineAttendanceScan {
+  localId: string;
+  code?: string;
+  studentId?: string;
+  sessionId?: string;
+  status?: string;
+  notes?: string;
+  method?: string;
+  manualOverride?: boolean;
+  photoBase64?: string;
+  photoFileName?: string;
+  queuedAt: string;
+}
+
+const OFFLINE_SCANS_KEY = 'dkb_offline_attendance_scans';
+const AUTO_REFRESH_INTERVAL_MS = 15000;
+const SCAN_BATCH_WINDOW_MS = 3000;
+
+export interface EnvConfigStatus {
+  configured: boolean;
+  sheetsConfigured: boolean;
+  driveConfigured: boolean;
+  spreadsheetConfigured: boolean;
+  driveFolderConfigured: boolean;
+  missingEnv: string[];
+}
+
 interface AppContextType {
   session: AuthSession | null;
   activeTab: ActiveTab;
   setActiveTab: (tab: ActiveTab) => void;
   syncStatus: SyncStatus;
+  saveStatus: SaveStatusState;
   isInitialLoading: boolean;
   initialLoadError: string | null;
+  configError: string | null;
+  missingEnv: string[];
+  envStatus: EnvConfigStatus;
+  conflictPrompt: ConflictState | null;
+  dismissConflictPrompt: () => void;
   lastSyncTime: Date | null;
   currentServerTime: Date;
   activeSession: AttendanceSession | null;
@@ -61,42 +82,9 @@ interface AppContextType {
   setManualSessionOverride: (sessionId: string | null) => void;
   isKioskFullscreen: boolean;
   toggleKioskFullscreen: () => void;
+  pendingOfflineScansCount: number;
 
-  // Google Workspace & Email Integration
-  googleAccount: ConnectedGoogleAccount | null;
-  googleSyncing: boolean;
-  googleAutoRefreshing: boolean;
-  googleNeedsInteractiveReauth: boolean;
-  googleOAuthActive: boolean;
-  serverDriveSyncActive: boolean;
-  permanentDriveSync: boolean;
-  driveSyncMode: 'service_account' | 'apps_script' | 'oauth_session' | 'none';
-  driveBridgeStatus: {
-    permanentAutoSync: boolean;
-    mode: 'service_account' | 'apps_script' | 'oauth_session' | 'none';
-    serviceAccountConfigured: boolean;
-    serviceAccountEmail: string;
-    appsScriptConfigured: boolean;
-    appsScriptUrlMasked: string;
-    oauthActive: boolean;
-    oauthExpired: boolean;
-    oauthEmail: string;
-  } | null;
-  refreshDriveBridgeStatus: () => Promise<void>;
-  saveDriveBridgeConfig: (payload: {
-    mode: 'service_account' | 'apps_script';
-    serviceAccountJson?: string;
-    clientEmail?: string;
-    privateKey?: string;
-    appsScriptUrl?: string;
-  }) => Promise<{ success: boolean; error?: string }>;
-  removeDriveBridgeConfig: (mode?: 'service_account' | 'apps_script') => Promise<boolean>;
-  connectGoogle: (promptSelect?: boolean, emailHint?: string, overrideClientId?: string) => Promise<{ success: boolean; error?: string }>;
-  disconnectGoogle: () => Promise<void>;
-  linkEmailDirectly: (email: string, name?: string) => Promise<{ success: boolean; error?: string }>;
-  syncGoogleSheetsNow: (emailHint?: string, overrideClientId?: string) => Promise<{ success: boolean; rowsUpdated?: number; error?: string }>;
-
-  // Data
+  // Data directly loaded from Google Sheets
   settings: AppSettings;
   classes: SchoolClass[];
   sessions: AttendanceSession[];
@@ -109,8 +97,6 @@ interface AppContextType {
   notificationSettings: NotificationSettings;
   notificationLogs: NotificationLog[];
   auditLogs: AuditLog[];
-  serverVersion: number;
-  googleSheetsConnected: boolean;
 
   // Actions
   loginDuty: (password: string) => Promise<{ success: boolean; error?: string; remainingAttempts?: number; lockedForSeconds?: number }>;
@@ -120,20 +106,54 @@ interface AppContextType {
   lockCurrentMenu: () => void;
   logout: () => void;
   updateSessionToken: (newToken: string) => void;
-  syncNow: () => Promise<void>;
+  refreshFromSheets: (silent?: boolean) => Promise<void>;
 
-  // Mutators
-  recordAttendance: (params: { code?: string; studentId?: string; sessionId?: string; status?: string; notes?: string; method?: string }) => Promise<{ success: boolean; record?: AttendanceRecord; student?: Student; session?: AttendanceSession; error?: string; isDuplicate?: boolean }>;
+  // Mutators (Direct to Google Sheets API v4 / Drive v3)
+  recordAttendance: (params: {
+    code?: string;
+    studentId?: string;
+    sessionId?: string;
+    status?: string;
+    notes?: string;
+    method?: string;
+    photoBase64?: string;
+    photoFileName?: string;
+  }) => Promise<{
+    success: boolean;
+    record?: AttendanceRecord;
+    student?: Student;
+    session?: AttendanceSession;
+    error?: string;
+    isDuplicate?: boolean;
+    offlineQueued?: boolean;
+  }>;
   updateAttendance: (id: string, updates: Partial<AttendanceRecord>, reason: string) => Promise<boolean>;
   deleteAttendance: (id: string, reason: string) => Promise<boolean>;
 
-  startOutOfClass: (studentId: string, type: 'BAK' | 'BAB' | 'Keperluan Lain', durationMinutes: number) => Promise<{ success: boolean; record?: OutOfClassRecord; student?: Student; error?: string }>;
-  confirmOutOfClassReturn: (id: string, returnMethod?: 'click' | 'manual', notes?: string, auditReason?: string) => Promise<{ success: boolean; record?: OutOfClassRecord; error?: string }>;
+  startOutOfClass: (
+    studentId: string,
+    type: 'BAK' | 'BAB' | 'Keperluan Lain',
+    durationMinutes: number
+  ) => Promise<{ success: boolean; record?: OutOfClassRecord; student?: Student; error?: string }>;
+  confirmOutOfClassReturn: (
+    id: string,
+    returnMethod?: 'click' | 'manual',
+    notes?: string,
+    auditReason?: string
+  ) => Promise<{ success: boolean; record?: OutOfClassRecord; error?: string }>;
 
-  recordViolation: (params: { studentId: string; violationTypeId: string; customPoints?: number; notes?: string; location?: string; evidenceBase64?: string; evidenceFileName?: string }) => Promise<{ success: boolean; violation?: ViolationRecord; studentTotalPoints?: number; error?: string }>;
+  recordViolation: (params: {
+    studentId: string;
+    violationTypeId: string;
+    customPoints?: number;
+    notes?: string;
+    location?: string;
+    evidenceBase64?: string;
+    evidenceFileName?: string;
+  }) => Promise<{ success: boolean; violation?: ViolationRecord; studentTotalPoints?: number; error?: string }>;
   deleteViolation: (id: string, reason: string) => Promise<boolean>;
 
-  saveStudent: (student: Student) => Promise<boolean>;
+  saveStudent: (student: Student & { photoBase64?: string }) => Promise<boolean>;
   deleteStudent: (nis: string) => Promise<boolean>;
   deleteStudents: (nisses: string[]) => Promise<boolean>;
   clearAllStudents: () => Promise<boolean>;
@@ -148,7 +168,7 @@ interface AppContextType {
   saveViolationType: (vt: ViolationType) => Promise<boolean>;
   deleteViolationType: (id: string) => Promise<boolean>;
 
-  updateSettings: (updates: Partial<AppSettings>, options?: { silent?: boolean }) => Promise<boolean>;
+  updateSettings: (updates: Partial<AppSettings> & { logoBase64?: string }, options?: { silent?: boolean }) => Promise<boolean>;
   updateNotificationSettings: (updates: Partial<NotificationSettings>, options?: { silent?: boolean }) => Promise<boolean>;
   sendTestEmail: (email: string) => Promise<{ success: boolean; message: string }>;
   sendWeeklyRecap: (classId?: string) => Promise<{ success: boolean; message: string; results?: any; sent?: boolean; recipient?: string }>;
@@ -163,7 +183,7 @@ interface AppContextType {
 }
 
 const defaultSettings: AppSettings = {
-  school_name: 'SMP Puncak Darussalam',
+  school_name: 'DISIPLIN KITA BISA — SMK NEGERI',
   logo_url: '',
   background_url: '',
   accent_color: '#0f172a',
@@ -184,15 +204,12 @@ const defaultSettings: AppSettings = {
   out_of_class_max_per_student_daily: 2,
   out_of_class_bak_duration: 5,
   out_of_class_bab_duration: 10,
-  out_of_class_other_duration: 2,
+  out_of_class_other_duration: 15,
   toggle_allow_edit_violation_points: true,
   toggle_email_notifications: true,
   toggle_kiosk_mode: false,
   auto_session_switch: true,
   auto_session_switch_notify: true,
-  google_account_email: 'kswsmp.puncakdarussalam@gmail.com',
-  google_account_name: 'Kesiswaan SMP Puncak Darussalam',
-  google_client_id: '1050818791896-mi4qsashp76oedjfgqiagmph04osv40b.apps.googleusercontent.com',
   updated_at: new Date().toISOString(),
 };
 
@@ -207,7 +224,7 @@ const defaultNotificationSettings: NotificationSettings = {
   warning_threshold_points: 25,
   subject_template: 'Pemberitahuan Kedisiplinan Siswa: {nama_siswa} ({kelas})',
   body_template: 'Yth. Orang Tua / Wali dari {nama_siswa},\n\nKami menginformasikan bahwa siswa tercatat: {status}.\n\n{nama_sekolah}',
-  weekly_recap_enabled: true,
+  weekly_recap_enabled: false,
   weekly_recap_day: 5,
   weekly_recap_time: '15:00',
   weekly_recap_last_sent: undefined,
@@ -216,21 +233,32 @@ const defaultNotificationSettings: NotificationSettings = {
 
 const AppContext = createContext<AppContextType | null>(null);
 
-function getCachedData<T>(key: string, fallback: T): T {
+function readOfflineScans(): OfflineAttendanceScan[] {
   try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
+    const raw = localStorage.getItem(OFFLINE_SCANS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
-    return fallback;
+    return [];
   }
+}
+
+function writeOfflineScans(list: OfflineAttendanceScan[]): void {
+  try {
+    if (list.length === 0) {
+      localStorage.removeItem(OFFLINE_SCANS_KEY);
+    } else {
+      localStorage.setItem(OFFLINE_SCANS_KEY, JSON.stringify(list));
+    }
+  } catch {}
 }
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [session, setSession] = useState<AuthSession | null>(() => {
     try {
       const saved = localStorage.getItem('dkb_session');
-      if (!saved) return null;
-      return JSON.parse(saved);
+      return saved ? JSON.parse(saved) : null;
     } catch {
       return null;
     }
@@ -251,59 +279,39 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return 'attendance';
   });
 
-  // Preserve activeTab in localStorage; protected role routes require matching role from initial login
   const setActiveTab = useCallback((newTab: ActiveTab) => {
     try {
       localStorage.setItem('dkb_active_tab', newTab);
     } catch {}
     setActiveTabState(newTab);
   }, []);
-  const [syncStatus, setSyncStatus] = useState<SyncStatus>(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'synced');
-  const [lastSyncTime, setLastSyncTime] = useState<Date | null>(new Date());
+
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>(
+    typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'synced'
+  );
+  const [saveStatus, setSaveStatus] = useState<SaveStatusState>({ state: 'idle', message: '' });
+  const saveResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const [isInitialLoading, setIsInitialLoading] = useState<boolean>(true);
+  const [initialLoadError, setInitialLoadError] = useState<string | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [missingEnv, setMissingEnv] = useState<string[]>([]);
+  const [envStatus, setEnvStatus] = useState<EnvConfigStatus>({
+    configured: false,
+    sheetsConfigured: false,
+    driveConfigured: false,
+    spreadsheetConfigured: false,
+    driveFolderConfigured: false,
+    missingEnv: [],
+  });
+  const [conflictPrompt, setConflictPrompt] = useState<ConflictState | null>(null);
+  const dismissConflictPrompt = useCallback(() => setConflictPrompt(null), []);
+
+  const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
   const [currentServerTime, setCurrentServerTime] = useState<Date>(getServerNow());
-  const [serverVersion, setServerVersion] = useState<number>(() => getCachedData('dkb_cache_version', 0));
-  const [googleSheetsConnected, setGoogleSheetsConnected] = useState<boolean>(() => {
-    const cached = getCachedData<AppSettings>('dkb_cache_settings', defaultSettings);
-    return Boolean(
-      cached.google_oauth_connected ||
-        cached.google_account_email ||
-        cached.google_sheet_id ||
-        cached.google_drive_folder_id ||
-        hasValidGoogleToken()
-    );
-  });
-  const [googleAccount, setGoogleAccount] = useState<ConnectedGoogleAccount | null>(() => {
-    const cached = getCachedData<AppSettings>('dkb_cache_settings', defaultSettings);
-    if (!cached.google_account_email) return null;
-    return {
-      email: cached.google_account_email,
-      name: cached.google_account_name || 'Kesiswaan SMP Puncak Darussalam',
-      photo: cached.google_account_photo || undefined,
-      uid: 'saved_google_account',
-      connectedAt: cached.google_last_synced_at || '2026-11-10T09:38:00.000Z',
-    };
-  });
-  const [googleSyncing, setGoogleSyncing] = useState<boolean>(false);
-  const [googleAutoRefreshing, setGoogleAutoRefreshing] = useState<boolean>(false);
-  const [googleNeedsInteractiveReauth, setGoogleNeedsInteractiveReauth] = useState<boolean>(false);
-  const [googleOAuthActive, setGoogleOAuthActive] = useState<boolean>(() => hasValidGoogleToken());
-  const [serverDriveSyncActive, setServerDriveSyncActive] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('dkb_cache_server_drive_active') === 'true';
-    } catch {
-      return false;
-    }
-  });
-  const [permanentDriveSync, setPermanentDriveSync] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('dkb_cache_permanent_drive_sync') === 'true';
-    } catch {
-      return false;
-    }
-  });
-  const [driveSyncMode, setDriveSyncMode] = useState<'service_account' | 'apps_script' | 'oauth_session' | 'none'>('none');
-  const [driveBridgeStatus, setDriveBridgeStatus] = useState<AppContextType['driveBridgeStatus']>(null);
   const [isKioskFullscreen, setIsKioskFullscreen] = useState<boolean>(false);
+  const [pendingOfflineScansCount, setPendingOfflineScansCount] = useState<number>(() => readOfflineScans().length);
+
   const [manualSessionOverrideId, setManualSessionOverrideId] = useState<string | null>(() => {
     try {
       return localStorage.getItem('dkb_manual_session_override') || null;
@@ -319,2072 +327,696 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const prevLiveSessionIdRef = useRef<string | null>(null);
   const prevLiveSessionNameRef = useRef<string | null>(null);
 
-  // Core Data States with Instant Offline Persistence
-  const [settings, setSettings] = useState<AppSettings>(() => getCachedData('dkb_cache_settings', defaultSettings));
-  const [classes, setClasses] = useState<SchoolClass[]>(() => getCachedData('dkb_cache_classes', []));
-  const [sessions, setSessions] = useState<AttendanceSession[]>(() => getCachedData('dkb_cache_sessions', []));
-  const [students, setStudents] = useState<Student[]>(() => getCachedData('dkb_cache_students', []));
-  const [violationTypes, setViolationTypes] = useState<ViolationType[]>(() => getCachedData('dkb_cache_violation_types', []));
-  const [attendance, setAttendance] = useState<AttendanceRecord[]>(() => getCachedData('dkb_cache_attendance', []));
-  const [outOfClass, setOutOfClass] = useState<OutOfClassRecord[]>(() => getCachedData('dkb_cache_out_of_class', []));
-  const [violations, setViolations] = useState<ViolationRecord[]>(() => getCachedData('dkb_cache_violations', []));
-  const [leaveRequests, setLeaveRequests] = useState<LeaveRequest[]>(() => getCachedData('dkb_cache_leave_requests', []));
-  const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(() => getCachedData('dkb_cache_notification_settings', defaultNotificationSettings));
-
-  // Initialize Google Auth state listener
-  useEffect(() => {
-    const unsub = initGoogleAuth(
-      (user) => {
-        setGoogleAccount({
-          email: user.email || settings.google_account_email || '',
-          name: user.displayName || user.email || settings.google_account_name || 'Admin Google',
-          photo: user.photoURL || settings.google_account_photo || undefined,
-          uid: user.uid || 'google_user',
-          connectedAt: new Date().toISOString(),
-        });
-        setGoogleSheetsConnected(true);
-      },
-      () => {
-        if (settings.google_account_email) {
-          setGoogleAccount((prev) => prev || {
-            email: settings.google_account_email || '',
-            name: settings.google_account_name || 'Kesiswaan SMP Puncak Darussalam',
-            photo: settings.google_account_photo || undefined,
-            uid: 'saved_google_account',
-            connectedAt: settings.google_last_synced_at || '2026-11-10T09:38:00.000Z',
-          });
-        }
-        setGoogleSheetsConnected(
-          Boolean(
-            settings.google_oauth_connected ||
-              settings.google_account_email ||
-              settings.google_sheet_id ||
-              hasValidGoogleToken()
-          )
-        );
-      }
-    );
-    return () => {
-      unsub();
-    };
-  }, [settings.google_account_email, settings.google_account_name, settings.google_account_photo, settings.google_oauth_connected, settings.google_sheet_id, settings.google_last_synced_at]);
-
-  // Hydrate Google account state from persistent settings
-  useEffect(() => {
-    if (settings.google_account_email) {
-      setGoogleAccount((prev) => {
-        if (
-          prev &&
-          prev.email === settings.google_account_email &&
-          prev.name === (settings.google_account_name || prev.name)
-        ) {
-          return prev;
-        }
-        return {
-          email: settings.google_account_email || '',
-          name: settings.google_account_name || 'Akun Google Sekolah',
-          photo: settings.google_account_photo || undefined,
-          uid: prev?.uid || 'saved_google_account',
-          connectedAt: settings.google_last_synced_at || prev?.connectedAt || new Date().toISOString(),
-        };
-      });
-      setGoogleSheetsConnected(true);
-    }
-  }, [settings.google_account_email, settings.google_account_name, settings.google_account_photo, settings.google_last_synced_at]);
-  const [notificationLogs, setNotificationLogs] = useState<NotificationLog[]>(() => getCachedData('dkb_cache_notification_logs', []));
-  const [auditLogs, setAuditLogs] = useState<AuditLog[]>(() => getCachedData('dkb_cache_audit_logs', []));
-
-  // Toasts
+  // Domain States (Read directly from Google Sheets)
+  const [settings, setSettings] = useState<AppSettings>(defaultSettings);
+  const [classes, setClasses] = useState<SchoolClass[]>([]);
+  const [sessions, setSessions] = useState<AttendanceSession[]>([]);
+  const [students, setStudents] = useState<Student[]>([]);
+  const [violationTypes, setViolationTypes] = useState<ViolationType[]>([]);
+  const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
+  const [outOfClass, setOutOfClass] = useState<OutOfClassRecord[]>([]);
+  const [violations, setViolations] = useState<ViolationRecord[]>([]);
+  const [leaveRequests, setLeaveRequests] = useState<LeaveRequest[]>([]);
+  const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(defaultNotificationSettings);
+  const [notificationLogs, setNotificationLogs] = useState<NotificationLog[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
 
-  const [isInitialLoading, setIsInitialLoading] = useState<boolean>(() => {
-    try {
-      const cached = localStorage.getItem('dkb_cache_classes');
-      return !cached;
-    } catch {
-      return false;
-    }
-  });
-  const [initialLoadError, setInitialLoadError] = useState<string | null>(null);
-  const [hasSyncedOnce, setHasSyncedOnce] = useState(false);
-  const [localDataNonce, setLocalDataNonce] = useState(0);
-  const [autoSheetSyncTick, setAutoSheetSyncTick] = useState(0);
-  const hasSyncedOnceRef = useRef(false);
-  const isAutoSheetSyncingRef = useRef(false);
-  const pendingAutoSheetSyncRef = useRef(false);
-  const lastAutoSheetSigRef = useRef('');
+  const isFetchingRef = useRef<boolean>(false);
 
-  const settingsRef = useRef<AppSettings>(settings);
-  settingsRef.current = settings;
-  const latestLocalDataRef = useRef({
-    students,
-    classes,
-    sessions,
-    violationTypes,
-    attendance,
-    outOfClass,
-    violations,
-    leaveRequests,
-    settings,
-    notificationSettings,
-  });
-  latestLocalDataRef.current = {
-    students,
-    classes,
-    sessions,
-    violationTypes,
-    attendance,
-    outOfClass,
-    violations,
-    leaveRequests,
-    settings,
-    notificationSettings,
-  };
-  const isSyncingRef = useRef(false);
-  const pendingSyncRef = useRef(false);
-  const pendingBroadcastRef = useRef(false);
-  const versionRef = useRef(0);
-  versionRef.current = serverVersion;
-  const syncChannelRef = useRef<BroadcastChannel | null>(null);
-
-  const broadcastSync = useCallback(() => {
-    try {
-      if (syncChannelRef.current) {
-        syncChannelRef.current.postMessage('sync');
-      }
-    } catch {}
-  }, []);
-
-  const enqueueOfflineMutation = useCallback((type: string, action: string, payload: any) => {
-    try {
-      const rawQ = localStorage.getItem('dkb_offline_queue');
-      const q = rawQ ? JSON.parse(rawQ) : [];
-      q.push({ type, action, payload, queuedAt: new Date().toISOString() });
-      localStorage.setItem('dkb_offline_queue', JSON.stringify(q));
-    } catch {}
-  }, []);
-
-  const showToast = useCallback((message: string, type: 'success' | 'error' | 'info' = 'info') => {
-    const id = `toast_${Date.now()}_${Math.random()}`;
-    setToasts((prev) => [...prev.slice(-3), { id, message, type }]);
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 4000);
-  }, []);
+  // 3-second batch scan collector for consecutive scans
+  interface BatchItem {
+    params: OfflineAttendanceScan;
+    resolve: (res: any) => void;
+  }
+  const scanBatchQueueRef = useRef<BatchItem[]>([]);
+  const scanBatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
-  const speak = useCallback(
-    (text: string) => {
-      ttsService.speak(text, {
-        enabled: settings.tts_enabled !== false,
-        rate: settings.tts_rate && settings.tts_rate > 1.0 ? settings.tts_rate : 1.1,
-        pitch: settings.tts_pitch || 1.0,
-        volume: settings.tts_volume || 1.0,
-      });
+  const showToast = useCallback(
+    (message: string, type: 'success' | 'error' | 'info' = 'info') => {
+      const id = `toast_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      setToasts((prev) => [...prev.slice(-4), { id, message, type }]);
+      setTimeout(() => {
+        dismissToast(id);
+      }, 4500);
     },
-    [settings]
+    [dismissToast]
   );
 
-  // Clock effect: checks every 1s for minute transitions so automatic session switching occurs right on time
-  // (Individual ticking clocks use isolated LiveClockText to avoid 60fps frame drops / stuttering)
-  useEffect(() => {
-    const updateClockIfNeeded = () => {
-      const now = getServerNow();
-      setCurrentServerTime((prev) => {
-        const prevMinute = Math.floor(prev.getTime() / 60000);
-        const curMinute = Math.floor(now.getTime() / 60000);
-        if (curMinute !== prevMinute || Math.abs(now.getTime() - prev.getTime()) >= 10000) {
-          return now;
-        }
-        return prev;
-      });
-    };
+  const setSavingState = useCallback(() => {
+    if (saveResetTimerRef.current) clearTimeout(saveResetTimerRef.current);
+    setSaveStatus({ state: 'saving', message: 'Menyimpan...', updatedAt: Date.now() });
+  }, []);
 
-    setCurrentServerTime(getServerNow());
-    const timer = setInterval(updateClockIfNeeded, 1000);
+  const setSavedState = useCallback((customMsg = 'Tersimpan') => {
+    if (saveResetTimerRef.current) clearTimeout(saveResetTimerRef.current);
+    setSaveStatus({ state: 'saved', message: customMsg, updatedAt: Date.now() });
+    saveResetTimerRef.current = setTimeout(() => {
+      setSaveStatus((prev) => (prev.state === 'saved' ? { state: 'idle', message: '' } : prev));
+    }, 3500);
+  }, []);
+
+  const setSaveErrorState = useCallback((errMsg: string) => {
+    if (saveResetTimerRef.current) clearTimeout(saveResetTimerRef.current);
+    setSaveStatus({ state: 'error', message: errMsg, updatedAt: Date.now() });
+  }, []);
+
+  const speak = useCallback(
+    (text: string) => {
+      if (!settings.tts_enabled) return;
+      ttsService.speak(text, {
+        rate: settings.tts_rate,
+        pitch: settings.tts_pitch,
+        volume: settings.tts_volume,
+      });
+    },
+    [settings.tts_enabled, settings.tts_rate, settings.tts_pitch, settings.tts_volume]
+  );
+
+  // Synchronize theme
+  useEffect(() => {
+    if (settings.theme === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }, [settings.theme]);
+
+  // Real-time Server Clock tick (1s)
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentServerTime(getServerNow());
+    }, 1000);
     return () => clearInterval(timer);
   }, []);
+
+  // Live session calculation
+  const autoSwitchEnabled = settings.auto_session_switch !== false;
+  const sessionSchedule = resolveSessionSchedule(
+    sessions,
+    currentServerTime,
+    autoSwitchEnabled,
+    manualSessionOverrideId
+  );
+  const activeSession = sessionSchedule.activeSession;
+
+  // Detect automatic session transitions
+  useEffect(() => {
+    const liveSess = sessionSchedule.liveWindowSession;
+    if (!liveSess || manualSessionOverrideId) return;
+
+    const prevId = prevLiveSessionIdRef.current;
+    const prevName = prevLiveSessionNameRef.current;
+
+    if (prevId && prevId !== liveSess.id && autoSwitchEnabled) {
+      setLastSessionTransition({
+        fromName: prevName || undefined,
+        toSession: liveSess,
+        at: new Date().toISOString(),
+      });
+      if (settings.auto_session_switch_notify !== false) {
+        showToast(`Peralihan sesi otomatis: "${liveSess.name}" kini aktif.`, 'info');
+      }
+    }
+
+    prevLiveSessionIdRef.current = liveSess.id;
+    prevLiveSessionNameRef.current = liveSess.name;
+  }, [sessionSchedule.liveWindowSession, manualSessionOverrideId, autoSwitchEnabled, settings.auto_session_switch_notify, showToast]);
+
+  const dismissSessionTransition = useCallback(() => setLastSessionTransition(null), []);
 
   const setManualSessionOverride = useCallback((sessionId: string | null) => {
     setManualSessionOverrideId(sessionId);
     try {
-      if (sessionId) {
-        localStorage.setItem('dkb_manual_session_override', sessionId);
-      } else {
-        localStorage.removeItem('dkb_manual_session_override');
-      }
+      if (sessionId) localStorage.setItem('dkb_manual_session_override', sessionId);
+      else localStorage.removeItem('dkb_manual_session_override');
     } catch {}
-    if (sessionId) {
-      const found = sessions.find((s) => s.id === sessionId);
-      showToast(`Mode Manual: Sesi presensi dikunci ke "${found?.name || sessionId}".`, 'info');
-    } else {
-      showToast('Peralihan Sesi Otomatis aktif kembali mengikuti jadwal server.', 'success');
-    }
-  }, [sessions, showToast]);
-
-  const dismissSessionTransition = useCallback(() => {
-    setLastSessionTransition(null);
   }, []);
 
-  // Compute Active Session & Full Schedule State based on authoritative server time & day
-  const autoSessionSwitchEnabled = settings.auto_session_switch !== false;
-  const sessionSchedule = React.useMemo(
-    () =>
-      resolveSessionSchedule(
-        sessions,
-        currentServerTime,
-        autoSessionSwitchEnabled,
-        manualSessionOverrideId
-      ),
-    [sessions, currentServerTime, autoSessionSwitchEnabled, manualSessionOverrideId]
-  );
+  const toggleKioskFullscreen = useCallback(() => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen?.().catch(() => {});
+      setIsKioskFullscreen(true);
+    } else {
+      document.exitFullscreen?.().catch(() => {});
+      setIsKioskFullscreen(false);
+    }
+  }, []);
 
-  const activeSession = sessionSchedule.activeSession;
-
-  // Detect automatic session transitions in real-time and notify kiosk + staff
-  useEffect(() => {
-    if (!autoSessionSwitchEnabled || manualSessionOverrideId) {
-      prevLiveSessionIdRef.current = sessionSchedule.liveWindowSession?.id || null;
-      prevLiveSessionNameRef.current = sessionSchedule.liveWindowSession?.name || null;
+  /**
+   * Direct read from Google Sheets via /api/sync
+   */
+  const refreshFromSheets = useCallback(async (silent = false) => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      setSyncStatus('offline');
       return;
     }
-
-    const currentLive = sessionSchedule.liveWindowSession;
-    const prevId = prevLiveSessionIdRef.current;
-    const prevName = prevLiveSessionNameRef.current;
-
-    if (currentLive && prevId !== null && prevId !== currentLive.id) {
-      const msg = `Peralihan Sesi Otomatis: Beralih ke "${currentLive.name}" (${currentLive.start_time} - ${currentLive.end_time})`;
-      setLastSessionTransition({
-        fromName: prevName || undefined,
-        toSession: currentLive,
-        at: new Date().toISOString(),
-      });
-      showToast(msg, 'info');
-      if (settingsRef.current.tts_enabled !== false && settingsRef.current.auto_session_switch_notify !== false) {
-        speak(`Perhatian, sesi presensi otomatis beralih ke ${currentLive.name}.`);
-      }
-    }
-
-    prevLiveSessionIdRef.current = currentLive?.id || (prevId === null && sessions.length > 0 ? '__none__' : prevId);
-    prevLiveSessionNameRef.current = currentLive?.name || null;
-  }, [
-    sessionSchedule.liveWindowSession,
-    autoSessionSwitchEnabled,
-    manualSessionOverrideId,
-    sessions.length,
-    showToast,
-    speak,
-  ]);
-
-  // Auto-dismiss transition banner after 45 seconds
-  useEffect(() => {
-    if (!lastSessionTransition) return;
-    const t = setTimeout(() => {
-      setLastSessionTransition(null);
-    }, 45000);
-    return () => clearTimeout(t);
-  }, [lastSessionTransition]);
-
-  // Apply Delta Changes to state without interrupting user interactions
-  const applyDeltaChanges = useCallback((changes: DeltaChange[]) => {
-    if (!changes || changes.length === 0) return;
-
-    for (const chg of changes) {
-      const { entity, entity_id, action, data } = chg;
-
-      switch (entity) {
-        case 'attendance':
-          if (action === 'insert') {
-            setAttendance((prev) => {
-              if (prev.some((a) => a.id === entity_id)) return prev;
-              const next = [data, ...prev];
-              try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'update') {
-            setAttendance((prev) => {
-              const next = prev.map((a) => (a.id === entity_id ? data : a));
-              try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'delete') {
-            setAttendance((prev) => {
-              const next = prev.filter((a) => a.id !== entity_id);
-              try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          }
-          break;
-
-        case 'out_of_class':
-          if (action === 'insert') {
-            setOutOfClass((prev) => {
-              if (prev.some((o) => o.id === entity_id)) return prev;
-              const next = [data, ...prev];
-              try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'update') {
-            setOutOfClass((prev) => {
-              const next = prev.map((o) => (o.id === entity_id ? data : o));
-              try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'delete') {
-            setOutOfClass((prev) => {
-              const next = prev.filter((o) => o.id !== entity_id);
-              try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          }
-          break;
-
-        case 'violations':
-          if (action === 'insert') {
-            setViolations((prev) => {
-              if (prev.some((v) => v.id === entity_id)) return prev;
-              const next = [data, ...prev];
-              try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'update') {
-            setViolations((prev) => {
-              const next = prev.map((v) => (v.id === entity_id ? data : v));
-              try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'delete') {
-            setViolations((prev) => {
-              const next = prev.filter((v) => v.id !== entity_id);
-              try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          }
-          break;
-
-        case 'students':
-          if (entity_id === 'bulk' && Array.isArray(data)) {
-            setStudents(data);
-            try { localStorage.setItem('dkb_cache_students', JSON.stringify(data)); } catch {}
-          } else if (action === 'insert') {
-            setStudents((prev) => {
-              if (prev.some((s) => s.nis === entity_id)) return prev;
-              const next = [...prev, data];
-              try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'update') {
-            setStudents((prev) => {
-              const exists = prev.some((s) => s.nis === entity_id);
-              const next = exists ? prev.map((s) => (s.nis === entity_id ? data : s)) : [...prev, data];
-              try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'delete') {
-            setStudents((prev) => {
-              const next = prev.filter((s) => s.nis !== entity_id);
-              try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          }
-          break;
-
-        case 'classes':
-          if (entity_id === 'bulk' && Array.isArray(data)) {
-            setClasses(data);
-            try { localStorage.setItem('dkb_cache_classes', JSON.stringify(data)); } catch {}
-          } else if (action === 'insert') {
-            setClasses((prev) => {
-              if (prev.some((c) => c.id === entity_id)) return prev;
-              const next = [...prev, data];
-              try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'update') {
-            setClasses((prev) => {
-              const exists = prev.some((c) => c.id === entity_id);
-              const next = exists ? prev.map((c) => (c.id === entity_id ? data : c)) : [...prev, data];
-              try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'delete') {
-            setClasses((prev) => {
-              const next = prev.filter((c) => c.id !== entity_id);
-              try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          }
-          break;
-
-        case 'sessions':
-          if (entity_id === 'bulk' && Array.isArray(data)) {
-            setSessions(data);
-            try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(data)); } catch {}
-          } else if (action === 'insert') {
-            setSessions((prev) => {
-              if (prev.some((s) => s.id === entity_id)) return prev;
-              const next = [...prev, data];
-              try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'update') {
-            setSessions((prev) => {
-              const exists = prev.some((s) => s.id === entity_id);
-              const next = exists ? prev.map((s) => (s.id === entity_id ? data : s)) : [...prev, data];
-              try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'delete') {
-            setSessions((prev) => {
-              const next = prev.filter((s) => s.id !== entity_id);
-              try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          }
-          break;
-
-        case 'violation_types':
-          if (entity_id === 'bulk' && Array.isArray(data)) {
-            setViolationTypes(data);
-            try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(data)); } catch {}
-          } else if (action === 'insert') {
-            setViolationTypes((prev) => {
-              if (prev.some((vt) => vt.id === entity_id)) return prev;
-              const next = [...prev, data];
-              try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'update') {
-            setViolationTypes((prev) => {
-              const exists = prev.some((vt) => vt.id === entity_id);
-              const next = exists ? prev.map((vt) => (vt.id === entity_id ? data : vt)) : [...prev, data];
-              try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'delete') {
-            setViolationTypes((prev) => {
-              const next = prev.filter((vt) => vt.id !== entity_id);
-              try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          }
-          break;
-
-        case 'leave_requests':
-          if (action === 'insert') {
-            setLeaveRequests((prev) => {
-              if (prev.some((lr) => lr.id === entity_id)) return prev;
-              const next = [data, ...prev];
-              try { localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'update') {
-            setLeaveRequests((prev) => {
-              const next = prev.map((lr) => (lr.id === entity_id ? data : lr));
-              try { localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          } else if (action === 'delete') {
-            setLeaveRequests((prev) => {
-              const next = prev.filter((lr) => lr.id !== entity_id);
-              try { localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          }
-          break;
-
-        case 'settings':
-          if (data) {
-            setSettings(data);
-            settingsRef.current = data;
-            registerGoogleClientIdToJs((data.google_client_id || '').trim());
-            setGoogleSheetsConnected(
-              Boolean(data.google_account_email || data.google_oauth_connected || hasValidGoogleToken() || serverDriveSyncActive)
-            );
-            if (data.google_account_email) {
-              setGoogleAccount((prev) => ({
-                email: data.google_account_email,
-                name: data.google_account_name || prev?.name || 'Kesiswaan SMP Puncak Darussalam',
-                photo: data.google_account_photo || prev?.photo,
-                uid: prev?.uid || 'saved_google_account',
-                connectedAt: data.google_last_synced_at || prev?.connectedAt || new Date().toISOString(),
-              }));
-            }
-            try {
-              localStorage.setItem('dkb_cache_settings', JSON.stringify(data));
-            } catch {}
-          }
-          break;
-
-        case 'notification_settings':
-          if (data) {
-            setNotificationSettings(data);
-            try {
-              localStorage.setItem('dkb_cache_notification_settings', JSON.stringify(data));
-            } catch {}
-          }
-          break;
-
-        case 'notification_log':
-          if (action === 'insert' && data) {
-            setNotificationLogs((prev) => {
-              if (prev.some((n) => n.id === entity_id)) return prev;
-              const next = [data, ...prev].slice(0, 100);
-              try { localStorage.setItem('dkb_cache_notification_logs', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          }
-          break;
-
-        case 'audit_log':
-          if (action === 'insert' && data) {
-            setAuditLogs((prev) => {
-              if (prev.some((a) => a.id === entity_id)) return prev;
-              const next = [data, ...prev].slice(0, 100);
-              try { localStorage.setItem('dkb_cache_audit_logs', JSON.stringify(next)); } catch {}
-              return next;
-            });
-          }
-          break;
-
-        case 'users':
-          // If current user modified or invalidated
-          if (session && session.userId === entity_id) {
-            if (action === 'delete') {
-              showToast('Akun Anda telah dinonaktifkan.', 'error');
-              setSession(null);
-              localStorage.removeItem('dkb_session');
-            } else if (
-              data &&
-              typeof (session as any).tokenVersion === 'number' &&
-              data.token_version > (session as any).tokenVersion
-            ) {
-              showToast('Sesi Anda telah kedaluwarsa karena perubahan kata sandi di perangkat lain.', 'error');
-              setSession(null);
-              localStorage.removeItem('dkb_session');
-            }
-          }
-          break;
-      }
-    }
-  }, [session, showToast, serverDriveSyncActive]);
-
-  // Two-Way Delta Sync with Timeout, Follow-up Queueing & Non-Stuttering Updates
-  const syncNow = useCallback(async (isManual = false, shouldBroadcast = true) => {
-    if (isSyncingRef.current) {
-      pendingSyncRef.current = true;
-      if (shouldBroadcast) pendingBroadcastRef.current = true;
-      return;
-    }
-    isSyncingRef.current = true;
-    if (isManual) {
-      setSyncStatus('syncing');
-    }
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s safe timeout
+    if (isFetchingRef.current) return;
+    isFetchingRef.current = true;
+    if (!silent) setSyncStatus('syncing');
 
     try {
-      // 1. Flush offline queue via two-way sync POST if online
-      const isOnline = typeof navigator === 'undefined' || navigator.onLine;
-      if (isOnline) {
-        try {
-          const rawQ = typeof localStorage !== 'undefined' ? localStorage.getItem('dkb_offline_queue') : null;
-          if (rawQ) {
-            const queue = JSON.parse(rawQ);
-            if (Array.isArray(queue) && queue.length > 0) {
-              const pushRes = await fetch('/api/sync', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-                },
-                body: JSON.stringify({ mutations: queue }),
-              });
-              if (pushRes.ok) {
-                localStorage.removeItem('dkb_offline_queue');
-                showToast(`Sinkronisasi Dua Arah: ${queue.length} perubahan lokal berhasil disimpan ke database server.`, 'success');
-              }
-            }
-          }
-        } catch (flushErr) {
-          console.warn('Flush offline queue error:', flushErr);
-        }
-      }
-
-      // 2. Fetch server changes (always fetch clean full snapshot on first mount)
-      let since = versionRef.current;
-      if (!hasSyncedOnceRef.current) {
-        since = 0;
-      }
-
-      const res = await fetch(`/api/sync?since=${since}&_t=${Date.now()}`, {
+      const res = await fetch('/api/sync', {
         headers: {
           'Cache-Control': 'no-cache',
-          'Pragma': 'no-cache',
           ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
         },
-        signal: controller.signal,
       });
+      const data = await res.json().catch(() => ({}));
 
-      if (!res.ok) {
-        throw new Error(`Sync HTTP error: ${res.status}`);
-      }
-
-      const contentType = res.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        setSyncStatus(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'synced');
+      if (res.status === 503) {
+        setConfigError(data.error || 'Environment variable server (SPREADSHEET_ID / Service Account) belum dikonfigurasi.');
+        setMissingEnv(Array.isArray(data.missingEnv) ? data.missingEnv : []);
+        setEnvStatus({
+          configured: false,
+          sheetsConfigured: false,
+          driveConfigured: false,
+          spreadsheetConfigured: false,
+          driveFolderConfigured: false,
+          missingEnv: Array.isArray(data.missingEnv) ? data.missingEnv : [],
+        });
+        setSyncStatus('error');
         return;
       }
 
-      const data = await res.json();
-      hasSyncedOnceRef.current = true;
-      setHasSyncedOnce(true);
+      if (!res.ok) {
+        setInitialLoadError(data.error || 'Gagal membaca data dari Google Sheets.');
+        setSyncStatus('error');
+        return;
+      }
 
-      // Update Clock Offset
+      setConfigError(null);
+      setInitialLoadError(null);
+      setMissingEnv(Array.isArray(data.missingEnv) ? data.missingEnv : []);
+      setEnvStatus({
+        configured: Boolean(data.configured),
+        sheetsConfigured: Boolean(data.sheetsConfigured),
+        driveConfigured: Boolean(data.driveConfigured),
+        spreadsheetConfigured: Boolean(data.spreadsheetConfigured),
+        driveFolderConfigured: Boolean(data.driveFolderConfigured),
+        missingEnv: Array.isArray(data.missingEnv) ? data.missingEnv : [],
+      });
+
       if (data.serverTime) {
         setServerClockOffset(data.serverTime);
+        setCurrentServerTime(getServerNow());
       }
 
-      if (data.serverDriveSyncActive !== undefined) {
-        const active = Boolean(data.serverDriveSyncActive);
-        setServerDriveSyncActive((prev) => (prev !== active ? active : prev));
-        try {
-          localStorage.setItem('dkb_cache_server_drive_active', String(active));
-        } catch {}
-      }
-      if (data.permanentDriveSync !== undefined) {
-        const perm = Boolean(data.permanentDriveSync);
-        setPermanentDriveSync((prev) => (prev !== perm ? perm : prev));
-        if (perm) {
-          setGoogleNeedsInteractiveReauth(false);
-        }
-        try {
-          localStorage.setItem('dkb_cache_permanent_drive_sync', String(perm));
-        } catch {}
-      }
-      if (data.oauthTokenExpired && !data.permanentDriveSync) {
-        setServerDriveSyncActive(false);
-        setGoogleNeedsInteractiveReauth(true);
-        try {
-          localStorage.setItem('dkb_cache_server_drive_active', 'false');
-        } catch {}
-      } else if (data.serverDriveSyncActive && !data.oauthTokenExpired) {
-        setGoogleNeedsInteractiveReauth(false);
-      }
-      if (data.driveSyncMode) {
-        setDriveSyncMode(data.driveSyncMode);
+      if (data.data) {
+        const d = data.data;
+        if (Array.isArray(d.students)) setStudents(d.students);
+        if (Array.isArray(d.classes)) setClasses(d.classes);
+        if (Array.isArray(d.sessions)) setSessions(d.sessions);
+        if (Array.isArray(d.attendance)) setAttendance(d.attendance);
+        if (Array.isArray(d.out_of_class)) setOutOfClass(d.out_of_class);
+        if (Array.isArray(d.violations)) setViolations(d.violations);
+        if (Array.isArray(d.violation_types)) setViolationTypes(d.violation_types);
+        if (Array.isArray(d.leave_requests)) setLeaveRequests(d.leave_requests);
+        if (d.settings) setSettings((prev) => ({ ...prev, ...d.settings }));
+        if (d.notification_settings) setNotificationSettings((prev) => ({ ...prev, ...d.notification_settings }));
+        if (Array.isArray(d.notification_logs)) setNotificationLogs(d.notification_logs);
+        if (Array.isArray(d.audit_logs)) setAuditLogs(d.audit_logs);
       }
 
-      const hasVersionChanged = data.version !== versionRef.current;
-
-      if (data.fullSnapshot && data.data) {
-        const localSnap = latestLocalDataRef.current;
-        const explicitClearAt = (() => {
-          try {
-            return parseInt(localStorage.getItem('dkb_explicit_clear_at') || '0', 10);
-          } catch {
-            return 0;
-          }
-        })();
-        const isRecentExplicitClear = explicitClearAt > 0 && Date.now() - explicitClearAt < 60000;
-        const serverHasData = hasRealSyncData(data.data);
-        const localHasData = hasRealSyncData(localSnap);
-
-        // Anti-data-loss guard: If server restarted empty while browser has real cached school data
-        // (and admin did not just run clearAllStudents), heal the server DB instead of wiping local data!
-        if (!serverHasData && localHasData && !isRecentExplicitClear) {
-          try {
-            const healRes = await fetch('/api/sync', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-              },
-              body: JSON.stringify({
-                merge: true,
-                classes: localSnap.classes,
-                students: localSnap.students,
-                sessions: localSnap.sessions,
-                violation_types: localSnap.violationTypes,
-                attendance: localSnap.attendance,
-                out_of_class: localSnap.outOfClass,
-                violations: localSnap.violations,
-                leave_requests: localSnap.leaveRequests,
-                settings: localSnap.settings,
-                notification_settings: localSnap.notificationSettings,
-              }),
-            });
-            if (healRes.ok) {
-              const healedJson = await healRes.json().catch(() => null);
-              if (healedJson?.version) {
-                setServerVersion(healedJson.version);
-                versionRef.current = healedJson.version;
-                try {
-                  localStorage.setItem('dkb_cache_version', String(healedJson.version));
-                } catch {}
-              }
-              showToast('Data sekolah dipulihkan dari cache lokal dan disinkronkan ulang ke database server.', 'info');
-            }
-          } catch {}
-          setSyncStatus((prev) => (prev !== 'synced' ? 'synced' : prev));
-          setInitialLoadError(null);
-          return;
-        }
-
-        const nextSettings = data.data.settings || defaultSettings;
-        setSettings(nextSettings);
-        settingsRef.current = nextSettings;
-        setGoogleSheetsConnected(
-          Boolean(
-            nextSettings.google_account_email ||
-              nextSettings.google_oauth_connected ||
-              hasValidGoogleToken() ||
-              data.serverDriveSyncActive
-          )
-        );
-        registerGoogleClientIdToJs((nextSettings.google_client_id || '').trim());
-        setClasses(data.data.classes || []);
-        setSessions(data.data.sessions || []);
-        setStudents(data.data.students || []);
-        setViolationTypes(data.data.violation_types || []);
-        setAttendance(data.data.attendance || []);
-        setOutOfClass(data.data.out_of_class || []);
-        setViolations(data.data.violations || []);
-        setLeaveRequests(data.data.leave_requests || []);
-        if (data.data.notification_settings) {
-          setNotificationSettings(data.data.notification_settings);
-        }
-        if (Array.isArray(data.data.notification_log)) {
-          setNotificationLogs(data.data.notification_log);
-          try {
-            localStorage.setItem('dkb_cache_notification_logs', JSON.stringify(data.data.notification_log));
-          } catch {}
-        }
-        if (Array.isArray(data.data.audit_log)) {
-          setAuditLogs(data.data.audit_log);
-          try {
-            localStorage.setItem('dkb_cache_audit_logs', JSON.stringify(data.data.audit_log));
-          } catch {}
-        }
-
-        try {
-          localStorage.setItem('dkb_cache_settings', JSON.stringify(nextSettings));
-          localStorage.setItem('dkb_cache_classes', JSON.stringify(data.data.classes || []));
-          if (data.data.sessions) localStorage.setItem('dkb_cache_sessions', JSON.stringify(data.data.sessions));
-          localStorage.setItem('dkb_cache_students', JSON.stringify(data.data.students || []));
-          if (data.data.violation_types) localStorage.setItem('dkb_cache_violation_types', JSON.stringify(data.data.violation_types));
-          localStorage.setItem('dkb_cache_attendance', JSON.stringify(data.data.attendance || []));
-          localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(data.data.out_of_class || []));
-          localStorage.setItem('dkb_cache_violations', JSON.stringify(data.data.violations || []));
-          localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(data.data.leave_requests || []));
-          if (data.data.notification_settings) {
-            localStorage.setItem('dkb_cache_notification_settings', JSON.stringify(data.data.notification_settings));
-          }
-          localStorage.setItem('dkb_cache_version', String(data.version));
-        } catch {}
-      } else if (data.changes && data.changes.length > 0) {
-        applyDeltaChanges(data.changes);
-      }
-
-      if (hasVersionChanged) {
-        setServerVersion(data.version);
-        versionRef.current = data.version;
-        try {
-          localStorage.setItem('dkb_cache_version', String(data.version));
-        } catch {}
-        setLastSyncTime(new Date());
-        if (shouldBroadcast) {
-          broadcastSync();
-        }
-      }
-
-      setSyncStatus((prev) => (prev !== 'synced' ? 'synced' : prev));
-      setInitialLoadError(null);
+      setLastSyncTime(new Date());
+      setSyncStatus('synced');
     } catch (err: any) {
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        setSyncStatus('offline');
-      } else {
-        setSyncStatus('error');
+      setSyncStatus(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'error');
+      if (!silent) {
+        setInitialLoadError(err?.message || 'Koneksi ke server bermasalah.');
       }
     } finally {
-      clearTimeout(timeoutId);
-      isSyncingRef.current = false;
+      isFetchingRef.current = false;
       setIsInitialLoading(false);
-      if (pendingSyncRef.current) {
-        const shouldBcast = pendingBroadcastRef.current;
-        pendingSyncRef.current = false;
-        pendingBroadcastRef.current = false;
-        setTimeout(() => {
-          syncNow(false, shouldBcast);
-        }, 50);
-      }
     }
-  }, [session, applyDeltaChanges, showToast, broadcastSync, serverDriveSyncActive]);
+  }, [session?.token]);
 
-  // Initial Sync & Drive Bridge Check on Mount (Zero-click automatic)
-  const refreshDriveBridgeStatus = useCallback(async () => {
+  /**
+   * Flush offline attendance scans saved in localStorage when back online
+   */
+  const flushOfflineAttendanceScans = useCallback(async () => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+    const queued = readOfflineScans();
+    if (queued.length === 0) return;
+
+    setSavingState();
     try {
-      const res = await fetch('/api/google-sync/bridge');
-      if (!res.ok) return;
-      const data = await res.json().catch(() => null);
-      if (data?.bridgeStatus) {
-        setDriveBridgeStatus(data.bridgeStatus);
-        const perm = Boolean(data.permanentDriveSync ?? data.bridgeStatus.permanentAutoSync);
-        const srvActive = Boolean(data.serverDriveSyncActive);
-        const expired = Boolean(data.bridgeStatus.oauthExpired && !perm);
-        setPermanentDriveSync(perm);
-        setDriveSyncMode(data.driveSyncMode || data.bridgeStatus.mode || 'none');
-        setServerDriveSyncActive(srvActive);
-        setGoogleNeedsInteractiveReauth(expired);
-        try {
-          localStorage.setItem('dkb_cache_permanent_drive_sync', String(perm));
-          localStorage.setItem('dkb_cache_server_drive_active', String(srvActive));
-        } catch {}
-        if (perm) {
-          setGoogleNeedsInteractiveReauth(false);
-          setGoogleSheetsConnected(true);
+      const res = await fetch('/api/attendance', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+        },
+        body: JSON.stringify({ scans: queued }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        writeOfflineScans([]);
+        setPendingOfflineScansCount(0);
+        setSavedState(`Tersimpan (${queued.length} scan offline terkirim)`);
+        if (data.rejectedCount > 0) {
+          showToast(`${data.savedCount} scan offline terkirim, ${data.rejectedCount} duplikat ditolak.`, 'info');
+        } else {
+          showToast(`${queued.length} data presensi offline berhasil disinkronkan ke Google Sheets.`, 'success');
         }
+        await refreshFromSheets(true);
+      } else if (res.status < 500 && res.status !== 429) {
+        // Unrecoverable validation error; drop bad items so queue does not loop forever
+        writeOfflineScans([]);
+        setPendingOfflineScansCount(0);
+        setSaveErrorState(data.error || 'Gagal mengirim scan offline.');
       }
-    } catch {}
-  }, []);
-
-  const saveDriveBridgeConfig = useCallback(
-    async (payload: {
-      mode: 'service_account' | 'apps_script';
-      serviceAccountJson?: string;
-      clientEmail?: string;
-      privateKey?: string;
-      appsScriptUrl?: string;
-    }): Promise<{ success: boolean; error?: string }> => {
-      try {
-        setGoogleSyncing(true);
-        const res = await fetch('/api/google-sync/bridge', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-          },
-          body: JSON.stringify(payload),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          const errMsg = data?.error || 'Gagal menyimpan konfigurasi Auto-Sync Drive permanen.';
-          showToast(errMsg, 'error');
-          return { success: false, error: errMsg };
-        }
-        if (data.bridgeStatus) {
-          setDriveBridgeStatus(data.bridgeStatus);
-        }
-        const perm = Boolean(data.permanentDriveSync ?? data.serverDriveSyncActive);
-        setPermanentDriveSync(perm);
-        setServerDriveSyncActive(Boolean(data.serverDriveSyncActive ?? perm));
-        setDriveSyncMode(data.driveSyncMode || (perm ? payload.mode : 'none'));
-        setGoogleNeedsInteractiveReauth(false);
-        setGoogleSheetsConnected(true);
-        try {
-          localStorage.setItem('dkb_cache_server_drive_active', String(Boolean(data.serverDriveSyncActive ?? perm)));
-          localStorage.setItem('dkb_cache_permanent_drive_sync', String(perm));
-        } catch {}
-
-        await syncNow(false, true);
-
-        if (data.error) {
-          showToast(data.error, 'info');
-          return { success: false, error: data.error };
-        }
-        showToast(
-          'Auto-Sync Google Drive & Sheets Permanen (0-Klik) aktif! Setiap perubahan langsung tersinkron otomatis tanpa login ulang.',
-          'success'
-        );
-        return { success: true };
-      } catch (err: any) {
-        const msg = err?.message || 'Gagal menghubungkan bridge permanen.';
-        showToast(msg, 'error');
-        return { success: false, error: msg };
-      } finally {
-        setGoogleSyncing(false);
-      }
-    },
-    [session?.token, showToast, syncNow]
-  );
-
-  const removeDriveBridgeConfig = useCallback(
-    async (mode?: 'service_account' | 'apps_script'): Promise<boolean> => {
-      try {
-        const res = await fetch('/api/google-sync/bridge', {
-          method: 'DELETE',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-          },
-          body: JSON.stringify({ mode }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (res.ok) {
-          if (data.bridgeStatus) setDriveBridgeStatus(data.bridgeStatus);
-          setPermanentDriveSync(Boolean(data.permanentDriveSync));
-          setServerDriveSyncActive(Boolean(data.serverDriveSyncActive));
-          setDriveSyncMode(data.driveSyncMode || 'none');
-          try {
-            localStorage.setItem('dkb_cache_permanent_drive_sync', String(Boolean(data.permanentDriveSync)));
-            localStorage.setItem('dkb_cache_server_drive_active', String(Boolean(data.serverDriveSyncActive)));
-          } catch {}
-          showToast('Konfigurasi Auto-Sync permanen dihapus dari server.', 'info');
-          return true;
-        }
-      } catch {}
-      return false;
-    },
-    [session?.token, showToast]
-  );
-
-  useEffect(() => {
-    syncNow();
-    refreshDriveBridgeStatus();
-  }, [syncNow, refreshDriveBridgeStatus]);
-
-  // Adaptive Multi-Device Real-Time Polling, Storage Event & Cross-Tab Broadcast Synchronization
-  useEffect(() => {
-    let intervalId: any;
-
-    // Cross-tab broadcast channel for zero-latency multi-window updates
-    const syncChannel = typeof window !== 'undefined' && 'BroadcastChannel' in window
-      ? new BroadcastChannel('dkb_sync_bus')
-      : null;
-    syncChannelRef.current = syncChannel;
-
-    if (syncChannel) {
-      syncChannel.onmessage = (event) => {
-        if (event.data === 'sync') {
-          syncNow(false, false);
-        }
-      };
+    } catch {
+      setSyncStatus('offline');
     }
+  }, [session?.token, refreshFromSheets, setSavingState, setSavedState, setSaveErrorState, showToast]);
 
-    const setupInterval = () => {
-      if (intervalId) clearInterval(intervalId);
-      const isVisible = document.visibilityState === 'visible';
-      // Real-time 2.5s non-blocking polling for active screens, 15s when tab in background
-      const delay = isVisible ? 2500 : 15000;
-      intervalId = setInterval(() => {
-        syncNow(false);
-      }, delay);
-    };
+  // Initial load + 15s automatic polling + tab visibility/focus auto-refresh + online listener
+  useEffect(() => {
+    refreshFromSheets(false);
+    flushOfflineAttendanceScans();
 
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        syncNow(); // Immediate sync on view focus
+    const interval = setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        refreshFromSheets(true);
+        flushOfflineAttendanceScans();
       }
-      setupInterval();
-    };
+    }, AUTO_REFRESH_INTERVAL_MS);
 
-    const handleFocus = () => {
-      syncNow();
-    };
-
-    const handleStorageChange = (e: StorageEvent) => {
-      if (e.key && e.key.startsWith('dkb_')) {
-        if (e.key === 'dkb_google_client_id' && e.newValue) {
-          setCustomGoogleClientId(e.newValue);
-        }
-        syncNow(false, false);
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        refreshFromSheets(true);
+        flushOfflineAttendanceScans();
       }
     };
 
     const handleOnline = () => {
-      showToast('Koneksi internet kembali normal. Menyinkronkan...', 'info');
-      syncNow();
+      setSyncStatus('syncing');
+      flushOfflineAttendanceScans();
+      refreshFromSheets(true);
     };
 
     const handleOffline = () => {
       setSyncStatus('offline');
-      showToast('Koneksi terputus. Mode offline aktif.', 'error');
     };
 
-    const handlePageHide = () => {
-      try {
-        const rawQ = localStorage.getItem('dkb_offline_queue');
-        if (rawQ && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-          const queue = JSON.parse(rawQ);
-          if (Array.isArray(queue) && queue.length > 0) {
-            const blob = new Blob([JSON.stringify({ mutations: queue })], { type: 'application/json' });
-            if (navigator.sendBeacon('/api/sync', blob)) {
-              localStorage.removeItem('dkb_offline_queue');
-            }
-          }
-        }
-      } catch {}
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('focus', handleFocus);
-    window.addEventListener('storage', handleStorageChange);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    window.addEventListener('focus', handleVisibilityOrFocus);
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
-    window.addEventListener('pagehide', handlePageHide);
-
-    setupInterval();
 
     return () => {
-      if (intervalId) clearInterval(intervalId);
-      if (syncChannel) {
-        syncChannel.close();
-        syncChannelRef.current = null;
-      }
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('focus', handleFocus);
-      window.removeEventListener('storage', handleStorageChange);
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
-      window.removeEventListener('pagehide', handlePageHide);
     };
-  }, [syncNow, showToast]);
+  }, [refreshFromSheets, flushOfflineAttendanceScans]);
 
-  // Locked menus are open without 30-minute expiration restriction
-
-  // Auth Operations
-  // Helper to generate a client authentication token
-  const createClientToken = (payload: Record<string, any>): string => {
-    try {
-      const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-      const body = btoa(unescape(encodeURIComponent(JSON.stringify({
-        ...payload,
-        iat: Math.floor(Date.now() / 1000),
-        exp: Math.floor(Date.now() / 1000) + 12 * 3600,
-      }))));
-      const sig = btoa('client-auth-token');
-      return `${header}.${body}.${sig}`;
-    } catch {
-      return `token_${Date.now()}_${Math.random().toString(36).substring(2)}`;
+  // Flush the 3-second batch of scans to POST /api/attendance
+  const flushScanBatch = useCallback(async () => {
+    if (scanBatchTimerRef.current) {
+      clearTimeout(scanBatchTimerRef.current);
+      scanBatchTimerRef.current = null;
     }
-  };
 
-  const decodeTokenPayload = (token: string): any => {
+    const items = scanBatchQueueRef.current.splice(0, scanBatchQueueRef.current.length);
+    if (items.length === 0) return;
+
+    setSavingState();
+
     try {
-      const parts = token.split('.');
-      if (parts.length >= 2) {
-        return JSON.parse(decodeURIComponent(escape(atob(parts[1]))));
+      const res = await fetch('/api/attendance', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+        },
+        body: JSON.stringify({
+          scans: items.map((it) => it.params),
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (data.serverTime) {
+        setServerClockOffset(data.serverTime);
       }
-    } catch {}
-    return {};
-  };
 
-  // Secure one-way cryptographic hashing for offline/client fallback (no plaintext passwords in bundle)
-  const hashPasswordSecurely = async (pwd: string): Promise<string> => {
-    try {
-      const data = new TextEncoder().encode(`dkb_auth_salt_2026_${pwd}`);
-      const digest = await crypto.subtle.digest('SHA-256', data);
-      return Array.from(new Uint8Array(digest))
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
-    } catch {
-      let h = 0;
-      for (let i = 0; i < pwd.length; i++) {
-        h = (Math.imul(31, h) + pwd.charCodeAt(i)) | 0;
-      }
-      return `h_${h}`;
-    }
-  };
-
-  const SECURE_OFFLINE_ROLE_HASHES = {
-    duty: [
-      'a6daec41ecc969b9c7eff19857a4e3f4523ed292b68d06f71d4e99470219c25b',
-      'e1a5d4a4d1c03e5a3024bd93bf5c0088719a2ecce55cd27bba70107f80310b5a',
-    ],
-    homeroom: [
-      '255ee0fea5d2a70fbb019c4bb98793d886e49c936cae2dd603c31a36aa5dadc5',
-      '334a69e0cd1755ef5fcce9bccaeb32a051949f58c41d0dd27cb90dce983a30f5',
-      'a6daec41ecc969b9c7eff19857a4e3f4523ed292b68d06f71d4e99470219c25b',
-      'e1a5d4a4d1c03e5a3024bd93bf5c0088719a2ecce55cd27bba70107f80310b5a',
-    ],
-    student_affairs: [
-      '9963acb0a4b2f4235df7827132a79af60ac5d8b3d6fed3f529bb813ee6a336e8',
-      'e1a5d4a4d1c03e5a3024bd93bf5c0088719a2ecce55cd27bba70107f80310b5a',
-    ],
-    admin: [
-      'e1a5d4a4d1c03e5a3024bd93bf5c0088719a2ecce55cd27bba70107f80310b5a',
-    ],
-  };
-
-  // Auth Operations: completely safe from "Unexpected token <" HTML errors
-  const loginDuty = async (password: string) => {
-    try {
-      let serverJson: any = null;
-      let serverOk = false;
-      let serverReturnedJson = false;
-
-      try {
-        const res = await fetch('/api/auth', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'login_duty', password }),
-        });
-
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          serverReturnedJson = true;
-          serverOk = res.ok;
-          serverJson = await res.json();
+      if (!res.ok) {
+        if (res.status >= 500 || res.status === 429) {
+          // Persist offline & notify user
+          const existingOffline = readOfflineScans();
+          const newOffline = [...existingOffline, ...items.map((i) => i.params)];
+          writeOfflineScans(newOffline);
+          setPendingOfflineScansCount(newOffline.length);
+          const msg = data.error || 'Server/kuota sibuk, scan disimpan sementara di perangkat.';
+          setSaveErrorState(msg);
+          items.forEach((it) => it.resolve({ success: false, error: msg, offlineQueued: true }));
+          return;
         }
-      } catch {
-        // Server unreachable or network dropped, fallback safely
-      }
-
-      // If server responded with JSON
-      if (serverReturnedJson) {
-        if (serverOk && serverJson?.token) {
-          const token = serverJson.token;
-          const payload = decodeTokenPayload(token);
-          const newSession: AuthSession = {
-            token,
-            userId: payload.userId || 'user_duty_main',
-            role: payload.role || 'duty',
-            name: payload.name || 'Petugas Piket Utama',
-            label: payload.label || 'Gerbang Utama & Pos Piket',
-          };
-          setSession(newSession);
-          localStorage.setItem('dkb_session', JSON.stringify(newSession));
-          soundEffects.playSuccessBeep();
-          setActiveTab('attendance');
-          showToast('Berhasil masuk sebagai Petugas Piket.', 'success');
-          return { success: true };
-        } else if (!serverOk) {
-          soundEffects.playErrorBeep();
-          return {
+        soundEffects.playErrorBeep();
+        const errMsg = data.error || 'Presensi gagal disimpan.';
+        setSaveErrorState(errMsg);
+        items.forEach((it) =>
+          it.resolve({
             success: false,
-            error: serverJson?.error || 'Password salah',
-            remainingAttempts: serverJson?.details?.remainingAttempts,
-            lockedForSeconds: serverJson?.details?.lockedForSeconds,
-          };
-        }
+            error: errMsg,
+            isDuplicate: data.isDuplicate,
+            student: data.student,
+          })
+        );
+        return;
       }
 
-      // Autonomous client-side cryptographic verification fallback (Zero plaintext passwords in code)
-      const inputHash = await hashPasswordSecurely(password);
-      const isAuthorized = SECURE_OFFLINE_ROLE_HASHES.duty.includes(inputHash);
+      const savedResults: any[] = Array.isArray(data.results) ? data.results : [];
+      const rejectedList: any[] = Array.isArray(data.rejectedDuplicates) ? data.rejectedDuplicates : [];
 
-      if (isAuthorized) {
-        const token = createClientToken({
-          userId: 'user_duty_main',
-          role: 'duty',
-          name: 'Petugas Piket Utama',
-          label: 'Gerbang Utama & Pos Piket',
-        });
-        const newSession: AuthSession = {
-          token,
-          userId: 'user_duty_main',
-          role: 'duty',
-          name: 'Petugas Piket Utama',
-          label: 'Gerbang Utama & Pos Piket',
-        };
-        setSession(newSession);
-        localStorage.setItem('dkb_session', JSON.stringify(newSession));
+      if (savedResults.length > 0) {
         soundEffects.playSuccessBeep();
-        setActiveTab('attendance');
-        showToast('Berhasil masuk sebagai Petugas Piket.', 'success');
-        return { success: true };
+        setAttendance((prev) => [
+          ...savedResults.map((r) => r.record),
+          ...prev.filter((p) => !savedResults.some((sr) => sr.record.id === p.id)),
+        ]);
+        setSavedState('Tersimpan');
       } else {
         soundEffects.playErrorBeep();
-        return { success: false, error: 'Password piket salah. Coba lagi.' };
+        setSaveErrorState(rejectedList[0]?.message || 'Presensi ditolak.');
       }
+
+      // Map each queued item to its result
+      items.forEach((it) => {
+        const targetStudent = students.find(
+          (s) =>
+            (it.params.studentId && s.nis === it.params.studentId) ||
+            (it.params.code &&
+              (s.nis.toLowerCase() === it.params.code.trim().toLowerCase() ||
+                s.rfid_uid.toLowerCase() === it.params.code.trim().toLowerCase() ||
+                s.card_code.toLowerCase() === it.params.code.trim().toLowerCase()))
+        );
+
+        const matchSaved = savedResults.find(
+          (r) =>
+            (targetStudent && r.record.student_id === targetStudent.nis) ||
+            (it.params.studentId && r.record.student_id === it.params.studentId)
+        );
+
+        if (matchSaved) {
+          it.resolve({
+            success: true,
+            record: matchSaved.record,
+            student: matchSaved.student,
+            session: matchSaved.session,
+          });
+          return;
+        }
+
+        const matchRejected = rejectedList.find(
+          (r) =>
+            (targetStudent && r.studentId === targetStudent.nis) ||
+            (it.params.studentId && r.studentId === it.params.studentId) ||
+            (it.params.code && r.code === it.params.code)
+        );
+
+        it.resolve({
+          success: false,
+          error: matchRejected?.message || rejectedList[0]?.message || 'Presensi gagal atau duplikat hari ini.',
+          isDuplicate: Boolean(matchRejected?.isDuplicate),
+          student: targetStudent,
+        });
+      });
+
+      refreshFromSheets(true);
     } catch {
-      soundEffects.playErrorBeep();
-      return { success: false, error: 'Terjadi kesalahan saat masuk.' };
+      const existingOffline = readOfflineScans();
+      const newOffline = [...existingOffline, ...items.map((i) => i.params)];
+      writeOfflineScans(newOffline);
+      setPendingOfflineScansCount(newOffline.length);
+      setSyncStatus('offline');
+      setSaveErrorState('Offline: scan tersimpan sementara di perangkat.');
+      items.forEach((it) =>
+        it.resolve({
+          success: false,
+          error: 'Tidak ada koneksi internet. Scan disimpan di perangkat & dikirim otomatis saat online.',
+          offlineQueued: true,
+        })
+      );
+    }
+  }, [session?.token, students, refreshFromSheets, setSavingState, setSavedState, setSaveErrorState]);
+
+  /**
+   * Helper to run direct write fetch with 'Menyimpan...' -> 'Tersimpan' status and 409 Conflict UI
+   */
+  const runWriteRequest = useCallback(
+    async (params: {
+      url: string;
+      method: 'POST' | 'PUT' | 'DELETE';
+      body: any;
+      conflictTitle?: string;
+      onSuccess?: (data: any) => void;
+      successMessage?: string;
+      silentToast?: boolean;
+    }): Promise<{ ok: boolean; data?: any; error?: string }> => {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        const offlineMsg = 'Tidak ada koneksi internet. Operasi edit/simpan data memerlukan koneksi ke Google Sheets.';
+        setSaveErrorState(offlineMsg);
+        if (!params.silentToast) showToast(offlineMsg, 'error');
+        return { ok: false, error: offlineMsg };
+      }
+
+      setSavingState();
+
+      const execute = async (forceOverwrite = false): Promise<{ ok: boolean; data?: any; error?: string }> => {
+        try {
+          const payload = forceOverwrite ? { ...params.body, forceOverwrite: true } : params.body;
+          const res = await fetch(params.url, {
+            method: params.method,
+            headers: {
+              'Content-Type': 'application/json',
+              ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+            },
+            body: JSON.stringify(payload),
+          });
+          const data = await res.json().catch(() => ({}));
+
+          if (res.status === 409 && data.conflict) {
+            const msg = data.error || 'Data sudah diubah oleh pengguna lain sebelum Anda menyimpan.';
+            setSaveErrorState('Konflik edit terdeteksi');
+            return await new Promise((resolve) => {
+              setConflictPrompt({
+                title: params.conflictTitle || 'Peringatan Konflik Data',
+                message: msg,
+                currentData: data.current,
+                onReloadLatest: async () => {
+                  setConflictPrompt(null);
+                  await refreshFromSheets(true);
+                  resolve({ ok: false, error: msg });
+                },
+                onForceOverwrite: async () => {
+                  setConflictPrompt(null);
+                  setSavingState();
+                  const forcedRes = await execute(true);
+                  resolve(forcedRes);
+                },
+              });
+            });
+          }
+
+          if (!res.ok) {
+            const errMsg = data.error || `Gagal menyimpan data (${res.status})`;
+            setSaveErrorState(errMsg);
+            if (!params.silentToast) showToast(errMsg, 'error');
+            return { ok: false, error: errMsg, data };
+          }
+
+          setSavedState('Tersimpan');
+          if (params.onSuccess) params.onSuccess(data);
+          if (params.successMessage && !params.silentToast) {
+            showToast(params.successMessage, 'success');
+          }
+          refreshFromSheets(true);
+          return { ok: true, data };
+        } catch (err: any) {
+          const errMsg = err?.message || 'Gagal terhubung ke server.';
+          setSaveErrorState(errMsg);
+          if (!params.silentToast) showToast(errMsg, 'error');
+          return { ok: false, error: errMsg };
+        }
+      };
+
+      return execute(false);
+    },
+    [session?.token, refreshFromSheets, setSavingState, setSavedState, setSaveErrorState, showToast]
+  );
+
+  // ==================== AUTH ACTIONS ====================
+  const decodeJwtPayload = (token: string): any => {
+    try {
+      return JSON.parse(atob(token.split('.')[1]));
+    } catch {
+      return {};
+    }
+  };
+
+  const loginDuty = async (password: string) => {
+    try {
+      const res = await fetch('/api/auth?action=login_duty', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return {
+          success: false,
+          error: data.error || 'Password salah',
+          remainingAttempts: data.details?.remainingAttempts ?? data.remainingAttempts,
+          lockedForSeconds: data.details?.lockedForSeconds ?? data.lockedForSeconds,
+        };
+      }
+      const payload = decodeJwtPayload(data.token);
+      const authSess: AuthSession = {
+        token: data.token,
+        userId: payload.userId,
+        role: payload.role,
+        name: payload.name,
+        label: payload.label,
+        tokenVersion: payload.tokenVersion,
+      };
+      setSession(authSess);
+      localStorage.setItem('dkb_session', JSON.stringify(authSess));
+      refreshFromSheets(true);
+      return { success: true };
+    } catch {
+      return { success: false, error: 'Gagal menghubungi server autentikasi.' };
     }
   };
 
   const unlockHomeroom = async (name: string, password: string, classId?: string) => {
-    const targetClassId = classId || classes[0]?.id || '10-RPL-1';
     try {
-      let serverJson: any = null;
-      let serverOk = false;
-      let serverReturnedJson = false;
-
-      try {
-        const res = await fetch('/api/auth', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-          },
-          body: JSON.stringify({ action: 'unlock_homeroom', name, password, ...(classId ? { classId } : {}) }),
-        });
-
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          serverReturnedJson = true;
-          serverOk = res.ok;
-          serverJson = await res.json();
-        }
-      } catch {}
-
-      if (serverReturnedJson) {
-        if (serverOk && serverJson?.token) {
-          const token = serverJson.token;
-          const assignedClassId = serverJson.classId || targetClassId;
-          const payload = decodeTokenPayload(token);
-          const newSession: AuthSession = {
-            token,
-            userId: payload.userId || session?.userId || 'user_homeroom',
-            role: payload.role || session?.role || 'homeroom',
-            name: serverJson.teacherName || payload.name || name,
-            label: payload.label || session?.label || `Wali Kelas ${assignedClassId}`,
-            lockedMenuRole: 'homeroom',
-            lockedMenuClassId: assignedClassId,
-          };
-          setSession(newSession);
-          localStorage.setItem('dkb_session', JSON.stringify(newSession));
-          setActiveTab('homeroom');
-          soundEffects.playSuccessBeep();
-          showToast(`Akses Wali Kelas terbuka untuk ${serverJson.teacherName || name} (Kelas ${assignedClassId}).`, 'success');
-          return { success: true, classId: assignedClassId };
-        } else if (!serverOk) {
-          soundEffects.playErrorBeep();
-          return { success: false, error: serverJson?.error || 'Password wali kelas salah' };
-        }
-      }
-
-      // Autonomous client-side cryptographic verification fallback (Zero plaintext passwords in code)
-      const matchedClass = classes.find((c) => c.id === targetClassId);
-      const inputHash = await hashPasswordSecurely(password);
-      const isAuthorized = SECURE_OFFLINE_ROLE_HASHES.homeroom.includes(inputHash);
-
-      if (isAuthorized) {
-        const token = createClientToken({
-          userId: 'user_homeroom',
-          role: 'homeroom',
-          name: name || matchedClass?.homeroom_teacher_name || 'Wali Kelas',
-          label: `Wali Kelas ${targetClassId}`,
-        });
-        const newSession: AuthSession = {
-          token,
-          userId: session?.userId || 'user_homeroom',
-          role: session?.role || 'homeroom',
-          name: name || matchedClass?.homeroom_teacher_name || 'Wali Kelas',
-          label: `Wali Kelas ${targetClassId}`,
-          lockedMenuRole: 'homeroom',
-          lockedMenuClassId: targetClassId,
-        };
-        setSession(newSession);
-        localStorage.setItem('dkb_session', JSON.stringify(newSession));
-        setActiveTab('homeroom');
-        soundEffects.playSuccessBeep();
-        showToast(`Akses Wali Kelas terbuka (Kelas ${targetClassId}).`, 'success');
-        return { success: true, classId: targetClassId };
-      } else {
-        soundEffects.playErrorBeep();
-        return { success: false, error: 'Password wali kelas salah. Coba lagi.' };
-      }
+      const res = await fetch('/api/auth?action=unlock_homeroom', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+        },
+        body: JSON.stringify({ name, password, classId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return { success: false, error: data.error || 'Password wali kelas salah' };
+      const payload = decodeJwtPayload(data.token);
+      const authSess: AuthSession = {
+        token: data.token,
+        userId: payload.userId || 'homeroom',
+        role: payload.role || 'homeroom',
+        name: payload.name || data.teacherName || name,
+        label: payload.label || `Wali Kelas ${data.classId || ''}`,
+        tokenVersion: payload.tokenVersion || 1,
+        lockedMenuRole: 'homeroom',
+        lockedMenuClassId: data.classId || payload.lockedMenuClassId,
+      };
+      setSession(authSess);
+      localStorage.setItem('dkb_session', JSON.stringify(authSess));
+      setActiveTab('homeroom');
+      refreshFromSheets(true);
+      return { success: true, classId: data.classId };
     } catch {
-      soundEffects.playErrorBeep();
-      return { success: false, error: 'Gagal memverifikasi password wali kelas.' };
+      return { success: false, error: 'Gagal menghubungi server autentikasi.' };
     }
   };
 
   const unlockStudentAffairs = async (password: string) => {
     try {
-      let serverJson: any = null;
-      let serverOk = false;
-      let serverReturnedJson = false;
-
-      try {
-        const res = await fetch('/api/auth', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-          },
-          body: JSON.stringify({ action: 'unlock_student_affairs', password }),
-        });
-
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          serverReturnedJson = true;
-          serverOk = res.ok;
-          serverJson = await res.json();
-        }
-      } catch {}
-
-      if (serverReturnedJson) {
-        if (serverOk && serverJson?.token) {
-          const token = serverJson.token;
-          const payload = decodeTokenPayload(token);
-          const newSession: AuthSession = {
-            token,
-            userId: payload.userId || session?.userId || 'user_student_affairs',
-            role: payload.role || session?.role || 'student_affairs',
-            name: payload.name || session?.name || 'Bagian Kesiswaan',
-            label: payload.label || session?.label || 'Tim Kesiswaan',
-            lockedMenuRole: 'student_affairs',
-          };
-          setSession(newSession);
-          localStorage.setItem('dkb_session', JSON.stringify(newSession));
-          setActiveTab('student_affairs');
-          soundEffects.playSuccessBeep();
-          showToast('Akses Kesiswaan terbuka.', 'success');
-          return { success: true };
-        } else if (!serverOk) {
-          soundEffects.playErrorBeep();
-          return { success: false, error: serverJson?.error || 'Password kesiswaan salah' };
-        }
-      }
-
-      // Autonomous client-side cryptographic verification fallback (Zero plaintext passwords in code)
-      const inputHash = await hashPasswordSecurely(password);
-      const isAuthorized = SECURE_OFFLINE_ROLE_HASHES.student_affairs.includes(inputHash);
-
-      if (isAuthorized) {
-        const token = createClientToken({
-          userId: 'user_student_affairs',
-          role: 'student_affairs',
-          name: 'Bagian Kesiswaan',
-          label: 'Tim Kesiswaan',
-        });
-        const newSession: AuthSession = {
-          token,
-          userId: session?.userId || 'user_student_affairs',
-          role: session?.role || 'student_affairs',
-          name: session?.name || 'Bagian Kesiswaan',
-          label: session?.label || 'Tim Kesiswaan',
-          lockedMenuRole: 'student_affairs',
-        };
-        setSession(newSession);
-        localStorage.setItem('dkb_session', JSON.stringify(newSession));
-        setActiveTab('student_affairs');
-        soundEffects.playSuccessBeep();
-        showToast('Akses Kesiswaan terbuka.', 'success');
-        return { success: true };
-      } else {
-        soundEffects.playErrorBeep();
-        return { success: false, error: 'Password kesiswaan salah. Coba lagi.' };
-      }
+      const res = await fetch('/api/auth?action=unlock_student_affairs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+        },
+        body: JSON.stringify({ password }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return { success: false, error: data.error || 'Password kesiswaan salah' };
+      const payload = decodeJwtPayload(data.token);
+      const authSess: AuthSession = {
+        token: data.token,
+        userId: payload.userId || 'student_affairs',
+        role: payload.role || 'student_affairs',
+        name: payload.name || 'Bagian Kesiswaan',
+        label: payload.label || 'Tim Kesiswaan',
+        tokenVersion: payload.tokenVersion || 1,
+        lockedMenuRole: 'student_affairs',
+      };
+      setSession(authSess);
+      localStorage.setItem('dkb_session', JSON.stringify(authSess));
+      setActiveTab('student_affairs');
+      refreshFromSheets(true);
+      return { success: true };
     } catch {
-      soundEffects.playErrorBeep();
-      return { success: false, error: 'Gagal memverifikasi password kesiswaan.' };
+      return { success: false, error: 'Gagal menghubungi server autentikasi.' };
     }
   };
 
   const unlockAdmin = async (password: string) => {
     try {
-      let serverJson: any = null;
-      let serverOk = false;
-      let serverReturnedJson = false;
-
-      try {
-        const res = await fetch('/api/auth', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-          },
-          body: JSON.stringify({ action: 'unlock_admin', password }),
-        });
-
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          serverReturnedJson = true;
-          serverOk = res.ok;
-          serverJson = await res.json();
-        }
-      } catch {}
-
-      if (serverReturnedJson) {
-        if (serverOk && serverJson?.token) {
-          const token = serverJson.token;
-          const payload = decodeTokenPayload(token);
-          const newSession: AuthSession = {
-            token,
-            userId: payload.userId || session?.userId || 'user_admin_main',
-            role: payload.role || session?.role || 'admin',
-            name: payload.name || session?.name || 'Administrator Sekolah',
-            label: payload.label || session?.label || 'Admin Sistem',
-            lockedMenuRole: 'admin',
-          };
-          setSession(newSession);
-          localStorage.setItem('dkb_session', JSON.stringify(newSession));
-          setActiveTab('admin');
-          soundEffects.playSuccessBeep();
-          showToast('Akses Administrator terbuka.', 'success');
-          return { success: true };
-        } else if (!serverOk) {
-          soundEffects.playErrorBeep();
-          return { success: false, error: serverJson?.error || 'Password admin salah' };
-        }
-      }
-
-      // Autonomous client-side cryptographic verification fallback (Zero plaintext passwords in code)
-      const inputHash = await hashPasswordSecurely(password);
-      const isAuthorized = SECURE_OFFLINE_ROLE_HASHES.admin.includes(inputHash);
-
-      if (isAuthorized) {
-        const token = createClientToken({
-          userId: 'user_admin_main',
-          role: 'admin',
-          name: 'Administrator Sekolah',
-          label: 'Admin Sistem',
-        });
-        const newSession: AuthSession = {
-          token,
-          userId: session?.userId || 'user_admin_main',
-          role: session?.role || 'admin',
-          name: session?.name || 'Administrator Sekolah',
-          label: session?.label || 'Admin Sistem',
-          lockedMenuRole: 'admin',
-        };
-        setSession(newSession);
-        localStorage.setItem('dkb_session', JSON.stringify(newSession));
-        setActiveTab('admin');
-        soundEffects.playSuccessBeep();
-        showToast('Akses Administrator terbuka.', 'success');
-        return { success: true };
-      } else {
-        soundEffects.playErrorBeep();
-        return { success: false, error: 'Password admin salah. Coba lagi.' };
-      }
+      const res = await fetch('/api/auth?action=unlock_admin', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+        },
+        body: JSON.stringify({ password }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return { success: false, error: data.error || 'Password admin salah' };
+      const payload = decodeJwtPayload(data.token);
+      const authSess: AuthSession = {
+        token: data.token,
+        userId: payload.userId || 'admin',
+        role: 'admin',
+        name: payload.name || 'Administrator',
+        label: payload.label || 'Admin Sistem',
+        tokenVersion: payload.tokenVersion || 1,
+        lockedMenuRole: 'admin',
+      };
+      setSession(authSess);
+      localStorage.setItem('dkb_session', JSON.stringify(authSess));
+      setActiveTab('admin');
+      refreshFromSheets(true);
+      return { success: true };
     } catch {
-      soundEffects.playErrorBeep();
-      return { success: false, error: 'Gagal memverifikasi password admin.' };
+      return { success: false, error: 'Gagal menghubungi server autentikasi.' };
     }
   };
 
   const logout = () => {
     setSession(null);
     localStorage.removeItem('dkb_session');
-    setActiveTab('attendance');
-    showToast('Anda telah keluar ke menu awal login.', 'info');
+    localStorage.removeItem('dkb_active_tab');
+    setActiveTabState('attendance');
   };
 
-  const lockCurrentMenu = () => {
-    if (!session) return;
-    setSession(null);
-    localStorage.removeItem('dkb_session');
-    setActiveTab('attendance');
-    showToast('Menu dikunci. Silakan masuk kembali melalui menu awal login.', 'info');
-  };
+  const lockCurrentMenu = () => logout();
 
   const updateSessionToken = (newToken: string) => {
     try {
-      const base64Url = newToken.split('.')[1];
-      const payload = JSON.parse(decodeURIComponent(escape(atob(base64Url))));
-      setSession((prev) => {
-        if (!prev) return null;
-        const updated: AuthSession = {
-          ...prev,
-          token: newToken,
-          userId: payload.userId || prev.userId,
-          role: payload.role || prev.role,
-          name: payload.name || prev.name,
-          tokenVersion: payload.tokenVersion || payload.token_version,
-          lockedMenuRole: prev.lockedMenuRole,
-          lockedMenuClassId: prev.lockedMenuClassId,
-        };
-        localStorage.setItem('dkb_session', JSON.stringify(updated));
-        return updated;
-      });
-    } catch (err) {
-      console.error('Failed to update session token:', err);
-    }
+      const payload = decodeJwtPayload(newToken);
+      const updatedSess: AuthSession = {
+        ...session!,
+        token: newToken,
+        tokenVersion: payload.tokenVersion,
+      };
+      setSession(updatedSess);
+      localStorage.setItem('dkb_session', JSON.stringify(updatedSess));
+    } catch {}
   };
 
-  const toggleKioskFullscreen = () => {
-    if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen().then(() => setIsKioskFullscreen(true)).catch(() => {});
-    } else {
-      document.exitFullscreen().then(() => setIsKioskFullscreen(false)).catch(() => {});
-    }
-  };
-
-  // Content-aware signature for automatic Google Drive & Google Sheets sync
-  // Excludes timestamps & sync metadata so saving google_last_synced_at never causes a sync loop
-  const driveSheetSignature = React.useMemo(() => {
-    const {
-      google_last_synced_at: _ls,
-      updated_at: _ua,
-      google_drive_backup_file_id: _bfi,
-      google_drive_backup_file_url: _bfu,
-      ...coreSettings
-    } = settings;
-    const { updated_at: _nua, ...coreNotif } = notificationSettings;
-    return JSON.stringify({
-      students,
-      classes,
-      sessions,
-      violationTypes,
-      attendance,
-      outOfClass,
-      violations,
-      leaveRequests,
-      coreSettings,
-      coreNotif,
-    });
-  }, [
-    students,
-    classes,
-    sessions,
-    violationTypes,
-    attendance,
-    outOfClass,
-    violations,
-    leaveRequests,
-    settings,
-    notificationSettings,
-  ]);
-
-  const registerGoogleSessionOnServer = useCallback(
-    async (
-      accessToken: string,
-      info?: { email?: string; name?: string; clientId?: string; expiresIn?: number }
-    ): Promise<{ serverDriveSyncActive: boolean; restoredFromCloud?: boolean }> => {
-      if (!accessToken) return { serverDriveSyncActive: false };
-      try {
-        const res = await fetch('/api/google-sync/session', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${accessToken}`,
-          },
-          body: JSON.stringify({
-            expiresIn: info?.expiresIn || getTokenExpiresInSeconds(),
-            email: info?.email,
-            name: info?.name,
-            clientId: info?.clientId,
-          }),
-        });
-        if (res.ok) {
-          const data = await res.json().catch(() => ({}));
-          const active = Boolean(data.serverDriveSyncActive ?? true);
-          const perm = Boolean(data.permanentDriveSync);
-          setServerDriveSyncActive(active);
-          if (data.permanentDriveSync !== undefined) {
-            setPermanentDriveSync(perm);
-          }
-          if (data.driveSyncMode) {
-            setDriveSyncMode(data.driveSyncMode);
-          }
-          setGoogleNeedsInteractiveReauth(false);
-          try {
-            localStorage.setItem('dkb_cache_server_drive_active', String(active));
-            if (data.permanentDriveSync !== undefined) {
-              localStorage.setItem('dkb_cache_permanent_drive_sync', String(perm));
-            }
-          } catch {}
-          if (data.restoredFromCloud) {
-            await syncNow(false, true);
-          }
-          return { serverDriveSyncActive: active, restoredFromCloud: Boolean(data.restoredFromCloud) };
-        }
-      } catch (e) {
-        console.warn('[Google Session Bridge Warning]:', e);
-      }
-      return { serverDriveSyncActive: false };
-    },
-    [syncNow]
-  );
-
-  // Google Workspace Integration Actions (Strict Google OAuth 2.0)
-  const connectGoogle = async (promptSelect: boolean = true, emailHint?: string, overrideClientId?: string) => {
-    try {
-      setGoogleSyncing(true);
-      const latestSettings = settingsRef.current;
-      const targetHint = emailHint || latestSettings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com';
-      const targetClientId =
-        overrideClientId !== undefined
-          ? overrideClientId.trim()
-          : (latestSettings.google_client_id || '').trim();
-      if (targetClientId) {
-        registerGoogleClientIdToJs(targetClientId);
-      }
-      showToast(`Membuka Google OAuth 2.0 untuk ${targetHint}...`, 'info');
-      const res = await signInWithGoogle(promptSelect, targetClientId, targetHint);
-      if (res.cancelled || !res.accessToken) {
-        showToast('Otorisasi Google OAuth 2.0 dibatalkan.', 'info');
-        return { success: false };
-      }
-      const { accessToken, accountInfo, expiresIn } = res;
-      setGoogleAccount(accountInfo);
-      setGoogleSheetsConnected(true);
-      setGoogleOAuthActive(hasValidGoogleToken());
-      setGoogleNeedsInteractiveReauth(false);
-      showToast(`OAuth 2.0 terverifikasi (${accountInfo.email}). Menghubungkan sinkron permanen...`, 'info');
-
-      const resolvedClientId = targetClientId || latestSettings.google_client_id || '';
-      await registerGoogleSessionOnServer(accessToken, {
-        email: accountInfo.email,
-        name: accountInfo.name,
-        clientId: resolvedClientId,
-        expiresIn,
-      });
-      await syncNow(false, false);
-
-      const curSnap = latestLocalDataRef.current;
-      const nextNotifSettings: NotificationSettings = {
-        ...curSnap.notificationSettings,
-        email_enabled: true,
-        weekly_recap_enabled: curSnap.notificationSettings.weekly_recap_enabled ?? true,
-      };
-      const nextSettingsSnapshot: AppSettings = {
-        ...settingsRef.current,
-        ...(resolvedClientId ? { google_client_id: resolvedClientId } : {}),
-        google_account_email: accountInfo.email,
-        google_account_name: accountInfo.name,
-        google_account_photo: accountInfo.photo,
-        google_oauth_connected: true,
-        toggle_email_notifications: true,
-      };
-
-      const sigBeforeSync = driveSheetSignature;
-      const syncRes = await syncAllDataToDriveAndSheets(accessToken, {
-        students: curSnap.students,
-        classes: curSnap.classes,
-        sessions: curSnap.sessions,
-        attendance: curSnap.attendance,
-        outOfClass: curSnap.outOfClass,
-        violations: curSnap.violations,
-        leaveRequests: curSnap.leaveRequests,
-        violationTypes: curSnap.violationTypes,
-        settings: nextSettingsSnapshot,
-        notificationSettings: nextNotifSettings,
-      });
-
-      if (syncRes.restoredFromCloud && syncRes.recoveredData) {
-        await fetch('/api/sync', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-          },
-          body: JSON.stringify({
-            merge: true,
-            classes: syncRes.recoveredData.classes,
-            students: syncRes.recoveredData.students,
-            sessions: syncRes.recoveredData.sessions,
-            violation_types: syncRes.recoveredData.violation_types,
-            attendance: syncRes.recoveredData.attendance,
-            out_of_class: syncRes.recoveredData.out_of_class,
-            violations: syncRes.recoveredData.violations,
-            leave_requests: syncRes.recoveredData.leave_requests,
-          }),
-        }).catch(() => {});
-        await syncNow(false, true);
-      }
-
-      const nowIso = new Date().toISOString();
-      lastAutoSheetSigRef.current = sigBeforeSync;
-      await updateSettings(
-        {
-          ...(resolvedClientId ? { google_client_id: resolvedClientId } : {}),
-          google_account_email: accountInfo.email,
-          google_account_name: accountInfo.name,
-          google_account_photo: accountInfo.photo,
-          google_drive_folder_id: syncRes.folderId,
-          google_drive_folder_url: syncRes.folderUrl,
-          google_drive_backup_file_id: syncRes.backupFileId,
-          google_drive_backup_file_url: syncRes.backupFileUrl,
-          google_sheet_id: syncRes.spreadsheetId,
-          google_sheet_url: syncRes.spreadsheetUrl,
-          google_last_synced_at: nowIso,
-          google_oauth_connected: true,
-          toggle_email_notifications: true,
-        },
-        { silent: true }
-      );
-
-      if (!notificationSettings.email_enabled) {
-        await updateNotificationSettings({ email_enabled: true }, { silent: true });
-      }
-
-      showToast(
-        syncRes.restoredFromCloud
-          ? `OAuth 2.0 (${accountInfo.email}) terhubung & data dipulihkan otomatis dari cadangan Google Drive/Sheets!`
-          : `OAuth 2.0 (${accountInfo.email}) terhubung permanen! Email, DB, Drive & Sheets sinkron (${syncRes.rowsUpdated} baris).`,
-        'success'
-      );
-      return { success: true };
-    } catch (err: any) {
-      console.error('[Google OAuth 2.0 Connect Error]:', err);
-      setGoogleOAuthActive(hasValidGoogleToken());
-      showToast(err.message || 'Gagal menghubungkan Akun Google OAuth 2.0', 'error');
-      return { success: false, error: err.message };
-    } finally {
-      setGoogleSyncing(false);
-    }
-  };
-
-  const disconnectGoogle = async () => {
-    try {
-      await disconnectGoogleAccount();
-      await fetch('/api/google-sync/session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'disconnect' }),
-      }).catch(() => {});
-      setGoogleAccount(null);
-      setGoogleSheetsConnected(false);
-      setGoogleOAuthActive(false);
-      setServerDriveSyncActive(false);
-      setGoogleAutoRefreshing(false);
-      setGoogleNeedsInteractiveReauth(false);
-      try {
-        localStorage.removeItem('dkb_cache_server_drive_active');
-      } catch {}
-      lastAutoSheetSigRef.current = '';
-      await updateSettings({
-        google_account_email: '',
-        google_account_name: '',
-        google_account_photo: '',
-        google_drive_folder_id: '',
-        google_drive_folder_url: '',
-        google_drive_backup_file_id: '',
-        google_drive_backup_file_url: '',
-        google_sheet_id: '',
-        google_sheet_url: '',
-        google_last_synced_at: '',
-        google_oauth_connected: false,
-      });
-      showToast('Akun Google berhasil diputuskan. Database lokal tetap aktif.', 'info');
-    } catch (err: any) {
-      showToast(err.message || 'Gagal memutuskan akun Google', 'error');
-    }
-  };
-
-  const linkEmailDirectly = async (email: string, name?: string): Promise<{ success: boolean; error?: string }> => {
-    try {
-      const cleanEmail = email.trim();
-      if (!cleanEmail || !cleanEmail.includes('@')) {
-        showToast('Masukkan alamat email yang valid (contoh: kswsmp.puncakdarussalam@gmail.com)', 'error');
-        return { success: false, error: 'Email tidak valid' };
-      }
-      const displayName = (name && name.trim()) || settingsRef.current.google_account_name || cleanEmail.split('@')[0];
-      const nowIso = new Date().toISOString();
-
-      const accountInfo: ConnectedGoogleAccount = {
-        email: cleanEmail,
-        name: displayName,
-        uid: `direct_${Date.now()}`,
-        connectedAt: nowIso,
-      };
-
-      setGoogleAccount(accountInfo);
-      setGoogleSheetsConnected(true);
-
-      await updateSettings({
-        google_account_email: cleanEmail,
-        google_account_name: displayName,
-        google_last_synced_at: nowIso,
-        toggle_email_notifications: true,
-      });
-
-      if (!notificationSettings.email_enabled) {
-        await updateNotificationSettings({ email_enabled: true }, { silent: true });
-      }
-
-      showToast(`Email ${cleanEmail} tersimpan permanen & otomatis sinkron meski refresh atau tutup aplikasi!`, 'success');
-      return { success: true };
-    } catch (err: any) {
-      showToast(err.message || 'Gagal menautkan email', 'error');
-      return { success: false, error: err.message };
-    }
-  };
-
-  const syncGoogleSheetsNow = async (emailHint?: string, overrideClientId?: string) => {
-    try {
-      setGoogleSyncing(true);
-      let token = hasValidGoogleToken() ? await getAccessToken() : null;
-      const latestSettings = settingsRef.current;
-      const targetHint = emailHint || latestSettings.google_account_email || 'kswsmp.puncakdarussalam@gmail.com';
-      const targetClientId =
-        overrideClientId !== undefined
-          ? overrideClientId.trim()
-          : (latestSettings.google_client_id || '').trim();
-      if (targetClientId) {
-        registerGoogleClientIdToJs(targetClientId);
-      }
-
-      // If browser in-memory token was cleared after refresh/reopen, reuse permanent bridge or active server OAuth session first (no popup)
-      if (!token && (permanentDriveSync || (serverDriveSyncActive && !googleNeedsInteractiveReauth))) {
-        try {
-          const pushRes = await fetch('/api/google-sync/push', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-          });
-          if (pushRes.ok) {
-            const pushData = await pushRes.json().catch(() => ({}));
-            if (pushData.success && !pushData.oauthTokenExpired) {
-              lastAutoSheetSigRef.current = driveSheetSignature;
-              setServerDriveSyncActive(true);
-              setGoogleNeedsInteractiveReauth(false);
-              try {
-                localStorage.setItem('dkb_cache_server_drive_active', 'true');
-              } catch {}
-              showToast(
-                'Sinkronisasi Google Drive & Sheets berhasil secara otomatis!',
-                'success'
-              );
-              return { success: true };
-            }
-            if (pushData.oauthTokenExpired) {
-              setServerDriveSyncActive(false);
-              setGoogleNeedsInteractiveReauth(true);
-              try {
-                localStorage.setItem('dkb_cache_server_drive_active', 'false');
-              } catch {}
-              showToast('Sesi Drive di server kedaluwarsa — klik sekali lagi tombol Sinkron Drive untuk otorisasi ulang.', 'info');
-              return { success: false };
-            }
-          }
-        } catch {}
-      }
-
-      let oauthAccountInfo: ConnectedGoogleAccount | null = null;
-      let tokenExpiresIn = getTokenExpiresInSeconds();
-      if (!token) {
-        showToast(`Meminta otorisasi OAuth 2.0 Google untuk ${targetHint}...`, 'info');
-        const res = await signInWithGoogle(false, targetClientId, targetHint);
-        if (res.cancelled || !res.accessToken) {
-          showToast('Otorisasi Google OAuth 2.0 diperlukan untuk sinkronisasi ke Drive & Sheets.', 'info');
-          return { success: false };
-        }
-        token = res.accessToken;
-        oauthAccountInfo = res.accountInfo;
-        tokenExpiresIn = res.expiresIn || 3500;
-        setGoogleAccount(res.accountInfo);
-        setGoogleSheetsConnected(true);
-        setGoogleOAuthActive(hasValidGoogleToken());
-        setGoogleNeedsInteractiveReauth(false);
-      }
-
-      await registerGoogleSessionOnServer(token, {
-        email: oauthAccountInfo?.email || targetHint,
-        name: oauthAccountInfo?.name || latestSettings.google_account_name,
-        clientId: targetClientId || latestSettings.google_client_id,
-        expiresIn: tokenExpiresIn,
-      });
-      await syncNow(false, false);
-
-      showToast('Menyinkronkan seluruh data (ID Cloud, Sesi, Siswa, Kelas, Presensi) ke Drive & Sheets...', 'info');
-      const sigBeforeSync = driveSheetSignature;
-      const curSnap = latestLocalDataRef.current;
-      const nextSettingsForSync: AppSettings = {
-        ...settingsRef.current,
-        ...(targetClientId ? { google_client_id: targetClientId } : {}),
-        ...(oauthAccountInfo
-          ? {
-              google_account_email: oauthAccountInfo.email,
-              google_account_name: oauthAccountInfo.name,
-              google_account_photo: oauthAccountInfo.photo,
-            }
-          : {}),
-        google_oauth_connected: true,
-        toggle_email_notifications: true,
-      };
-      const nextNotifForSync: NotificationSettings = {
-        ...curSnap.notificationSettings,
-        email_enabled: true,
-      };
-
-      const syncRes = await syncAllDataToDriveAndSheets(token, {
-        students: curSnap.students,
-        classes: curSnap.classes,
-        sessions: curSnap.sessions,
-        attendance: curSnap.attendance,
-        outOfClass: curSnap.outOfClass,
-        violations: curSnap.violations,
-        leaveRequests: curSnap.leaveRequests,
-        violationTypes: curSnap.violationTypes,
-        settings: nextSettingsForSync,
-        notificationSettings: nextNotifForSync,
-      });
-
-      if (syncRes.restoredFromCloud && syncRes.recoveredData) {
-        await fetch('/api/sync', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-          },
-          body: JSON.stringify({
-            merge: true,
-            classes: syncRes.recoveredData.classes,
-            students: syncRes.recoveredData.students,
-            sessions: syncRes.recoveredData.sessions,
-            violation_types: syncRes.recoveredData.violation_types,
-            attendance: syncRes.recoveredData.attendance,
-            out_of_class: syncRes.recoveredData.out_of_class,
-            violations: syncRes.recoveredData.violations,
-            leave_requests: syncRes.recoveredData.leave_requests,
-          }),
-        }).catch(() => {});
-        await syncNow(false, true);
-      }
-
-      const nowIso = new Date().toISOString();
-      lastAutoSheetSigRef.current = sigBeforeSync;
-      await updateSettings(
-        {
-          ...(targetClientId ? { google_client_id: targetClientId } : {}),
-          ...(oauthAccountInfo
-            ? {
-                google_account_email: oauthAccountInfo.email,
-                google_account_name: oauthAccountInfo.name,
-                google_account_photo: oauthAccountInfo.photo,
-              }
-            : {}),
-          google_drive_folder_id: syncRes.folderId,
-          google_drive_folder_url: syncRes.folderUrl,
-          google_drive_backup_file_id: syncRes.backupFileId,
-          google_drive_backup_file_url: syncRes.backupFileUrl,
-          google_sheet_id: syncRes.spreadsheetId,
-          google_sheet_url: syncRes.spreadsheetUrl,
-          google_last_synced_at: nowIso,
-          google_oauth_connected: true,
-          toggle_email_notifications: true,
-        },
-        { silent: true }
-      );
-      if (!notificationSettings.email_enabled) {
-        await updateNotificationSettings({ email_enabled: true }, { silent: true });
-      }
-      setGoogleOAuthActive(hasValidGoogleToken());
-      showToast(
-        syncRes.restoredFromCloud
-          ? 'Data berhasil dipulihkan otomatis dari cadangan Google Drive/Sheets ke aplikasi & database!'
-          : `OAuth 2.0 & Auto-Sync Google Drive + Sheets aktif (${syncRes.rowsUpdated} baris tersinkron).`,
-        'success'
-      );
-      return { success: true, rowsUpdated: syncRes.rowsUpdated };
-    } catch (err: any) {
-      console.error('[Google Sync Error]:', err);
-      setGoogleOAuthActive(hasValidGoogleToken());
-      showToast(err.message || 'Gagal sinkronisasi data ke Google Drive & Sheets', 'error');
-      return { success: false, error: err.message };
-    } finally {
-      setGoogleSyncing(false);
-    }
-  };
-
-  // Helper to push via /api/sync as immediate DB fallback when endpoint fails or session token is absent
-  const pushTwoWayMutation = useCallback(
-    async (type: string, action: string, payload: any, extraBody?: Record<string, any>) => {
-      try {
-        const res = await fetch('/api/sync', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-          },
-          body: JSON.stringify(
-            extraBody || { mutations: [{ type, action, payload }] }
-          ),
-        });
-        if (res.ok) {
-          broadcastSync();
-          return true;
-        }
-      } catch {}
-      enqueueOfflineMutation(type, action, payload);
-      return false;
-    },
-    [session?.token, broadcastSync, enqueueOfflineMutation]
-  );
-
-  // Mutator Operations
-  const recordAttendanceOffline = (params: {
-    code?: string;
-    studentId?: string;
-    sessionId?: string;
-    status?: string;
-    notes?: string;
-    method?: string;
-  }) => {
-    const rawCode = (params.code || params.studentId || '').trim();
-    const matchedStudent = students.find(
-      (s) =>
-        s.nis === rawCode ||
-        s.card_code === rawCode ||
-        s.rfid_uid === rawCode ||
-        s.nisn === rawCode
-    );
-
-    if (!matchedStudent) {
-      soundEffects.playErrorBeep();
-      return {
-        success: false,
-        error: `Kartu / NIS "${rawCode}" tidak terdaftar dalam database lokal perangkat.`,
-      };
-    }
-
-    const todayStr = currentServerTime.toISOString().split('T')[0];
-    const targetSessionId = params.sessionId || activeSession?.id || 'session_1';
-    const alreadyAttended = attendance.some(
-      (a) => a.student_id === matchedStudent.nis && a.date === todayStr && a.session_id === targetSessionId
-    );
-
-    if (alreadyAttended) {
-      soundEffects.playErrorBeep();
-      return {
-        success: false,
-        error: `Siswa ${matchedStudent.name} sudah tercatat presensi sesi ini.`,
-        isDuplicate: true,
-        student: matchedStudent,
-      };
-    }
-
-    const nowH = currentServerTime.getHours();
-    const nowM = currentServerTime.getMinutes();
-    const curMins = nowH * 60 + nowM;
-    let lateMins = 0;
-    let finalStatus = params.status || 'Hadir';
-
-    if (activeSession && activeSession.on_time_limit && !params.status) {
-      const [lh, lm] = activeSession.on_time_limit.split(':').map(Number);
-      const limitMins = lh * 60 + lm;
-      if (curMins > limitMins) {
-        lateMins = curMins - limitMins;
-        finalStatus = 'Terlambat';
-      }
-    }
-
-    const nowIso = new Date().toISOString();
-    const offlineRecord: AttendanceRecord = {
-      id: `att_offline_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      student_id: matchedStudent.nis,
-      session_id: targetSessionId,
-      date: todayStr,
-      timestamp: nowIso,
-      status: finalStatus as any,
-      late_minutes: lateMins,
-      method: ((params.method as any) || 'rfid') as 'rfid' | 'barcode' | 'manual',
-      device_id: 'offline_local_device',
-      notes: params.notes || 'Presensi Tersimpan Offline (Siap Sinkron)',
-      version: 1,
-      created_at: nowIso,
-      updated_at: nowIso,
-    };
-
-    setAttendance((prev) => {
-      const next = [offlineRecord, ...prev];
-      try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
-      return next;
-    });
-
-    enqueueOfflineMutation('attendance', 'insert', offlineRecord);
-    setLocalDataNonce((n) => n + 1);
-    broadcastSync();
-
-    soundEffects.playSuccessBeep();
-    showToast(`Mode Offline: Presensi ${matchedStudent.name} berhasil disimpan lokal & akan otomatis disinkronkan saat online.`, 'info');
-    return {
-      success: true,
-      record: offlineRecord,
-      student: matchedStudent,
-      session: activeSession || undefined,
-    };
-  };
+  // ==================== MUTATORS ====================
 
   const recordAttendance = async (params: {
     code?: string;
@@ -2393,125 +1025,116 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     status?: string;
     notes?: string;
     method?: string;
+    photoBase64?: string;
+    photoFileName?: string;
   }) => {
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      return recordAttendanceOffline(params);
-    }
+    const manualOverride = Boolean(
+      manualSessionOverrideId || (params.sessionId && params.sessionId !== activeSession?.id)
+    );
+    const targetSessionId = params.sessionId || activeSession?.id;
+    const todayStr = getServerNow().toISOString().split('T')[0];
 
-    try {
-      const res = await fetch('/api/attendance', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({
-          ...params,
-          manualOverride: Boolean(manualSessionOverrideId || (params.sessionId && params.sessionId !== activeSession?.id)),
-        }),
-      });
+    // Quick duplicate & card validation against current state before queueing 3s batch
+    const targetStudent = students.find(
+      (s) =>
+        (params.studentId && s.nis === params.studentId) ||
+        (params.code &&
+          (s.nis.toLowerCase() === params.code.trim().toLowerCase() ||
+            s.rfid_uid.toLowerCase() === params.code.trim().toLowerCase() ||
+            s.card_code.toLowerCase() === params.code.trim().toLowerCase()))
+    );
 
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        if (res.status === 401 || res.status >= 500) {
-          return recordAttendanceOffline(params);
-        }
+    if (targetStudent) {
+      const multiSession = sessions.filter((s) => s.is_active).length > 1;
+      const alreadyRecorded = attendance.some(
+        (a) =>
+          a.student_id === targetStudent.nis &&
+          a.date === todayStr &&
+          (multiSession ? a.session_id === targetSessionId : true)
+      );
+      if (alreadyRecorded) {
+        soundEffects.playErrorBeep();
+        const err = `Presensi ganda ditolak: ${targetStudent.name} sudah tercatat presensi hari ini (${todayStr}).`;
+        return { success: false, error: err, isDuplicate: true, student: targetStudent };
+      }
+
+      const alreadyInBatch = scanBatchQueueRef.current.some(
+        (b) =>
+          (b.params.studentId && b.params.studentId === targetStudent.nis) ||
+          (params.code && b.params.code && b.params.code.trim().toLowerCase() === params.code.trim().toLowerCase())
+      );
+      if (alreadyInBatch) {
         soundEffects.playErrorBeep();
         return {
           success: false,
-          error: data.error || 'Presensi gagal',
-          isDuplicate: data.details?.isDuplicate,
-          student: data.details?.student,
+          error: `Presensi ganda dalam antrean 3 detik untuk ${targetStudent.name}.`,
+          isDuplicate: true,
+          student: targetStudent,
         };
       }
-
-      soundEffects.playSuccessBeep();
-      // Optimistic update + localStorage cache
-      setAttendance((prev) => {
-        const next = [data.record, ...prev.filter((a) => a.id !== data.record.id)];
-        try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
-        return next;
-      });
-      setLocalDataNonce((n) => n + 1);
-      broadcastSync();
-      syncNow(false, true);
-      return {
-        success: true,
-        record: data.record,
-        student: data.student,
-        session: data.session,
-      };
-    } catch {
-      return recordAttendanceOffline(params);
     }
+
+    const scanObj: OfflineAttendanceScan = {
+      localId: `scan_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      ...params,
+      sessionId: targetSessionId,
+      manualOverride,
+      queuedAt: new Date().toISOString(),
+    };
+
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      const existing = readOfflineScans();
+      const updated = [...existing, scanObj];
+      writeOfflineScans(updated);
+      setPendingOfflineScansCount(updated.length);
+      soundEffects.playSuccessBeep();
+      setSaveErrorState('Offline: scan disimpan di perangkat & dikirim otomatis saat online.');
+      showToast('Offline: Presensi disimpan sementara di perangkat & akan dikirim otomatis saat online.', 'info');
+      return {
+        success: false,
+        offlineQueued: true,
+        error: 'Mode Offline: Scan disimpan di perangkat dan akan otomatis dikirim saat online.',
+        student: targetStudent,
+      };
+    }
+
+    // Collect scans in frontend for 3 seconds, then send in one batch request
+    return await new Promise<any>((resolve) => {
+      setSavingState();
+      scanBatchQueueRef.current.push({ params: scanObj, resolve });
+      if (!scanBatchTimerRef.current) {
+        scanBatchTimerRef.current = setTimeout(() => {
+          flushScanBatch();
+        }, SCAN_BATCH_WINDOW_MS);
+      }
+    });
   };
 
   const updateAttendance = async (id: string, updates: Partial<AttendanceRecord>, reason: string) => {
-    setAttendance((prev) => {
-      const next = prev.map((a) => (a.id === id ? { ...a, ...updates, audit_reason: reason } : a));
-      try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
-      return next;
+    const existing = attendance.find((a) => a.id === id);
+    const res = await runWriteRequest({
+      url: '/api/attendance',
+      method: 'PUT',
+      body: {
+        id,
+        updates,
+        reason,
+        expected_updated_at: existing?.diubah_pada || existing?.updated_at,
+      },
+      conflictTitle: 'Konflik Edit Presensi',
+      successMessage: 'Presensi berhasil diperbarui & disimpan ke Google Sheets.',
     });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/attendance', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ id, updates, reason }),
-      });
-      if (res.ok) {
-        showToast('Presensi berhasil diperbarui & disinkronkan.', 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('attendance', 'update', { id, updates: { ...updates, audit_reason: reason } });
-      if (synced) {
-        showToast('Presensi berhasil disinkronkan ke database.', 'success');
-        syncNow(false, true);
-      }
-      return synced;
-    } catch {
-      enqueueOfflineMutation('attendance', 'update', { id, updates: { ...updates, audit_reason: reason } });
-      return false;
-    }
+    return res.ok;
   };
 
   const deleteAttendance = async (id: string, reason: string) => {
-    setAttendance((prev) => {
-      const next = prev.filter((a) => a.id !== id);
-      try { localStorage.setItem('dkb_cache_attendance', JSON.stringify(next)); } catch {}
-      return next;
+    const res = await runWriteRequest({
+      url: '/api/attendance',
+      method: 'DELETE',
+      body: { id, reason },
+      successMessage: 'Presensi berhasil ditandai dihapus (soft delete) di Google Sheets.',
     });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/attendance', {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ id, reason }),
-      });
-      if (res.ok) {
-        showToast('Presensi berhasil dibatalkan & disinkronkan.', 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('attendance', 'delete', { id });
-      if (synced) {
-        showToast('Presensi berhasil dihapus & disinkronkan ke database.', 'success');
-        syncNow(false, true);
-      }
-      return synced;
-    } catch {
-      enqueueOfflineMutation('attendance', 'delete', { id });
-      return false;
-    }
+    return res.ok;
   };
 
   const startOutOfClass = async (
@@ -2519,80 +1142,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     type: 'BAK' | 'BAB' | 'Keperluan Lain',
     durationMinutes: number
   ) => {
-    const makeOfflineOutOfClass = () => {
-      const student = students.find((s) => s.nis === studentId);
-      if (!student) return { success: false, error: 'Siswa tidak ditemukan.' };
-      const now = new Date();
-      const expectedReturn = new Date(now.getTime() + durationMinutes * 60000).toISOString();
-      const offlineRecord: OutOfClassRecord = {
-        id: `ooc_off_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        student_id: studentId,
-        class_id: student.class_id,
+    const res = await runWriteRequest({
+      url: '/api/out-of-class',
+      method: 'POST',
+      body: {
+        studentId,
         type,
-        started_at: now.toISOString(),
-        due_at: expectedReturn,
-        status: 'active',
-        duration_minutes: durationMinutes,
-        late_return_minutes: 0,
-        idempotency_key: `ooc_off_${Date.now()}`,
-        version: 1,
-        created_at: now.toISOString(),
-        updated_at: now.toISOString(),
-      };
-      setOutOfClass((prev) => {
-        const next = [offlineRecord, ...prev];
-        try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
-        return next;
-      });
-      enqueueOfflineMutation('out_of_class', 'insert', offlineRecord);
-      setLocalDataNonce((n) => n + 1);
-      broadcastSync();
-      soundEffects.playSuccessBeep();
-      showToast(`Mode Offline: Izin keluar ${student.name} tersimpan lokal & siap sinkron.`, 'info');
-      return { success: true, record: offlineRecord, student };
-    };
-
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      return makeOfflineOutOfClass();
+        durationMinutes,
+        idempotencyKey: `ooc_${Date.now()}_${Math.random()}`,
+      },
+      silentToast: true,
+    });
+    if (!res.ok) {
+      soundEffects.playErrorBeep();
+      return { success: false, error: res.error };
     }
-
-    try {
-      const res = await fetch('/api/out-of-class', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({
-          studentId,
-          type,
-          durationMinutes,
-          idempotencyKey: `ooc_${Date.now()}_${Math.random()}`,
-        }),
-      });
-
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        if (res.status === 401 || res.status >= 500) {
-          return makeOfflineOutOfClass();
-        }
-        soundEffects.playErrorBeep();
-        return { success: false, error: data.error };
-      }
-
-      soundEffects.playSuccessBeep();
-      setOutOfClass((prev) => {
-        const next = [data.record, ...prev.filter((o) => o.id !== data.record.id)];
-        try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
-        return next;
-      });
-      setLocalDataNonce((n) => n + 1);
-      broadcastSync();
-      syncNow(false, true);
-      return { success: true, record: data.record, student: data.student };
-    } catch {
-      return makeOfflineOutOfClass();
-    }
+    soundEffects.playSuccessBeep();
+    return { success: true, record: res.data?.record, student: res.data?.student };
   };
 
   const confirmOutOfClassReturn = async (
@@ -2601,71 +1167,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     notes?: string,
     auditReason?: string
   ) => {
-    const nowIso = new Date().toISOString();
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      setOutOfClass((prev) => {
-        const next = prev.map((o) => (o.id === id ? { ...o, status: 'returned' as const, returned_at: nowIso, return_method: returnMethod, return_notes: notes } : o));
-        try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
-        return next;
-      });
-      enqueueOfflineMutation('out_of_class', 'update', { id, status: 'returned', returned_at: nowIso, return_method: returnMethod, return_notes: notes, audit_reason: auditReason });
-      setLocalDataNonce((n) => n + 1);
-      broadcastSync();
-      soundEffects.playSuccessBeep();
-      showToast('Mode Offline: Pengembalian izin keluar tersimpan lokal.', 'info');
-      return { success: true };
+    const existing = outOfClass.find((o) => o.id === id);
+    const res = await runWriteRequest({
+      url: '/api/out-of-class',
+      method: 'PUT',
+      body: {
+        id,
+        returnMethod,
+        notes,
+        auditReason,
+        expected_updated_at: existing?.diubah_pada || existing?.updated_at,
+      },
+      conflictTitle: 'Konflik Konfirmasi Kepulangan',
+      silentToast: true,
+    });
+    if (!res.ok) {
+      soundEffects.playErrorBeep();
+      return { success: false, error: res.error };
     }
-
-    try {
-      const res = await fetch('/api/out-of-class', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ id, returnMethod, notes, auditReason }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        if (res.status === 401 || res.status >= 500) {
-          const synced = await pushTwoWayMutation('out_of_class', 'update', {
-            id,
-            status: 'returned',
-            returned_at: nowIso,
-            return_method: returnMethod,
-            return_notes: notes,
-            audit_reason: auditReason,
-          });
-          setOutOfClass((prev) => {
-            const next = prev.map((o) =>
-              o.id === id ? { ...o, status: 'returned' as const, returned_at: nowIso, return_method: returnMethod, return_notes: notes } : o
-            );
-            try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
-            return next;
-          });
-          setLocalDataNonce((n) => n + 1);
-          soundEffects.playSuccessBeep();
-          if (synced) syncNow(false, true);
-          return { success: true };
-        }
-        soundEffects.playErrorBeep();
-        return { success: false, error: data.error };
-      }
-
-      soundEffects.playSuccessBeep();
-      setOutOfClass((prev) => {
-        const next = prev.map((o) => (o.id === id ? data.record : o));
-        try { localStorage.setItem('dkb_cache_out_of_class', JSON.stringify(next)); } catch {}
-        return next;
-      });
-      setLocalDataNonce((n) => n + 1);
-      broadcastSync();
-      syncNow(false, true);
-      return { success: true, record: data.record };
-    } catch {
-      enqueueOfflineMutation('out_of_class', 'update', { id, status: 'returned', returned_at: nowIso, return_method: returnMethod, return_notes: notes });
-      return { success: true };
-    }
+    soundEffects.playSuccessBeep();
+    return { success: true, record: res.data?.record };
   };
 
   const recordViolation = async (params: {
@@ -2677,600 +1198,197 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     evidenceBase64?: string;
     evidenceFileName?: string;
   }) => {
-    const makeOfflineViolation = () => {
-      const student = students.find((s) => s.nis === params.studentId);
-      const vt = violationTypes.find((v) => v.id === params.violationTypeId);
-      if (!student || !vt) return { success: false, error: 'Data siswa atau jenis pelanggaran tidak valid.' };
-      const nowIso = new Date().toISOString();
-      const points = params.customPoints !== undefined ? params.customPoints : vt.default_points;
-      const offlineRecord: ViolationRecord = {
-        id: `vio_off_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        student_id: params.studentId,
-        class_id: student.class_id,
-        violation_type_id: params.violationTypeId,
-        type_name: vt.name,
-        category: vt.category,
-        points,
-        notes: params.notes || '',
-        location: params.location,
-        evidence_photo_url: params.evidenceBase64,
-        recorded_by: session?.name || 'Petugas Piket',
-        recorded_at: nowIso,
-        version: 1,
-        created_at: nowIso,
-        updated_at: nowIso,
-      };
-      setViolations((prev) => {
-        const next = [offlineRecord, ...prev];
-        try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
-        return next;
-      });
-      enqueueOfflineMutation('violations', 'insert', offlineRecord);
-      setLocalDataNonce((n) => n + 1);
-      broadcastSync();
-      soundEffects.playSuccessBeep();
-      showToast(`Mode Offline: Pelanggaran ${student.name} (+${points} poin) tersimpan lokal.`, 'info');
-      return { success: true, violation: offlineRecord, studentTotalPoints: points };
+    const res = await runWriteRequest({
+      url: '/api/violations',
+      method: 'POST',
+      body: params,
+      silentToast: true,
+    });
+    if (!res.ok) {
+      soundEffects.playErrorBeep();
+      return { success: false, error: res.error };
+    }
+    soundEffects.playSuccessBeep();
+    return {
+      success: true,
+      violation: res.data?.violation,
+      studentTotalPoints: res.data?.studentTotalPoints,
     };
-
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      return makeOfflineViolation();
-    }
-
-    try {
-      const res = await fetch('/api/violations', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify(params),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        if (res.status === 401 || res.status >= 500) {
-          return makeOfflineViolation();
-        }
-        soundEffects.playErrorBeep();
-        return { success: false, error: data.error };
-      }
-
-      soundEffects.playSuccessBeep();
-      setViolations((prev) => {
-        const next = [data.violation, ...prev.filter((v) => v.id !== data.violation.id)];
-        try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
-        return next;
-      });
-      setLocalDataNonce((n) => n + 1);
-      broadcastSync();
-      syncNow(false, true);
-      return {
-        success: true,
-        violation: data.violation,
-        studentTotalPoints: data.studentTotalPoints,
-      };
-    } catch {
-      return makeOfflineViolation();
-    }
   };
 
   const deleteViolation = async (id: string, reason: string) => {
-    setViolations((prev) => {
-      const next = prev.filter((v) => v.id !== id);
-      try { localStorage.setItem('dkb_cache_violations', JSON.stringify(next)); } catch {}
-      return next;
+    const res = await runWriteRequest({
+      url: '/api/violations',
+      method: 'DELETE',
+      body: { id, reason },
+      successMessage: 'Catatan pelanggaran ditandai dihapus (soft delete) di Google Sheets.',
     });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/violations', {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ id, reason }),
-      });
-      if (res.ok) {
-        showToast('Catatan pelanggaran berhasil dihapus & disinkronkan.', 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('violations', 'delete', { id });
-      if (synced) syncNow(false, true);
-      return synced;
-    } catch {
-      enqueueOfflineMutation('violations', 'delete', { id });
-      return false;
-    }
+    return res.ok;
   };
 
-  const saveStudent = async (student: Student) => {
-    setStudents((prev) => {
-      const idx = prev.findIndex((s) => s.nis === student.nis);
-      const next = idx >= 0 ? prev.map((s) => (s.nis === student.nis ? student : s)) : [...prev, student];
-      try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
-      return next;
+  const saveStudent = async (student: Student & { photoBase64?: string }) => {
+    const existing = students.find((s) => s.nis === student.nis);
+    const res = await runWriteRequest({
+      url: '/api/students',
+      method: 'POST',
+      body: {
+        ...student,
+        expected_updated_at: existing?.diubah_pada || existing?.updated_at,
+      },
+      conflictTitle: `Konflik Edit Siswa (${student.name})`,
+      successMessage: `Data siswa ${student.name} tersimpan di Google Sheets.`,
     });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/students', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify(student),
-      });
-      if (res.ok) {
-        showToast('Data siswa berhasil disimpan & disinkronkan.', 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('students', 'upsert', student);
-      if (synced) {
-        showToast('Data siswa berhasil disinkronkan ke database.', 'success');
-        syncNow(false, true);
-      }
-      return synced;
-    } catch {
-      enqueueOfflineMutation('students', 'upsert', student);
-      showToast('Perubahan siswa disimpan lokal & akan otomatis sinkron saat online.', 'info');
-      return false;
-    }
+    return res.ok;
   };
 
   const deleteStudent = async (nis: string) => {
-    setStudents((prev) => {
-      const next = prev.filter((s) => s.nis !== nis);
-      try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
-      return next;
+    const res = await runWriteRequest({
+      url: '/api/students',
+      method: 'DELETE',
+      body: { nis },
+      successMessage: 'Siswa ditandai dihapus di Google Sheets.',
     });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/students', {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ nis }),
-      });
-      if (res.ok) {
-        showToast('Siswa berhasil dihapus & disinkronkan.', 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('students', 'delete', { nis });
-      if (synced) {
-        showToast('Siswa berhasil dihapus & disinkronkan.', 'success');
-        syncNow(false, true);
-      }
-      return synced;
-    } catch {
-      enqueueOfflineMutation('students', 'delete', { nis });
-      return false;
-    }
+    return res.ok;
   };
 
   const deleteStudents = async (nisses: string[]) => {
-    const delSet = new Set(nisses);
-    setStudents((prev) => {
-      const next = prev.filter((s) => !delSet.has(s.nis));
-      try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
-      return next;
+    const res = await runWriteRequest({
+      url: '/api/students',
+      method: 'DELETE',
+      body: { nisses },
+      successMessage: `${nisses.length} siswa ditandai dihapus di Google Sheets.`,
     });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/students', {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ nisses }),
-      });
-      if (res.ok) {
-        showToast(`${nisses.length} data siswa berhasil dihapus & disinkronkan.`, 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('students', 'delete_many', { nisses });
-      if (synced) {
-        showToast(`${nisses.length} data siswa berhasil dihapus & disinkronkan.`, 'success');
-        syncNow(false, true);
-      }
-      return synced;
-    } catch {
-      enqueueOfflineMutation('students', 'delete_many', { nisses });
-      return false;
-    }
+    return res.ok;
   };
 
   const clearAllStudents = async () => {
-    setStudents([]);
-    try {
-      localStorage.setItem('dkb_cache_students', JSON.stringify([]));
-      localStorage.setItem('dkb_explicit_clear_at', String(Date.now()));
-    } catch {}
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/students', {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ action: 'clear_all' }),
-      });
-      if (res.ok) {
-        showToast('Semua data siswa berhasil dihapus dan disinkronkan.', 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('students', 'clear_all', {});
-      if (synced) {
-        showToast('Semua data siswa berhasil dihapus dan disinkronkan.', 'success');
-        syncNow(false, true);
-      }
-      return synced;
-    } catch {
-      enqueueOfflineMutation('students', 'clear_all', {});
-      return false;
-    }
+    const res = await runWriteRequest({
+      url: '/api/students',
+      method: 'DELETE',
+      body: { action: 'clear_all' },
+      successMessage: 'Seluruh data siswa ditandai dihapus di Google Sheets.',
+    });
+    return res.ok;
   };
 
   const batchImportStudents = async (newStudents: Student[]) => {
-    setStudents((prev) => {
-      const map = new Map(prev.map((s) => [s.nis, s]));
-      for (const s of newStudents) {
-        map.set(s.nis, s);
-      }
-      const next = Array.from(map.values());
-      try { localStorage.setItem('dkb_cache_students', JSON.stringify(next)); } catch {}
-      return next;
+    const res = await runWriteRequest({
+      url: '/api/students?action=batch_import',
+      method: 'POST',
+      body: { students: newStudents },
+      silentToast: true,
     });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/students?action=batch_import', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ students: newStudents }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        showToast(`Impor selesai: ${data.added} ditambahkan, ${data.updated} diperbarui & otomatis disinkronkan.`, 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return { success: true, added: data.added, updated: data.updated };
-      }
-      const synced = await pushTwoWayMutation('students', 'batch_import', { students: newStudents });
-      if (synced) {
-        showToast(`Impor selesai: ${newStudents.length} siswa berhasil disinkronkan.`, 'success');
-        syncNow(false, true);
-      }
-      return { success: synced, added: synced ? newStudents.length : 0, updated: 0 };
-    } catch {
-      enqueueOfflineMutation('students', 'batch_import', { students: newStudents });
-      return { success: false, added: 0, updated: 0 };
+    if (res.ok && res.data) {
+      return {
+        success: true,
+        added: res.data.inserted || 0,
+        updated: res.data.updated || 0,
+      };
     }
+    return { success: false, added: 0, updated: 0 };
   };
 
   const saveClass = async (cls: SchoolClass) => {
-    setClasses((prev) => {
-      const idx = prev.findIndex((c) => c.id === cls.id);
-      const next = idx >= 0 ? prev.map((c) => (c.id === cls.id ? cls : c)) : [...prev, cls];
-      try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
-      return next;
+    const existing = classes.find((c) => c.id === cls.id);
+    const res = await runWriteRequest({
+      url: '/api/classes',
+      method: 'POST',
+      body: {
+        ...cls,
+        expected_updated_at: existing?.diubah_pada || existing?.updated_at,
+      },
+      conflictTitle: `Konflik Edit Kelas (${cls.name})`,
+      successMessage: `Data kelas ${cls.name} tersimpan di Google Sheets.`,
     });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/classes', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify(cls),
-      });
-      if (res.ok) {
-        showToast('Kelas berhasil disimpan & disinkronkan.', 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('classes', 'upsert', cls);
-      if (synced) {
-        showToast('Kelas berhasil disinkronkan ke database.', 'success');
-        syncNow(false, true);
-      }
-      return synced;
-    } catch {
-      enqueueOfflineMutation('classes', 'upsert', cls);
-      return false;
-    }
+    return res.ok;
   };
 
   const deleteClass = async (id: string) => {
-    setClasses((prev) => {
-      const next = prev.filter((c) => c.id !== id && c.id.toLowerCase() !== id.toLowerCase());
-      try { localStorage.setItem('dkb_cache_classes', JSON.stringify(next)); } catch {}
-      return next;
+    const res = await runWriteRequest({
+      url: '/api/classes',
+      method: 'DELETE',
+      body: { id },
+      successMessage: 'Kelas berhasil dihapus (soft delete).',
     });
-    setLocalDataNonce((n) => n + 1);
-    showToast('Kelas berhasil dihapus & disinkronkan.', 'success');
-    try {
-      const res = await fetch(`/api/classes?id=${encodeURIComponent(id)}`, {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ id }),
-      });
-      if (!res.ok) {
-        await pushTwoWayMutation('classes', 'delete', { id });
-      }
-      broadcastSync();
-      syncNow(false, true);
-      return true;
-    } catch {
-      enqueueOfflineMutation('classes', 'delete', { id });
-      return false;
-    }
+    return res.ok;
   };
 
   const saveSession = async (sess: AttendanceSession) => {
-    setSessions((prev) => {
-      const idx = prev.findIndex((s) => s.id === sess.id);
-      const next = idx >= 0 ? prev.map((s) => (s.id === sess.id ? sess : s)) : [...prev, sess];
-      try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
-      return next;
+    const existing = sessions.find((s) => s.id === sess.id);
+    const res = await runWriteRequest({
+      url: '/api/sessions',
+      method: 'POST',
+      body: {
+        ...sess,
+        expected_updated_at: existing?.diubah_pada || existing?.updated_at,
+      },
+      conflictTitle: `Konflik Edit Sesi (${sess.name})`,
+      successMessage: `Sesi ${sess.name} tersimpan di Google Sheets.`,
     });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/sessions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify(sess),
-      });
-      if (res.ok) {
-        showToast('Sesi presensi berhasil disimpan & disinkronkan.', 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('sessions', 'upsert', sess);
-      if (synced) {
-        showToast('Sesi presensi berhasil disimpan & disinkronkan.', 'success');
-        syncNow(false, true);
-      }
-      return synced;
-    } catch {
-      enqueueOfflineMutation('sessions', 'upsert', sess);
-      showToast('Perubahan sesi disimpan lokal & akan otomatis sinkron saat online.', 'info');
-      return false;
-    }
+    return res.ok;
   };
 
   const deleteSession = async (id: string) => {
-    setSessions((prev) => {
-      const next = prev.filter((s) => s.id !== id && s.id.toLowerCase() !== id.toLowerCase());
-      try { localStorage.setItem('dkb_cache_sessions', JSON.stringify(next)); } catch {}
-      return next;
+    const res = await runWriteRequest({
+      url: '/api/sessions',
+      method: 'DELETE',
+      body: { id },
+      successMessage: 'Sesi presensi berhasil dihapus (soft delete).',
     });
-    setLocalDataNonce((n) => n + 1);
-    showToast('Sesi presensi berhasil dihapus & disinkronkan.', 'success');
-    try {
-      const res = await fetch(`/api/sessions?id=${encodeURIComponent(id)}`, {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ id }),
-      });
-      if (!res.ok) {
-        await pushTwoWayMutation('sessions', 'delete', { id });
-      }
-      broadcastSync();
-      syncNow(false, true);
-      return true;
-    } catch {
-      enqueueOfflineMutation('sessions', 'delete', { id });
-      return false;
-    }
+    return res.ok;
   };
 
   const saveViolationType = async (vt: ViolationType) => {
-    setViolationTypes((prev) => {
-      const idx = prev.findIndex((x) => x.id === vt.id);
-      const next = idx >= 0 ? prev.map((x) => (x.id === vt.id ? vt : x)) : [...prev, vt];
-      try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(next)); } catch {}
-      return next;
+    const existing = violationTypes.find((v) => v.id === vt.id);
+    const res = await runWriteRequest({
+      url: '/api/violation-types',
+      method: 'POST',
+      body: {
+        ...vt,
+        expected_updated_at: existing?.diubah_pada || existing?.updated_at,
+      },
+      conflictTitle: `Konflik Edit Jenis Pelanggaran (${vt.name})`,
+      successMessage: `Jenis pelanggaran ${vt.name} tersimpan di Google Sheets.`,
     });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/violation-types', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify(vt),
-      });
-      if (res.ok) {
-        showToast('Jenis pelanggaran berhasil disimpan & disinkronkan.', 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('violation_types', 'upsert', vt);
-      if (synced) {
-        showToast('Jenis pelanggaran berhasil disimpan & disinkronkan.', 'success');
-        syncNow(false, true);
-      }
-      return synced;
-    } catch {
-      enqueueOfflineMutation('violation_types', 'upsert', vt);
-      return false;
-    }
+    return res.ok;
   };
 
   const deleteViolationType = async (id: string) => {
-    setViolationTypes((prev) => {
-      const next = prev.filter((vt) => vt.id !== id);
-      try { localStorage.setItem('dkb_cache_violation_types', JSON.stringify(next)); } catch {}
-      return next;
+    const res = await runWriteRequest({
+      url: '/api/violation-types',
+      method: 'DELETE',
+      body: { id },
+      successMessage: 'Jenis pelanggaran berhasil dihapus (soft delete).',
     });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/violation-types', {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ id }),
-      });
-      if (res.ok) {
-        showToast('Jenis pelanggaran berhasil dihapus & disinkronkan.', 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('violation_types', 'delete', { id });
-      if (synced) {
-        showToast('Jenis pelanggaran berhasil dihapus & disinkronkan.', 'success');
-        syncNow(false, true);
-      }
-      return synced;
-    } catch {
-      enqueueOfflineMutation('violation_types', 'delete', { id });
-      return false;
-    }
+    return res.ok;
   };
 
   const updateSettings = useCallback(
-    async (updates: Partial<AppSettings>, options?: { silent?: boolean }) => {
-      settingsRef.current = { ...settingsRef.current, ...updates };
-      setSettings((prev) => {
-        const next = { ...prev, ...updates };
-        settingsRef.current = next;
-        try {
-          localStorage.setItem('dkb_cache_settings', JSON.stringify(next));
-        } catch {}
-        return next;
+    async (updates: Partial<AppSettings> & { logoBase64?: string }, options?: { silent?: boolean }) => {
+      const res = await runWriteRequest({
+        url: '/api/settings',
+        method: 'POST',
+        body: updates,
+        successMessage: 'Pengaturan aplikasi berhasil disimpan ke Google Sheets.',
+        silentToast: options?.silent,
       });
-      if (updates.google_client_id !== undefined) {
-        registerGoogleClientIdToJs(updates.google_client_id || '');
-      }
-      // Do not re-trigger background Drive/Sheets auto-sync for pure sync-metadata updates
-      const syncMetaKeys = new Set([
-        'google_last_synced_at',
-        'google_drive_backup_file_id',
-        'google_drive_backup_file_url',
-      ]);
-      const updatedKeys = Object.keys(updates);
-      const isPureSyncStamp =
-        updatedKeys.length > 0 && updatedKeys.every((k) => syncMetaKeys.has(k));
-      if (!isPureSyncStamp) {
-        setLocalDataNonce((n) => n + 1);
-      }
-
-      try {
-        const res = await fetch('/api/settings', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-          },
-          body: JSON.stringify(updates),
-        });
-        if (res.ok) {
-          if (!options?.silent) {
-            showToast('Pengaturan aplikasi berhasil disimpan & disinkronkan.', 'success');
-          }
-          broadcastSync();
-          syncNow(false, true);
-          return true;
-        }
-        // Fallback via /api/sync two-way endpoint so settings always persist to DB
-        const synced = await pushTwoWayMutation('settings', 'update', updates, { settings: updates });
-        if (synced) {
-          if (!options?.silent) {
-            showToast('Pengaturan aplikasi berhasil disinkronkan ke database.', 'success');
-          }
-          syncNow(false, true);
-          return true;
-        }
-        return false;
-      } catch {
-        enqueueOfflineMutation('settings', 'update', updates);
-        return false;
-      }
+      return res.ok;
     },
-    [session?.token, showToast, broadcastSync, syncNow, pushTwoWayMutation, enqueueOfflineMutation]
+    [runWriteRequest]
   );
 
   const updateNotificationSettings = useCallback(
     async (updates: Partial<NotificationSettings>, options?: { silent?: boolean }) => {
-      setNotificationSettings((prev) => {
-        const next = { ...prev, ...updates };
-        try {
-          localStorage.setItem('dkb_cache_notification_settings', JSON.stringify(next));
-        } catch {}
-        return next;
+      const res = await runWriteRequest({
+        url: '/api/notifications',
+        method: 'POST',
+        body: updates,
+        successMessage: 'Pengaturan notifikasi email tersimpan ke Google Sheets.',
+        silentToast: options?.silent,
       });
-      setLocalDataNonce((n) => n + 1);
-
-      try {
-        const res = await fetch('/api/notifications', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-          },
-          body: JSON.stringify(updates),
-        });
-        if (res.ok) {
-          if (!options?.silent) {
-            showToast('Pengaturan notifikasi berhasil diperbarui & disinkronkan.', 'success');
-          }
-          broadcastSync();
-          syncNow(false, true);
-          return true;
-        }
-        const synced = await pushTwoWayMutation(
-          'notification_settings',
-          'update',
-          updates,
-          { notification_settings: updates }
-        );
-        if (synced) {
-          if (!options?.silent) {
-            showToast('Pengaturan notifikasi berhasil disinkronkan ke database.', 'success');
-          }
-          syncNow(false, true);
-          return true;
-        }
-        return false;
-      } catch {
-        enqueueOfflineMutation('notification_settings', 'update', updates);
-        return false;
-      }
+      return res.ok;
     },
-    [session?.token, showToast, broadcastSync, syncNow, pushTwoWayMutation, enqueueOfflineMutation]
+    [runWriteRequest]
   );
 
   const sendTestEmail = async (email: string) => {
@@ -3283,9 +1401,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         },
         body: JSON.stringify({ email }),
       });
-      return await res.json();
-    } catch (err: any) {
-      return { success: false, message: err.message || 'Gagal mengirim email uji coba' };
+      const data = await res.json().catch(() => ({}));
+      return { success: Boolean(res.ok && data.success), message: data.message || data.error || 'Selesai' };
+    } catch {
+      return { success: false, message: 'Gagal menghubungi server email.' };
     }
   };
 
@@ -3299,256 +1418,44 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         },
         body: JSON.stringify({ classId }),
       });
-      const data = await res.json();
-      if (res.ok) {
-        if (classId) {
-          showToast(
-            data.sent
-              ? `Rekap mingguan berhasil dikirim ke ${data.recipient || 'email wali kelas'}.`
-              : `Gagal kirim rekap: ${data.reason}`,
-            data.sent ? 'success' : 'error'
-          );
-        } else {
-          showToast(
-            `Rekap mingguan diproses: ${data.sent} terkirim, ${data.skipped} dilewati (tanpa email), ${data.failed} gagal.`,
-            data.sent > 0 ? 'success' : 'info'
-          );
-        }
-        syncNow();
-        return { success: true, message: 'Rekap berhasil diproses', ...data };
+      const data = await res.json().catch(() => ({}));
+      refreshFromSheets(true);
+      if (classId) {
+        return {
+          success: Boolean(data.sent),
+          sent: data.sent,
+          recipient: data.recipient,
+          message: data.sent
+            ? `Rekap mingguan terkirim ke ${data.recipient}`
+            : data.reason || 'Gagal mengirim rekap',
+        };
       }
-      showToast(data.error || 'Gagal mengirim rekap mingguan', 'error');
-      return { success: false, message: data.error || 'Gagal' };
-    } catch (err: any) {
-      showToast(err.message || 'Gagal mengirim rekap mingguan', 'error');
-      return { success: false, message: err.message || 'Gagal mengirim rekap mingguan' };
+      return {
+        success: res.ok,
+        results: data.results,
+        message: `Terkirim: ${data.sent || 0}, Dilewati: ${data.skipped || 0}, Gagal: ${data.failed || 0}`,
+      };
+    } catch {
+      return { success: false, message: 'Gagal mengirim rekap mingguan.' };
     }
   };
 
   const approveLeaveRequest = async (id: string, status: 'approved' | 'rejected', rejectionReason?: string) => {
-    setLeaveRequests((prev) => {
-      const next = prev.map((lr) =>
-        lr.id === id ? { ...lr, status, rejection_reason: rejectionReason || lr.rejection_reason } : lr
-      );
-      try { localStorage.setItem('dkb_cache_leave_requests', JSON.stringify(next)); } catch {}
-      return next;
-    });
-    setLocalDataNonce((n) => n + 1);
-    try {
-      const res = await fetch('/api/leave-requests', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-        },
-        body: JSON.stringify({ id, status, rejectionReason }),
-      });
-      if (res.ok) {
-        showToast(`Pengajuan izin berhasil di${status === 'approved' ? 'setujui' : 'tolak'} & disinkronkan.`, 'success');
-        broadcastSync();
-        syncNow(false, true);
-        return true;
-      }
-      const synced = await pushTwoWayMutation('leave_requests', 'update', {
+    const existing = leaveRequests.find((l) => l.id === id);
+    const res = await runWriteRequest({
+      url: '/api/leave-requests',
+      method: 'PUT',
+      body: {
         id,
         status,
-        rejection_reason: rejectionReason,
-      });
-      if (synced) {
-        showToast(`Status izin berhasil disinkronkan ke database.`, 'success');
-        syncNow(false, true);
-      }
-      return synced;
-    } catch {
-      enqueueOfflineMutation('leave_requests', 'update', { id, status, rejection_reason: rejectionReason });
-      return false;
-    }
+        rejectionReason,
+        expected_updated_at: existing?.diubah_pada || existing?.updated_at,
+      },
+      conflictTitle: 'Konflik Persetujuan Izin',
+      successMessage: status === 'approved' ? 'Pengajuan izin disetujui.' : 'Pengajuan izin ditolak.',
+    });
+    return res.ok;
   };
-
-  // Keep local JS Client ID runtime strictly synchronized with authoritative server DB settings
-  useEffect(() => {
-    if (!hasSyncedOnce) return;
-    const dbClientId = (settings.google_client_id || '').trim();
-    if (dbClientId) {
-      registerGoogleClientIdToJs(dbClientId);
-    } else {
-      setCustomGoogleClientId('');
-    }
-  }, [hasSyncedOnce, settings.google_client_id]);
-
-  const latestDrivePayloadRef = useRef({
-    driveSheetSignature,
-    students,
-    classes,
-    sessions,
-    attendance,
-    outOfClass,
-    violations,
-    leaveRequests,
-    violationTypes,
-    settings,
-    notificationSettings,
-  });
-  latestDrivePayloadRef.current = {
-    driveSheetSignature,
-    students,
-    classes,
-    sessions,
-    attendance,
-    outOfClass,
-    violations,
-    leaveRequests,
-    violationTypes,
-    settings,
-    notificationSettings,
-  };
-
-  // Automatic Real-Time Background Google Drive & Google Sheets Sync
-  // Works seamlessly using either browser in-memory OAuth token OR persisted server OAuth session,
-  // so refreshes / logout / reopen continue syncing every change automatically without manual clicks.
-  useEffect(() => {
-    const hasClientToken = hasValidGoogleToken();
-    if (!hasSyncedOnce || (!hasClientToken && !serverDriveSyncActive)) return;
-    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
-
-    if (driveSheetSignature === lastAutoSheetSigRef.current) {
-      return;
-    }
-
-    if (isAutoSheetSyncingRef.current) {
-      pendingAutoSheetSyncRef.current = true;
-      return;
-    }
-
-    const timer = setTimeout(async () => {
-      const clientTokenActive = hasValidGoogleToken();
-      if (!clientTokenActive && !serverDriveSyncActive) return;
-      if (isAutoSheetSyncingRef.current) {
-        pendingAutoSheetSyncRef.current = true;
-        return;
-      }
-      const snap = latestDrivePayloadRef.current;
-      if (snap.driveSheetSignature === lastAutoSheetSigRef.current) return;
-
-      isAutoSheetSyncingRef.current = true;
-      setGoogleSyncing(true);
-      try {
-        const capturedSig = snap.driveSheetSignature;
-
-        if (clientTokenActive) {
-          const token = await getAccessToken();
-          if (!token) {
-            setGoogleOAuthActive(false);
-            return;
-          }
-
-          const syncRes = await syncAllDataToDriveAndSheets(token, {
-            students: snap.students,
-            classes: snap.classes,
-            sessions: snap.sessions,
-            attendance: snap.attendance,
-            outOfClass: snap.outOfClass,
-            violations: snap.violations,
-            leaveRequests: snap.leaveRequests,
-            violationTypes: snap.violationTypes,
-            settings: snap.settings,
-            notificationSettings: snap.notificationSettings,
-          });
-
-          if (syncRes.restoredFromCloud && syncRes.recoveredData) {
-            await fetch('/api/sync', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
-              },
-              body: JSON.stringify({
-                merge: true,
-                classes: syncRes.recoveredData.classes,
-                students: syncRes.recoveredData.students,
-                sessions: syncRes.recoveredData.sessions,
-                violation_types: syncRes.recoveredData.violation_types,
-                attendance: syncRes.recoveredData.attendance,
-                out_of_class: syncRes.recoveredData.out_of_class,
-                violations: syncRes.recoveredData.violations,
-                leave_requests: syncRes.recoveredData.leave_requests,
-              }),
-            }).catch(() => {});
-            syncNow(false, true);
-          }
-
-          lastAutoSheetSigRef.current = capturedSig;
-          const metaUpdates: Partial<AppSettings> = {
-            google_last_synced_at: new Date().toISOString(),
-          };
-          if (syncRes.folderId && syncRes.folderId !== snap.settings.google_drive_folder_id) {
-            metaUpdates.google_drive_folder_id = syncRes.folderId;
-            metaUpdates.google_drive_folder_url = syncRes.folderUrl;
-          }
-          if (syncRes.spreadsheetId && syncRes.spreadsheetId !== snap.settings.google_sheet_id) {
-            metaUpdates.google_sheet_id = syncRes.spreadsheetId;
-            metaUpdates.google_sheet_url = syncRes.spreadsheetUrl;
-          }
-          if (syncRes.backupFileId && syncRes.backupFileId !== snap.settings.google_drive_backup_file_id) {
-            metaUpdates.google_drive_backup_file_id = syncRes.backupFileId;
-            metaUpdates.google_drive_backup_file_url = syncRes.backupFileUrl;
-          }
-
-          await updateSettings(metaUpdates, { silent: true });
-        } else if (serverDriveSyncActive) {
-          // Persisted server OAuth session seamlessly handles refreshes and re-logins without manual clicks
-          const pushRes = await fetch('/api/google-sync/push', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-          });
-          if (pushRes.ok) {
-            const pushData = await pushRes.json().catch(() => ({}));
-            if (pushData.success) {
-              lastAutoSheetSigRef.current = capturedSig;
-              if (pushData.restoredFromCloud) {
-                syncNow(false, true);
-              }
-            } else if (pushData.oauthTokenExpired || pushData.needsReauth) {
-              setServerDriveSyncActive(false);
-              setGoogleNeedsInteractiveReauth(true);
-              try {
-                localStorage.setItem('dkb_cache_server_drive_active', 'false');
-              } catch {}
-            }
-          }
-        }
-      } catch (err: any) {
-        console.warn('[Auto Drive & Sheets Sync]:', err);
-        if (err?.statusCode === 401) {
-          setGoogleOAuthActive(false);
-          setGoogleNeedsInteractiveReauth(true);
-        }
-      } finally {
-        isAutoSheetSyncingRef.current = false;
-        setGoogleSyncing(false);
-        const latestSig = latestDrivePayloadRef.current.driveSheetSignature;
-        if (
-          (hasValidGoogleToken() || serverDriveSyncActive) &&
-          (pendingAutoSheetSyncRef.current || latestSig !== lastAutoSheetSigRef.current)
-        ) {
-          pendingAutoSheetSyncRef.current = false;
-          setAutoSheetSyncTick((t) => t + 1);
-        }
-      }
-    }, 450);
-
-    return () => clearTimeout(timer);
-  }, [
-    hasSyncedOnce,
-    googleOAuthActive,
-    serverDriveSyncActive,
-    autoSheetSyncTick,
-    driveSheetSignature,
-    updateSettings,
-    session?.token,
-    syncNow,
-    showToast,
-  ]);
 
   return (
     <AppContext.Provider
@@ -3557,8 +1464,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         activeTab,
         setActiveTab,
         syncStatus,
+        saveStatus,
         isInitialLoading,
         initialLoadError,
+        configError,
+        missingEnv,
+        envStatus,
+        conflictPrompt,
+        dismissConflictPrompt,
         lastSyncTime,
         currentServerTime,
         activeSession,
@@ -3568,6 +1481,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setManualSessionOverride,
         isKioskFullscreen,
         toggleKioskFullscreen,
+        pendingOfflineScansCount,
         settings,
         classes,
         sessions,
@@ -3580,24 +1494,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         notificationSettings,
         notificationLogs,
         auditLogs,
-        serverVersion,
-        googleSheetsConnected,
-        googleAccount,
-        googleSyncing,
-        googleAutoRefreshing,
-        googleNeedsInteractiveReauth,
-        googleOAuthActive,
-        serverDriveSyncActive,
-        permanentDriveSync,
-        driveSyncMode,
-        driveBridgeStatus,
-        refreshDriveBridgeStatus,
-        saveDriveBridgeConfig,
-        removeDriveBridgeConfig,
-        connectGoogle,
-        disconnectGoogle,
-        linkEmailDirectly,
-        syncGoogleSheetsNow,
         loginDuty,
         unlockHomeroom,
         unlockStudentAffairs,
@@ -3605,7 +1501,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         lockCurrentMenu,
         logout,
         updateSessionToken,
-        syncNow,
+        refreshFromSheets,
         recordAttendance,
         updateAttendance,
         deleteAttendance,
@@ -3640,8 +1536,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 };
 
-export const useApp = () => {
+export const useApp = (): AppContextType => {
   const ctx = useContext(AppContext);
-  if (!ctx) throw new Error('useApp must be used within AppProvider');
+  if (!ctx) {
+    throw new Error('useApp must be used inside AppProvider');
+  }
   return ctx;
 };

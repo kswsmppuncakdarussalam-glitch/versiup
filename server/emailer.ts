@@ -1,5 +1,5 @@
 import nodemailer from 'nodemailer';
-import { storage } from './storage.ts';
+import { sheetsDb } from './sheets.ts';
 import type { NotificationLog, Student } from './types.ts';
 
 interface EmailPayload {
@@ -47,8 +47,8 @@ export class NotificationService {
    */
   async notifyParent(payload: EmailPayload): Promise<{ sent: boolean; reason?: string }> {
     try {
-      const settings = await storage.getSettings();
-      const notifSettings = await storage.getNotificationSettings();
+      const settings = await sheetsDb.getSettings();
+      const notifSettings = await sheetsDb.getNotificationSettings();
 
       // Check if feature toggle or email is enabled
       if (!settings.toggle_email_notifications || !notifSettings.email_enabled) {
@@ -100,7 +100,7 @@ export class NotificationService {
           error_message: 'Email orang tua tidak terdaftar atau tidak valid.',
           created_at: now.toISOString(),
         };
-        await storage.logNotification(log);
+        await sheetsDb.logNotification(log);
         return { sent: false, reason: 'Email orang tua tidak terdaftar.' };
       }
 
@@ -139,15 +139,15 @@ export class NotificationService {
           error_message: undefined,
           created_at: now.toISOString(),
         };
-        await storage.logNotification(log);
+        await sheetsDb.logNotification(log);
         return { sent: true };
       }
 
       // Real SMTP send
       const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
       const replyToEmail =
-        settings.google_account_email && settings.google_account_email.includes('@')
-          ? settings.google_account_email.trim()
+        process.env.SMTP_USER && process.env.SMTP_USER.includes('@')
+          ? process.env.SMTP_USER.trim()
           : undefined;
       const mailOptions = {
         from: `"${fromName}" <${process.env.SMTP_USER}>`,
@@ -169,7 +169,7 @@ export class NotificationService {
         status: 'sent',
         created_at: now.toISOString(),
       };
-      await storage.logNotification(log);
+      await sheetsDb.logNotification(log);
 
       return { sent: true };
     } catch (err: any) {
@@ -187,7 +187,7 @@ export class NotificationService {
         error_message: err?.message || 'Gagal mengirim email',
         created_at: now.toISOString(),
       };
-      await storage.logNotification(log);
+      await sheetsDb.logNotification(log);
       return { sent: false, reason: err?.message };
     }
   }
@@ -196,7 +196,7 @@ export class NotificationService {
    * Test sending an email
    */
   async sendTestEmail(targetEmail: string): Promise<{ success: boolean; message: string }> {
-    const settings = await storage.getSettings();
+    const settings = await sheetsDb.getSettings();
     const now = new Date();
     const cleanTarget = (targetEmail || '').trim();
     if (!cleanTarget || !cleanTarget.includes('@')) {
@@ -204,7 +204,7 @@ export class NotificationService {
     }
 
     if (!this.transporter || !this.isSmtpConfigured) {
-      await storage.logNotification({
+      await sheetsDb.logNotification({
         id: `notif_test_${Date.now()}`,
         timestamp: now.toISOString(),
         student_id: 'uji_coba',
@@ -223,8 +223,8 @@ export class NotificationService {
     try {
       const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
       const replyToEmail =
-        settings.google_account_email && settings.google_account_email.includes('@')
-          ? settings.google_account_email.trim()
+        process.env.SMTP_USER && process.env.SMTP_USER.includes('@')
+          ? process.env.SMTP_USER.trim()
           : undefined;
       await this.transporter.sendMail({
         from: `"${fromName}" <${process.env.SMTP_USER}>`,
@@ -233,7 +233,7 @@ export class NotificationService {
         subject: `[Uji Coba] Sistem Notifikasi ${settings.school_name}`,
         text: `Halo,\n\nIni adalah pesan uji coba sistem notifikasi orang tua dari aplikasi DISIPLIN KITA BISA (${settings.school_name}). Konfigurasi email berfungsi dengan baik!`,
       });
-      await storage.logNotification({
+      await sheetsDb.logNotification({
         id: `notif_test_${Date.now()}`,
         timestamp: now.toISOString(),
         student_id: 'uji_coba',
@@ -246,7 +246,7 @@ export class NotificationService {
       return { success: true, message: `Email uji coba berhasil dikirim ke ${cleanTarget}` };
     } catch (err: any) {
       console.error('[NotificationService] sendTestEmail SMTP error:', err);
-      await storage.logNotification({
+      await sheetsDb.logNotification({
         id: `notif_test_${Date.now()}`,
         timestamp: now.toISOString(),
         student_id: 'uji_coba',
@@ -270,8 +270,8 @@ export class NotificationService {
     customEndDate?: string
   ): Promise<{ sent: boolean; reason?: string; recipient?: string; studentCount?: number }> {
     try {
-      const settings = await storage.getSettings();
-      const classes = await storage.getClasses();
+      const settings = await sheetsDb.getSettings();
+      const classes = await sheetsDb.getClasses();
       const cls = classes.find((c) => c.id === classId);
 
       if (!cls) {
@@ -294,7 +294,7 @@ export class NotificationService {
           error_message: 'Email wali kelas belum diatur oleh Administrator di menu Kelola Kelas.',
           created_at: now.toISOString(),
         };
-        await storage.logNotification(log);
+        await sheetsDb.logNotification(log);
         return { sent: false, reason: `Email wali kelas untuk ${cls.name} belum diatur oleh Admin.` };
       }
 
@@ -315,15 +315,15 @@ export class NotificationService {
       }
 
       // Fetch students of this class
-      const allStudents = await storage.getStudents();
+      const allStudents = await sheetsDb.getStudents();
       const classStudents = allStudents.filter((s) => s.class_id === classId);
       const studentMap = new Map(classStudents.map((s) => [s.nis, s]));
 
       // Fetch active sessions
-      const sessions = (await storage.getSessions()).filter((s) => s.is_active);
+      const sessions = (await sheetsDb.getSessions()).filter((s) => s.is_active);
 
       // Fetch attendance in this period
-      const allAttendance = await storage.getAttendance();
+      const allAttendance = await sheetsDb.getAttendance();
       const periodAttendance = allAttendance.filter(
         (a) => a.date >= startStr! && a.date <= endStr! && studentMap.has(a.student_id)
       );
@@ -559,15 +559,15 @@ Email tujuan ini dikelola oleh Administrator Sekolah.
           error_message: undefined,
           created_at: now.toISOString(),
         };
-        await storage.logNotification(log);
+        await sheetsDb.logNotification(log);
         return { sent: true, recipient: email, studentCount: classStudents.length };
       }
 
       // Real SMTP send
       const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
       const replyToEmail =
-        settings.google_account_email && settings.google_account_email.includes('@')
-          ? settings.google_account_email.trim()
+        process.env.SMTP_USER && process.env.SMTP_USER.includes('@')
+          ? process.env.SMTP_USER.trim()
           : undefined;
       await this.transporter.sendMail({
         from: `"${fromName}" <${process.env.SMTP_USER}>`,
@@ -588,7 +588,7 @@ Email tujuan ini dikelola oleh Administrator Sekolah.
         status: 'sent',
         created_at: now.toISOString(),
       };
-      await storage.logNotification(log);
+      await sheetsDb.logNotification(log);
 
       return { sent: true, recipient: email, studentCount: classStudents.length };
     } catch (err: any) {
@@ -605,7 +605,7 @@ Email tujuan ini dikelola oleh Administrator Sekolah.
         error_message: err?.message || 'Gagal mengirim rekap mingguan',
         created_at: now.toISOString(),
       };
-      await storage.logNotification(log);
+      await sheetsDb.logNotification(log);
       return { sent: false, reason: err?.message };
     }
   }
@@ -614,7 +614,7 @@ Email tujuan ini dikelola oleh Administrator Sekolah.
    * Send Weekly Recap to All Classes
    */
   async sendAllWeeklyRecaps(): Promise<{ total: number; sent: number; skipped: number; failed: number; results: any[] }> {
-    const classes = await storage.getClasses();
+    const classes = await sheetsDb.getClasses();
     const results: any[] = [];
     let sent = 0;
     let skipped = 0;
@@ -634,7 +634,7 @@ Email tujuan ini dikelola oleh Administrator Sekolah.
 
     // Update weekly_recap_last_sent in notification_settings
     try {
-      await storage.updateNotificationSettings({
+      await sheetsDb.updateNotificationSettings({
         weekly_recap_last_sent: new Date().toISOString(),
       });
     } catch (e) {
@@ -649,7 +649,7 @@ Email tujuan ini dikelola oleh Administrator Sekolah.
    */
   async checkAndTriggerWeeklyRecap(): Promise<void> {
     try {
-      const notifSettings = await storage.getNotificationSettings();
+      const notifSettings = await sheetsDb.getNotificationSettings();
       if (!notifSettings.weekly_recap_enabled) return;
 
       const now = new Date();
@@ -684,9 +684,3 @@ Email tujuan ini dikelola oleh Administrator Sekolah.
 }
 
 export const notificationService = new NotificationService();
-
-// Start periodic background check every 5 minutes
-setInterval(() => {
-  notificationService.checkAndTriggerWeeklyRecap().catch(() => {});
-}, 5 * 60 * 1000);
-

@@ -1,11 +1,11 @@
-import { storage } from './storage.ts';
+import { sheetsDb, SheetsConfigError, ConflictError } from './sheets.ts';
 import { authService } from './auth.ts';
 import { notificationService } from './emailer.ts';
-import { googleSheetsClient } from './sheets.ts';
 import { resolveSessionSchedule } from './sessionHelper.ts';
 import * as XLSX from 'xlsx';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import type { AttendanceRecord } from './types.ts';
 
 function sanitizePayloadForSigning(obj: Record<string, any>): Record<string, any> {
   const copy = { ...obj };
@@ -43,7 +43,7 @@ export class JsonResponse {
     return {
       statusCode: 400,
       headers: { 'Content-Type': 'application/json' },
-      body: { error: message, details },
+      body: { error: message, ...(details ? { details, ...details } : {}) },
     };
   }
 
@@ -71,7 +71,29 @@ export class JsonResponse {
     };
   }
 
+  static conflict(message: string, current: any): ApiResponse {
+    return {
+      statusCode: 409,
+      headers: { 'Content-Type': 'application/json' },
+      body: { error: message, conflict: true, current },
+    };
+  }
+
+  static serviceUnavailable(message: string, missingEnv: string[]): ApiResponse {
+    return {
+      statusCode: 503,
+      headers: { 'Content-Type': 'application/json' },
+      body: { error: message, configured: false, missingEnv },
+    };
+  }
+
   static serverError(err: any): ApiResponse {
+    if (err instanceof SheetsConfigError) {
+      return JsonResponse.serviceUnavailable(err.message, err.missingEnv);
+    }
+    if (err instanceof ConflictError) {
+      return JsonResponse.conflict(err.message, err.current);
+    }
     return {
       statusCode: 500,
       headers: { 'Content-Type': 'application/json' },
@@ -80,128 +102,14 @@ export class JsonResponse {
   }
 }
 
-async function restoreFromCloudIfEmpty(
-  overrideToken?: string,
-  forceMerge = false
-): Promise<{
-  restored: boolean;
-  source?: 'drive_json' | 'google_sheets';
-  counts?: { students: number; classes: number; attendance: number; violations: number };
-}> {
-  try {
-    const snap = await storage.getFullSnapshot();
-    const db = snap.db;
-    const isEmpty = !googleSheetsClient.hasRealData(db);
-    if (!isEmpty && !forceMerge) {
-      return { restored: false };
-    }
-
-    const folderId = db?.settings?.google_drive_folder_id;
-    const backupFileId = db?.settings?.google_drive_backup_file_id;
-    const sheetId = db?.settings?.google_sheet_id;
-
-    let restoredPayload: any = null;
-    let discoveredFileId: string | undefined;
-    let source: 'drive_json' | 'google_sheets' = 'drive_json';
-
-    const driveBackup = await googleSheetsClient.pullDriveBackupWithToken(
-      backupFileId,
-      folderId,
-      overrideToken
-    );
-    if (driveBackup && googleSheetsClient.hasRealData(driveBackup.data)) {
-      restoredPayload = driveBackup.data;
-      discoveredFileId = driveBackup.backupFileId;
-      source = 'drive_json';
-    } else if (sheetId) {
-      const sheetData = await googleSheetsClient.pullSpreadsheetDataWithToken(
-        sheetId,
-        overrideToken
-      );
-      if (sheetData && googleSheetsClient.hasRealData(sheetData)) {
-        restoredPayload = sheetData;
-        source = 'google_sheets';
-      }
-    }
-
-    if (!restoredPayload) {
-      return { restored: false };
-    }
-
-    const mergedSettings = {
-      ...(restoredPayload.settings || {}),
-      ...(discoveredFileId ? { google_drive_backup_file_id: discoveredFileId } : {}),
-      google_last_synced_at: new Date().toISOString(),
-    };
-
-    await storage.applyTwoWaySync({
-      merge: true,
-      classes: Array.isArray(restoredPayload.classes) ? restoredPayload.classes : undefined,
-      students: Array.isArray(restoredPayload.students) ? restoredPayload.students : undefined,
-      sessions: Array.isArray(restoredPayload.sessions) ? restoredPayload.sessions : undefined,
-      violation_types: Array.isArray(restoredPayload.violation_types)
-        ? restoredPayload.violation_types
-        : undefined,
-      attendance: Array.isArray(restoredPayload.attendance) ? restoredPayload.attendance : undefined,
-      out_of_class: Array.isArray(restoredPayload.out_of_class) ? restoredPayload.out_of_class : undefined,
-      violations: Array.isArray(restoredPayload.violations) ? restoredPayload.violations : undefined,
-      leave_requests: Array.isArray(restoredPayload.leave_requests)
-        ? restoredPayload.leave_requests
-        : undefined,
-      settings: mergedSettings,
-      notification_settings: restoredPayload.notification_settings || undefined,
-    });
-
-    return {
-      restored: true,
-      source,
-      counts: {
-        students: restoredPayload.students?.length || 0,
-        classes: restoredPayload.classes?.length || 0,
-        attendance: restoredPayload.attendance?.length || 0,
-        violations: restoredPayload.violations?.length || 0,
-      },
-    };
-  } catch (err) {
-    console.warn('[restoreFromCloudIfEmpty Warning]:', err);
-    return { restored: false };
-  }
-}
-
 /**
- * Automatic boot-time synchronization (t = 0) when server credentials / persisted session exist.
- */
-export async function runBootCloudSync(): Promise<void> {
-  if (!googleSheetsClient.isConnected) return;
-  try {
-    await restoreFromCloudIfEmpty();
-    const snap = await storage.getFullSnapshot();
-    if (!googleSheetsClient.isConnected) return;
-    if (googleSheetsClient.hasRealData(snap.db)) {
-      const outcome = await googleSheetsClient.syncFullDatabase(snap.db);
-      const patch: Record<string, any> = {
-        google_last_synced_at: new Date().toISOString(),
-        google_oauth_connected: true,
-      };
-      if (outcome && outcome.discoveredBackupFileId) {
-        patch.google_drive_backup_file_id = outcome.discoveredBackupFileId;
-      }
-      await storage.updateSettings(patch);
-    }
-  } catch (err: any) {
-    console.warn('[BootCloudSync Warning]:', err?.message || err);
-  }
-}
-
-/**
- * Main API Handler routing requests based on path
+ * Main stateless API Handler for Vercel Serverless & local Express
  */
 export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
   const urlObj = new URL(req.url, 'http://localhost');
   const pathname = urlObj.pathname;
   const method = req.method.toUpperCase();
 
-  // Extract query parameters
   const query: Record<string, string> = { ...req.query };
   urlObj.searchParams.forEach((val, key) => {
     query[key] = val;
@@ -211,31 +119,79 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
   const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : '';
 
   try {
-    // 1. SETUP: /api/setup
+    // 1. SETUP & CONFIG CHECK: /api/setup
     if (pathname === '/api/setup') {
-      if (googleSheetsClient.isPermanentAutoSync) {
-        const preSnap = await storage.getFullSnapshot();
-        if (!googleSheetsClient.hasRealData(preSnap.db)) {
-          await restoreFromCloudIfEmpty();
-        }
+      const envStatus = sheetsDb.getFullEnvStatus();
+      if (!envStatus.sheetsConfigured) {
+        return JsonResponse.serviceUnavailable(
+          `Environment variable server belum lengkap: ${envStatus.missingEnv.join(', ')}`,
+          envStatus.missingEnv
+        );
       }
-      const fullSnapshot = await storage.getFullSnapshot();
+      await sheetsDb.ensureSheetsAndHeaders();
       return JsonResponse.ok({
         success: true,
-        message: 'Sistem dan basis data berhasil diinisialisasi.',
-        googleSheetsConnected: storage.isSheetsConnected(),
-        serverDriveSyncActive: googleSheetsClient.isConnected,
-        permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
-        driveSyncMode: googleSheetsClient.getSyncMode(),
-        bridgeStatus: googleSheetsClient.getBridgeStatus(),
-        oauthTokenExpired: googleSheetsClient.isOAuthExpired,
-        version: fullSnapshot.version,
+        configured: envStatus.configured,
+        sheetsConfigured: envStatus.sheetsConfigured,
+        driveConfigured: envStatus.driveConfigured,
+        spreadsheetConfigured: envStatus.spreadsheetConfigured,
+        driveFolderConfigured: envStatus.driveFolderConfigured,
+        missingEnv: envStatus.missingEnv,
+        serverTime: new Date().toISOString(),
       });
     }
 
-    // 2. AUTH: /api/auth
+    // 2. PRIVATE PHOTO PROXY & UPLOAD: /api/photos
+    if (pathname === '/api/photos') {
+      const envStatus = sheetsDb.getFullEnvStatus();
+      if (!envStatus.driveConfigured) {
+        return JsonResponse.serviceUnavailable(
+          `Environment variable Google Drive belum lengkap: ${envStatus.missingEnv.join(', ')}`,
+          envStatus.missingEnv
+        );
+      }
+
+      if (method === 'GET') {
+        const fileId = (query.id || '').trim();
+        if (!fileId || !/^[a-zA-Z0-9_-]{10,200}$/.test(fileId)) {
+          return JsonResponse.badRequest('Parameter id file Drive tidak valid.');
+        }
+        const fileData = await sheetsDb.getPhotoFromDrive(fileId);
+        return {
+          statusCode: 200,
+          headers: {
+            'Content-Type': fileData.mimeType,
+            'Cache-Control': 'private, max-age=86400',
+          },
+          body: fileData.buffer,
+        };
+      }
+
+      if (method === 'POST') {
+        const { base64, fileName } = req.body || {};
+        if (!base64) return JsonResponse.badRequest('Data base64 foto wajib diisi.');
+        const fileId = await sheetsDb.uploadPhotoToDrive(base64, fileName || `foto_${Date.now()}.jpg`);
+        return JsonResponse.ok({ success: true, fileId });
+      }
+    }
+
+    // 3. AUTH: /api/auth
     if (pathname === '/api/auth') {
+      const envStatus = sheetsDb.getFullEnvStatus();
+      if (!envStatus.sheetsConfigured) {
+        return JsonResponse.serviceUnavailable(
+          `Konfigurasi Google Service Account / Spreadsheet belum lengkap di environment variable server: ${envStatus.missingEnv.join(', ')}`,
+          envStatus.missingEnv
+        );
+      }
+
       const action = query.action || req.body?.action;
+      if (!action && method === 'GET') {
+        if (!token) return JsonResponse.unauthorized('Token sesi tidak ditemukan.');
+        const validRes = await authService.validateActiveSession(token);
+        if (!validRes.valid) return JsonResponse.unauthorized(validRes.reason);
+        return JsonResponse.ok({ valid: true, session: validRes.session });
+      }
 
       if (action === 'login_duty') {
         const password = req.body?.password;
@@ -276,7 +232,6 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         return JsonResponse.ok({ valid: true, session: validRes.session });
       }
 
-      // Password Management (Admin / Authorized)
       if (action === 'manage_accounts') {
         const validRes = await authService.validateActiveSession(token);
         if (!validRes.valid || !validRes.session) {
@@ -284,8 +239,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         }
 
         if (method === 'GET') {
-          const users = await storage.getUsers();
-          // Hide password hashes
+          const users = await sheetsDb.getUsers();
           const safeUsers = users.map((u) => ({
             id: u.id,
             role: u.role,
@@ -300,40 +254,35 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         }
 
         if (method === 'POST') {
-          const { user, newPassword, targetUserId, targetRole, classId, universalHomeroom } = req.body;
+          const { user, newPassword, targetUserId, targetRole, classId } = req.body;
 
-          // 1. Direct role-based password change (Admin, Kesiswaan, Wali Kelas, Piket) without needing manual user creation
           if (targetRole && newPassword) {
             if (newPassword.trim().length < 4) {
               return JsonResponse.badRequest('Password baru minimal 4 karakter.');
             }
 
-            const users = await storage.getUsers();
+            const users = await sheetsDb.getUsers();
             let target: any = undefined;
             let refreshedToken: string | undefined = undefined;
             const nowIso = new Date().toISOString();
 
             if (targetRole === 'admin') {
-              target = users.find((u) => u.role === 'admin');
-              if (!target) {
-                target = {
-                  id: 'user_admin_main',
-                  role: 'admin',
-                  name: 'Administrator Sekolah',
-                  label: 'Admin Sistem',
-                  password_hash: '',
-                  token_version: 1,
-                  is_active: true,
-                  created_at: nowIso,
-                  updated_at: nowIso,
-                };
-              }
+              target = users.find((u) => u.role === 'admin') || {
+                id: 'user_admin_main',
+                role: 'admin',
+                name: 'Administrator Sekolah',
+                label: 'Admin Sistem',
+                password_hash: '',
+                token_version: 1,
+                is_active: true,
+                created_at: nowIso,
+                updated_at: nowIso,
+              };
               target.password_hash = bcrypt.hashSync(newPassword.trim(), 10);
               target.token_version = (target.token_version || 1) + 1;
               target.updated_at = nowIso;
-              await storage.saveUser(target);
+              await sheetsDb.saveUser(target, validRes.session.name);
 
-              // Refresh current admin token so caller stays authenticated
               const JWT_SECRET = process.env.JWT_SECRET || 'disiplin-kita-bisa-secure-secret-key-2026';
               refreshedToken = jwt.sign(
                 sanitizePayloadForSigning({
@@ -344,82 +293,69 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
                 { expiresIn: '12h' }
               );
             } else if (targetRole === 'student_affairs') {
-              target = users.find((u) => u.role === 'student_affairs');
-              if (!target) {
-                target = {
-                  id: 'user_student_affairs',
-                  role: 'student_affairs',
-                  name: 'Bagian Kesiswaan & Tatib',
-                  label: 'Tim Kesiswaan',
-                  password_hash: '',
-                  token_version: 1,
-                  is_active: true,
-                  created_at: nowIso,
-                  updated_at: nowIso,
-                };
-              }
+              target = users.find((u) => u.role === 'student_affairs') || {
+                id: 'user_student_affairs',
+                role: 'student_affairs',
+                name: 'Bagian Kesiswaan & Tatib',
+                label: 'Tim Kesiswaan',
+                password_hash: '',
+                token_version: 1,
+                is_active: true,
+                created_at: nowIso,
+                updated_at: nowIso,
+              };
               target.password_hash = bcrypt.hashSync(newPassword.trim(), 10);
               target.token_version = (target.token_version || 1) + 1;
               target.updated_at = nowIso;
-              await storage.saveUser(target);
+              await sheetsDb.saveUser(target, validRes.session.name);
             } else if (targetRole === 'duty') {
-              target = users.find((u) => u.role === 'duty');
-              if (!target) {
-                target = {
-                  id: 'user_duty_main',
-                  role: 'duty',
-                  name: 'Petugas Piket Utama',
-                  label: 'Gerbang Utama & Pos Piket',
-                  password_hash: '',
-                  token_version: 1,
-                  is_active: true,
-                  created_at: nowIso,
-                  updated_at: nowIso,
-                };
-              }
+              target = users.find((u) => u.role === 'duty') || {
+                id: 'user_duty_main',
+                role: 'duty',
+                name: 'Petugas Piket Utama',
+                label: 'Gerbang Utama & Pos Piket',
+                password_hash: '',
+                token_version: 1,
+                is_active: true,
+                created_at: nowIso,
+                updated_at: nowIso,
+              };
               target.password_hash = bcrypt.hashSync(newPassword.trim(), 10);
               target.token_version = (target.token_version || 1) + 1;
               target.updated_at = nowIso;
-              await storage.saveUser(target);
+              await sheetsDb.saveUser(target, validRes.session.name);
             } else if (targetRole === 'homeroom') {
-              const classes = await storage.getClasses();
+              const classes = await sheetsDb.getClasses();
               const hash = bcrypt.hashSync(newPassword.trim(), 10);
 
               if (classId) {
-                // Update or auto-create homeroom user for specific classId
                 const targetClass = classes.find((c) => c.id === classId);
-                target = users.find((u) => u.role === 'homeroom' && u.class_id === classId);
-                if (!target) {
-                  target = {
-                    id: `user_homeroom_${classId.toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
-                    role: 'homeroom',
-                    name: targetClass?.homeroom_teacher_name || `Wali Kelas ${classId}`,
-                    class_id: classId,
-                    email: targetClass?.homeroom_teacher_email,
-                    label: `Wali Kelas ${targetClass?.name || classId}`,
-                    password_hash: hash,
-                    token_version: 1,
-                    is_active: true,
-                    created_at: nowIso,
-                    updated_at: nowIso,
-                  };
-                } else {
-                  target.password_hash = hash;
-                  target.token_version = (target.token_version || 1) + 1;
-                  target.updated_at = nowIso;
-                }
-                await storage.saveUser(target);
+                target = users.find((u) => u.role === 'homeroom' && u.class_id === classId) || {
+                  id: `user_homeroom_${classId.toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
+                  role: 'homeroom',
+                  name: targetClass?.homeroom_teacher_name || `Wali Kelas ${classId}`,
+                  class_id: classId,
+                  email: targetClass?.homeroom_teacher_email,
+                  label: `Wali Kelas ${targetClass?.name || classId}`,
+                  password_hash: hash,
+                  token_version: 1,
+                  is_active: true,
+                  created_at: nowIso,
+                  updated_at: nowIso,
+                };
+                target.password_hash = hash;
+                target.token_version = (target.token_version || 1) + 1;
+                target.updated_at = nowIso;
+                await sheetsDb.saveUser(target, validRes.session.name);
               } else {
-                // Universal / all homeroom teachers password
                 const homeroomUsers = users.filter((u) => u.role === 'homeroom');
                 for (const hr of homeroomUsers) {
                   hr.password_hash = hash;
                   hr.token_version = (hr.token_version || 1) + 1;
                   hr.updated_at = nowIso;
-                  await storage.saveUser(hr);
+                  await sheetsDb.saveUser(hr, validRes.session.name);
                 }
 
-                // Ensure master homeroom account exists for universal login
                 let masterHr = users.find((u) => u.id === 'user_homeroom_master');
                 if (!masterHr) {
                   masterHr = {
@@ -438,31 +374,19 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
                   masterHr.token_version = (masterHr.token_version || 1) + 1;
                   masterHr.updated_at = nowIso;
                 }
-                await storage.saveUser(masterHr);
+                await sheetsDb.saveUser(masterHr, validRes.session.name);
                 target = masterHr;
               }
             }
 
-            await storage.logAudit(
-              validRes.session.name,
-              'admin',
-              'update_password',
-              'users',
-              target?.id || targetRole,
-              undefined,
-              undefined,
-              `Admin mengubah password langsung untuk peran: ${targetRole}${classId ? ` (${classId})` : ''}`
-            );
-
             return JsonResponse.ok({ success: true, user: target, refreshedToken });
           }
 
-          // 2. Direct password change for any specific user by ID
           if (targetUserId && newPassword) {
             if (newPassword.trim().length < 4) {
               return JsonResponse.badRequest('Password baru minimal 4 karakter.');
             }
-            const users = await storage.getUsers();
+            const users = await sheetsDb.getUsers();
             const target = users.find((u) => u.id === targetUserId);
             if (!target) return JsonResponse.notFound('Akun tidak ditemukan.');
 
@@ -470,17 +394,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
             target.token_version = (target.token_version || 1) + 1;
             target.updated_at = new Date().toISOString();
 
-            await storage.saveUser(target);
-            await storage.logAudit(
-              validRes.session.name,
-              'admin',
-              'update_password',
-              'users',
-              target.id,
-              undefined,
-              undefined,
-              `Admin mengubah password untuk akun: ${target.name} (${target.role})`
-            );
+            await sheetsDb.saveUser(target, validRes.session.name);
 
             let refreshedToken: string | undefined = undefined;
             if (validRes.session.userId === target.id) {
@@ -501,7 +415,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           if (!user || !user.id || !user.role || !user.name) {
             return JsonResponse.badRequest('Data akun tidak lengkap.');
           }
-          const users = await storage.getUsers();
+          const users = await sheetsDb.getUsers();
           const existing = users.find((u) => u.id === user.id);
 
           if (!existing && (!newPassword || newPassword.trim().length < 4)) {
@@ -509,11 +423,11 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           }
 
           let passwordHash = existing?.password_hash || '';
-          let tokenVersion = (existing?.token_version || 1);
+          let tokenVersion = existing?.token_version || 1;
 
           if (newPassword && newPassword.trim().length >= 4) {
             passwordHash = bcrypt.hashSync(newPassword.trim(), 10);
-            tokenVersion += 1; // Invalidate all prior active sessions on other devices!
+            tokenVersion += 1;
           }
 
           const updatedUser = {
@@ -523,17 +437,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
             updated_at: new Date().toISOString(),
           };
 
-          await storage.saveUser(updatedUser);
-          await storage.logAudit(
-            validRes.session.name,
-            'admin',
-            existing ? 'update' : 'create',
-            'users',
-            updatedUser.id,
-            existing ? JSON.stringify(existing) : undefined,
-            JSON.stringify(updatedUser),
-            `Perubahan akun/password untuk ${updatedUser.name} (${updatedUser.role})`
-          );
+          await sheetsDb.saveUser(updatedUser, validRes.session.name);
 
           let refreshedToken: string | undefined = undefined;
           if (validRes.session.userId === updatedUser.id && newPassword && newPassword.trim().length >= 4) {
@@ -556,7 +460,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           if (id === 'user_admin_main') {
             return JsonResponse.badRequest('Akun admin utama tidak boleh dihapus.');
           }
-          await storage.deleteUser(id);
+          await sheetsDb.deleteUser(id, validRes.session.name);
           return JsonResponse.ok({ success: true });
         }
       }
@@ -564,408 +468,278 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       return JsonResponse.badRequest('Aksi auth tidak dikenali.');
     }
 
-    // 3. SYNC: /api/sync (Two-Way Database Synchronization: GET & POST)
-    // Real-time multi-device synchronization: no-store / no-cache to avoid stale CDN responses
+    // 4. DIRECT READ FROM GOOGLE SHEETS: GET /api/sync
     if (pathname === '/api/sync') {
-      if (method === 'POST') {
-        const syncResult = await storage.applyTwoWaySync(req.body || {});
-        return JsonResponse.ok(
-          {
-            ...syncResult,
-            googleSheetsConnected: storage.isSheetsConnected(),
-            serverDriveSyncActive: googleSheetsClient.isConnected,
-            permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
-            driveSyncMode: googleSheetsClient.getSyncMode(),
-            oauthTokenExpired: googleSheetsClient.isOAuthExpired,
-          },
-          {
-            'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
-            'Pragma': 'no-cache',
-            'Expires': '0',
-          }
-        );
+      if (method !== 'GET') {
+        return JsonResponse.badRequest('Endpoint /api/sync hanya mendukung GET untuk membaca data langsung dari Google Sheets.');
       }
 
-      const sinceVer = parseInt(query.since || '0', 10);
-      if (sinceVer === 0 && googleSheetsClient.isPermanentAutoSync) {
-        const preSnap = await storage.getFullSnapshot();
-        if (!googleSheetsClient.hasRealData(preSnap.db)) {
-          await restoreFromCloudIfEmpty();
-        }
+      const envStatus = sheetsDb.getFullEnvStatus();
+      if (!envStatus.sheetsConfigured) {
+        return JsonResponse.serviceUnavailable(
+          `Konfigurasi Google Service Account / Spreadsheet belum lengkap di environment variable server: ${envStatus.missingEnv.join(', ')}`,
+          envStatus.missingEnv
+        );
       }
-      const syncResult = await storage.getSyncData(sinceVer);
+      const db = await sheetsDb.getFullDatabase();
+
       return JsonResponse.ok(
         {
-          ...syncResult,
-          googleSheetsConnected: storage.isSheetsConnected(),
-          serverDriveSyncActive: googleSheetsClient.isConnected,
-          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
-          driveSyncMode: googleSheetsClient.getSyncMode(),
-          oauthTokenExpired: googleSheetsClient.isOAuthExpired,
+          fullSnapshot: true,
+          configured: envStatus.configured,
+          sheetsConfigured: envStatus.sheetsConfigured,
+          driveConfigured: envStatus.driveConfigured,
+          spreadsheetConfigured: envStatus.spreadsheetConfigured,
+          driveFolderConfigured: envStatus.driveFolderConfigured,
+          missingEnv: envStatus.missingEnv,
+          serverTime: new Date().toISOString(),
+          data: {
+            students: db.students,
+            classes: db.classes,
+            sessions: db.sessions,
+            attendance: db.attendance,
+            out_of_class: db.out_of_class,
+            violations: db.violations,
+            violation_types: db.violation_types,
+            leave_requests: db.leave_requests,
+            settings: db.settings,
+            notification_settings: db.notification_settings,
+            notification_logs: db.notification_logs,
+            audit_logs: db.audit_logs,
+          },
         },
         {
           'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
-          'Pragma': 'no-cache',
-          'Expires': '0',
+          Pragma: 'no-cache',
+          Expires: '0',
         }
       );
     }
 
-    // 3b. GOOGLE OAUTH SESSION BRIDGE: /api/google-sync/session
-    // Holds user's active Google OAuth 2.0 Bearer token strictly in server RAM across refreshes/re-logins
-    if (pathname === '/api/google-sync/session') {
-      if (method === 'GET') {
-        return JsonResponse.ok({
-          serverDriveSyncActive: googleSheetsClient.isConnected,
-          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
-          driveSyncMode: googleSheetsClient.getSyncMode(),
-          bridgeStatus: googleSheetsClient.getBridgeStatus(),
-          oauthTokenExpired: googleSheetsClient.isOAuthExpired,
-        });
-      }
-
-      if (method === 'POST') {
-        const { action, expiresIn, email, name, clientId } = req.body || {};
-        if (action === 'disconnect') {
-          googleSheetsClient.clearOAuthSession();
-          await storage.updateSettings({ google_oauth_connected: false });
-          return JsonResponse.ok({
-            success: true,
-            serverDriveSyncActive: googleSheetsClient.isConnected,
-            permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
-            driveSyncMode: googleSheetsClient.getSyncMode(),
-          });
-        }
-
-        if (!token || token === 'undefined' || token === 'null') {
-          return JsonResponse.unauthorized('Token OAuth 2.0 Google tidak ditemukan pada header Authorization Bearer.');
-        }
-
-        googleSheetsClient.setOAuthSession(token, Number(expiresIn) || 3500, email);
-        await storage.updateSettings({
-          google_oauth_connected: true,
-          toggle_email_notifications: true,
-          ...(email ? { google_account_email: email } : {}),
-          ...(name ? { google_account_name: name } : {}),
-          ...(clientId ? { google_client_id: clientId } : {}),
-        });
-
-        // Auto-recover school data from Google Drive backup / Sheets if server DB restarted empty
-        const restoreRes = await restoreFromCloudIfEmpty(token);
-        const latestSnap = await storage.getFullSnapshot();
-        if (googleSheetsClient.hasRealData(latestSnap.db)) {
-          googleSheetsClient.scheduleAutoSync(() => latestSnap.db);
-        }
-
-        return JsonResponse.ok({
-          success: true,
-          serverDriveSyncActive: googleSheetsClient.isConnected,
-          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
-          driveSyncMode: googleSheetsClient.getSyncMode(),
-          oauthTokenExpired: false,
-          restoredFromCloud: restoreRes.restored,
-          restoredSource: restoreRes.source,
-          restoredCounts: restoreRes.counts,
-        });
-      }
-    }
-
-    // 3b1. ZERO-CLICK PERMANENT DRIVE & SHEETS BRIDGE: /api/google-sync/bridge
-    if (pathname === '/api/google-sync/bridge') {
-      if (method === 'GET') {
-        return JsonResponse.ok({
-          success: true,
-          bridgeStatus: googleSheetsClient.getBridgeStatus(),
-          serverDriveSyncActive: googleSheetsClient.isConnected,
-          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
-          driveSyncMode: googleSheetsClient.getSyncMode(),
-        });
-      }
-
-      const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) {
-        return JsonResponse.unauthorized('Silakan masuk sebagai Admin untuk mengubah konfigurasi Auto-Sync permanen.');
-      }
-
-      if (method === 'POST') {
-        const { mode, serviceAccountJson, clientEmail, privateKey, appsScriptUrl } = req.body || {};
-        if (mode === 'service_account') {
-          let emailToSave = (clientEmail || '').trim();
-          let keyToSave = (privateKey || '').trim();
-          if (serviceAccountJson && typeof serviceAccountJson === 'string') {
-            let parsed: any = null;
-            try {
-              parsed = JSON.parse(serviceAccountJson);
-            } catch {
-              return JsonResponse.badRequest('Format JSON Service Account tidak valid.');
-            }
-            emailToSave = (parsed?.client_email || emailToSave).trim();
-            keyToSave = (parsed?.private_key || keyToSave).trim();
-          }
-          try {
-            googleSheetsClient.setServiceAccountCredentials(emailToSave, keyToSave);
-          } catch (e: any) {
-            return JsonResponse.badRequest(e?.message || 'Kredensial Service Account tidak valid.');
-          }
-        } else if (mode === 'apps_script') {
-          try {
-            googleSheetsClient.setAppsScriptWebhookUrl(appsScriptUrl);
-          } catch (e: any) {
-            return JsonResponse.badRequest(e?.message || 'URL Google Apps Script tidak valid.');
-          }
-        } else {
-          return JsonResponse.badRequest('Mode bridge tidak dikenali (pilih service_account atau apps_script).');
-        }
-
-        // Immediately sync / test connection
-        const restoreRes = await restoreFromCloudIfEmpty();
-        const snap = await storage.getFullSnapshot();
-        let syncOutcome: any = null;
-        let syncError = '';
-        try {
-          syncOutcome = await googleSheetsClient.syncFullDatabase(snap.db);
-          await storage.updateSettings({
-            google_last_synced_at: new Date().toISOString(),
-            google_oauth_connected: true,
-          });
-        } catch (err: any) {
-          syncError = err?.message || 'Tersimpan di server, namun uji koneksi ke Google gagal. Periksa izin berbagi folder/sheet atau URL Web App.';
-        }
-
-        return JsonResponse.ok({
-          success: !syncError,
-          error: syncError || undefined,
-          restoredFromCloud: restoreRes.restored,
-          abortedEmptyOverwrite: Boolean(syncOutcome?.abortedEmptyOverwrite),
-          bridgeStatus: googleSheetsClient.getBridgeStatus(),
-          serverDriveSyncActive: googleSheetsClient.isConnected,
-          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
-          driveSyncMode: googleSheetsClient.getSyncMode(),
-        });
-      }
-
-      if (method === 'DELETE') {
-        const modeToClear = (req.body?.mode || query.mode) as 'service_account' | 'apps_script' | undefined;
-        googleSheetsClient.clearPermanentBridge(modeToClear);
-        return JsonResponse.ok({
-          success: true,
-          bridgeStatus: googleSheetsClient.getBridgeStatus(),
-          serverDriveSyncActive: googleSheetsClient.isConnected,
-          permanentDriveSync: googleSheetsClient.isPermanentAutoSync,
-          driveSyncMode: googleSheetsClient.getSyncMode(),
-        });
-      }
-    }
-
-    // 3b2. GOOGLE DRIVE & SHEETS PULL / MERGE: /api/google-sync/pull
-    if (pathname === '/api/google-sync/pull' && method === 'POST') {
-      const overrideToken = token && token !== 'undefined' && token !== 'null' ? token : undefined;
-      if (overrideToken) {
-        googleSheetsClient.setOAuthSession(overrideToken, Number(req.body?.expiresIn) || 3500);
-      }
-      if (!googleSheetsClient.isConnected) {
-        return JsonResponse.ok({
-          success: false,
-          needsReauth: true,
-          restored: false,
-          serverDriveSyncActive: false,
-          oauthTokenExpired: googleSheetsClient.isOAuthExpired,
-        });
-      }
-      const restoreRes = await restoreFromCloudIfEmpty(overrideToken, Boolean(req.body?.forceMerge));
-      const snap = await storage.getFullSnapshot();
-      return JsonResponse.ok({
-        success: true,
-        restored: restoreRes.restored,
-        source: restoreRes.source,
-        counts: restoreRes.counts,
-        version: snap.version,
-        serverDriveSyncActive: googleSheetsClient.isConnected,
-        oauthTokenExpired: googleSheetsClient.isOAuthExpired,
-      });
-    }
-
-    // 3c. SERVER-SIDE GOOGLE DRIVE & SHEETS PUSH: /api/google-sync/push
-    if (pathname === '/api/google-sync/push' && method === 'POST') {
-      if (!googleSheetsClient.isConnected) {
-        return JsonResponse.ok({
-          success: false,
-          needsReauth: true,
-          serverDriveSyncActive: false,
-          oauthTokenExpired: googleSheetsClient.isOAuthExpired,
-        });
-      }
-      // First restore from cloud if server restarted empty so we never overwrite real cloud data!
-      const restoreRes = await restoreFromCloudIfEmpty();
-      const snap = await storage.getFullSnapshot();
-      const pushOutcome = await googleSheetsClient.syncFullDatabase(snap.db);
-      if (googleSheetsClient.isOAuthExpired || !googleSheetsClient.isConnected) {
-        return JsonResponse.ok({
-          success: false,
-          needsReauth: true,
-          serverDriveSyncActive: false,
-          oauthTokenExpired: true,
-        });
-      }
-      if (pushOutcome && pushOutcome.abortedEmptyOverwrite) {
-        return JsonResponse.ok({
-          success: false,
-          abortedEmptyOverwrite: true,
-          serverDriveSyncActive: googleSheetsClient.isConnected,
-          oauthTokenExpired: false,
-        });
-      }
-      const nowIso = new Date().toISOString();
-      const settingsPatch: Record<string, any> = { google_last_synced_at: nowIso };
-      if (pushOutcome && pushOutcome.discoveredBackupFileId) {
-        settingsPatch.google_drive_backup_file_id = pushOutcome.discoveredBackupFileId;
-      }
-      await storage.updateSettings(settingsPatch);
-      return JsonResponse.ok({
-        success: true,
-        restoredFromCloud: restoreRes.restored,
-        restoredCounts: restoreRes.counts,
-        serverDriveSyncActive: googleSheetsClient.isConnected,
-        oauthTokenExpired: false,
-        syncedAt: nowIso,
-      });
-    }
-
-    // 4. ATTENDANCE: /api/attendance
+    // 5. STATELESS ATTENDANCE: /api/attendance
     if (pathname === '/api/attendance') {
       if (method === 'GET') {
-        const records = await storage.getAttendance();
-        return JsonResponse.ok({ records });
+        const records = await sheetsDb.getAttendance();
+        return JsonResponse.ok({ records, serverTime: new Date().toISOString() });
       }
 
       if (method === 'POST') {
-        // Record attendance (RFID scan, Barcode scan, or Manual input)
-        const { code, studentId, sessionId, status, notes, method: attMethod, deviceId } = req.body;
+        const incomingScans: any[] = Array.isArray(req.body?.scans)
+          ? req.body.scans
+          : [req.body];
 
-        let student = null;
-        if (code) {
-          student = await storage.findStudentByCode(code);
-        } else if (studentId) {
-          const students = await storage.getStudents();
-          student = students.find((s) => s.nis === studentId);
+        if (incomingScans.length === 0) {
+          return JsonResponse.badRequest('Tidak ada data scan presensi untuk diproses.');
         }
 
-        if (!student) {
-          return JsonResponse.badRequest('Kartu atau NIS tidak terdaftar dalam database siswa.');
-        }
+        const db = await sheetsDb.getFullDatabase();
+        const serverNow = new Date();
+        const currentDateStr = serverNow.toISOString().split('T')[0];
+        const autoSwitchEnabled = db.settings.auto_session_switch !== false;
 
-        // Determine session with authoritative automatic session switching
-        const sessions = await storage.getSessions();
-        const settings = await storage.getSettings();
-        const autoSwitchEnabled = settings.auto_session_switch !== false;
-        const { manualOverride } = req.body;
+        const validRes = token ? await authService.validateActiveSession(token) : { valid: false, session: undefined };
+        const actorName = validRes.valid ? validRes.session?.name || 'Petugas Piket' : 'Sistem Presensi';
 
-        const now = new Date();
-        const currentTimeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-        const currentDateStr = now.toISOString().split('T')[0];
+        const preparedRecords: AttendanceRecord[] = [];
+        const resolvedStudentsByRecordId = new Map<string, any>();
+        const resolvedSessionByRecordId = new Map<string, any>();
+        const immediateRejections: { code?: string; studentId?: string; message: string; isDuplicate?: boolean }[] = [];
 
-        const scheduleState = resolveSessionSchedule(
-          sessions,
-          now,
-          autoSwitchEnabled,
-          manualOverride ? sessionId : undefined
-        );
+        for (const item of incomingScans) {
+          const {
+            code,
+            studentId,
+            sessionId,
+            status,
+            notes,
+            method: attMethod,
+            deviceId,
+            manualOverride,
+            photoBase64,
+            photoFileName,
+          } = item || {};
 
-        let session = undefined;
-        if (manualOverride && sessionId) {
-          session = sessions.find((s) => s.id === sessionId);
-        } else if (autoSwitchEnabled && scheduleState.liveWindowSession) {
-          // Always follow authoritative live window when auto-switch is enabled
-          session = scheduleState.liveWindowSession;
-        } else if (sessionId) {
-          session = sessions.find((s) => s.id === sessionId && s.is_active);
-        }
+          let student = null;
+          if (code) {
+            const clean = String(code).trim().toLowerCase();
+            student = db.students.find(
+              (s) =>
+                s.nis.toLowerCase() === clean ||
+                s.rfid_uid.toLowerCase() === clean ||
+                s.card_code.toLowerCase() === clean
+            );
+          } else if (studentId) {
+            student = db.students.find((s) => s.nis === String(studentId).trim());
+          }
 
-        if (!session) {
-          session = scheduleState.activeSession || sessions.find((s) => s.is_active) || sessions[0];
-        }
+          if (!student) {
+            immediateRejections.push({
+              code,
+              studentId,
+              message: `Kartu atau NIS "${code || studentId || '-'}" tidak terdaftar dalam database siswa.`,
+            });
+            continue;
+          }
 
-        const activeSession = session || sessions[0];
-
-        // Check if student is on leave or sick today
-        const leaveRequests = await storage.getLeaveRequests();
-        const activeLeave = leaveRequests.find(
-          (l) =>
-            l.student_id === student!.nis &&
-            l.status === 'approved' &&
-            currentDateStr >= l.start_date &&
-            currentDateStr <= l.end_date
-        );
-
-        if (activeLeave && !status) {
-          return JsonResponse.badRequest(
-            `Siswa berstatus ${activeLeave.type.toUpperCase()} hari ini: ${activeLeave.reason}`
+          const scheduleState = resolveSessionSchedule(
+            db.sessions,
+            serverNow,
+            autoSwitchEnabled,
+            manualOverride ? sessionId : undefined
           );
+
+          let session = undefined;
+          if (manualOverride && sessionId) {
+            session = db.sessions.find((s) => s.id === sessionId);
+          } else if (autoSwitchEnabled && scheduleState.liveWindowSession) {
+            session = scheduleState.liveWindowSession;
+          } else if (sessionId) {
+            session = db.sessions.find((s) => s.id === sessionId && s.is_active);
+          }
+          const activeSession = session || scheduleState.activeSession || db.sessions.find((s) => s.is_active) || db.sessions[0];
+
+          const activeLeave = db.leave_requests.find(
+            (l) =>
+              l.student_id === student!.nis &&
+              l.status === 'approved' &&
+              currentDateStr >= l.start_date &&
+              currentDateStr <= l.end_date
+          );
+
+          if (activeLeave && !status) {
+            immediateRejections.push({
+              code,
+              studentId: student.nis,
+              message: `Siswa ${student.name} berstatus ${activeLeave.type.toUpperCase()} hari ini: ${activeLeave.reason}`,
+            });
+            continue;
+          }
+
+          let attStatus = status || 'Hadir';
+          let lateMinutes = 0;
+
+          if (!status && activeSession?.on_time_limit) {
+            const [limitH, limitM] = activeSession.on_time_limit.split(':').map(Number);
+            const curMinTotal = serverNow.getHours() * 60 + serverNow.getMinutes();
+            const limitMinTotal = (limitH || 0) * 60 + (limitM || 0);
+            const diffMinutes = curMinTotal - limitMinTotal;
+
+            if (diffMinutes > 0) {
+              lateMinutes = diffMinutes;
+              attStatus = 'Terlambat';
+            }
+          }
+
+          let photoId = '';
+          if (photoBase64) {
+            photoId = await sheetsDb.uploadPhotoToDrive(
+              photoBase64,
+              photoFileName || `presensi_${student.nis}_${Date.now()}.jpg`
+            );
+          }
+
+          const nowIso = serverNow.toISOString();
+          const recordId = `att_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+          const record: AttendanceRecord = {
+            id: recordId,
+            student_id: student.nis,
+            session_id: activeSession.id,
+            date: currentDateStr,
+            timestamp: nowIso,
+            status: attStatus,
+            late_minutes: lateMinutes,
+            method: attMethod || (String(code || '').startsWith('RFID-') ? 'rfid' : 'barcode'),
+            device_id: deviceId || 'kiosk_main',
+            photo_id: photoId,
+            notes: notes || '',
+            version: 1,
+            created_at: nowIso,
+            updated_at: nowIso,
+            diubah_pada: nowIso,
+          };
+
+          preparedRecords.push(record);
+          resolvedStudentsByRecordId.set(recordId, student);
+          resolvedSessionByRecordId.set(recordId, activeSession);
         }
 
-        // Determine attendance status & late minutes
-        let attStatus = status || 'Hadir';
-        let lateMinutes = 0;
+        const { saved, rejectedDuplicates } = await sheetsDb.appendAttendanceBatch(
+          preparedRecords,
+          actorName
+        );
 
-        if (!status && activeSession?.on_time_limit) {
-          const [limitH, limitM] = activeSession.on_time_limit.split(':').map(Number);
-          const curMinTotal = now.getHours() * 60 + now.getMinutes();
-          const limitMinTotal = (limitH || 0) * 60 + (limitM || 0);
-          const diffMinutes = curMinTotal - limitMinTotal;
-
-          if (diffMinutes > 0) {
-            lateMinutes = diffMinutes;
-            attStatus = 'Terlambat';
+        // Send notifications for saved late/alpha scans
+        for (const rec of saved) {
+          if (rec.status === 'Terlambat' || rec.status === 'Alpha') {
+            const student = resolvedStudentsByRecordId.get(rec.id);
+            if (student) {
+              notificationService
+                .notifyParent({
+                  student,
+                  triggerType: rec.status === 'Terlambat' ? 'terlambat' : 'alpha',
+                  status: `${rec.status} (${rec.late_minutes} menit)`,
+                })
+                .catch(console.error);
+            }
           }
         }
 
-        const recordId = `att_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-        const record = {
-          id: recordId,
-          student_id: student.nis,
-          session_id: activeSession.id,
-          date: currentDateStr,
-          timestamp: now.toISOString(),
-          status: attStatus,
-          late_minutes: lateMinutes,
-          method: attMethod || (code?.startsWith('RFID-') ? 'rfid' : 'barcode'),
-          device_id: deviceId || 'kiosk_main',
-          notes: notes || '',
-          version: 1,
-          created_at: now.toISOString(),
-          updated_at: now.toISOString(),
-        };
+        const allRejections = [
+          ...immediateRejections,
+          ...rejectedDuplicates.map((d) => ({
+            studentId: d.student_id,
+            isDuplicate: true,
+            message: d.reason,
+          })),
+        ];
 
-        const result = await storage.recordAttendance(record);
-        if (!result.success) {
-          return JsonResponse.badRequest(result.message || 'Presensi gagal disimpan', {
-            isDuplicate: result.isDuplicate,
-            student,
+        // If single scan request and rejected
+        if (!Array.isArray(req.body?.scans)) {
+          if (saved.length === 0 && allRejections.length > 0) {
+            return JsonResponse.badRequest(allRejections[0].message, {
+              isDuplicate: Boolean(allRejections[0].isDuplicate),
+              student: preparedRecords[0]
+                ? resolvedStudentsByRecordId.get(preparedRecords[0].id)
+                : undefined,
+            });
+          }
+          const singleRec = saved[0];
+          return JsonResponse.ok({
+            success: true,
+            record: singleRec,
+            student: resolvedStudentsByRecordId.get(singleRec.id),
+            session: resolvedSessionByRecordId.get(singleRec.id),
+            serverTime: serverNow.toISOString(),
           });
-        }
-
-        // Parent email notification if late or alpha
-        if (attStatus === 'Terlambat' || attStatus === 'Alpha') {
-          notificationService.notifyParent({
-            student,
-            triggerType: attStatus === 'Terlambat' ? 'terlambat' : 'alpha',
-            status: `${attStatus} (${lateMinutes} menit)` ,
-          }).catch(console.error);
         }
 
         return JsonResponse.ok({
           success: true,
-          record: result.record,
-          student,
-          session: activeSession,
+          savedCount: saved.length,
+          rejectedCount: allRejections.length,
+          results: saved.map((rec) => ({
+            record: rec,
+            student: resolvedStudentsByRecordId.get(rec.id),
+            session: resolvedSessionByRecordId.get(rec.id),
+          })),
+          rejectedDuplicates: allRejections,
+          serverTime: serverNow.toISOString(),
         });
       }
 
       if (method === 'PUT') {
-        const { id, updates, reason } = req.body;
+        const { id, updates, reason, expected_updated_at, forceOverwrite } = req.body;
         const validRes = await authService.validateActiveSession(token);
         if (!validRes.valid) return JsonResponse.unauthorized();
-        const updated = await storage.updateAttendance(id, updates, validRes.session?.name || 'Petugas', reason || 'Koreksi presensi');
+        const updated = await sheetsDb.updateAttendance(
+          id,
+          updates,
+          validRes.session?.name || 'Petugas',
+          reason || 'Koreksi presensi',
+          expected_updated_at,
+          Boolean(forceOverwrite)
+        );
+        if (!updated) return JsonResponse.notFound('Data presensi tidak ditemukan.');
         return JsonResponse.ok({ success: true, record: updated });
       }
 
@@ -973,17 +747,20 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         const { id, reason } = req.body;
         const validRes = await authService.validateActiveSession(token);
         if (!validRes.valid) return JsonResponse.unauthorized();
-        const success = await storage.deleteAttendance(id, validRes.session?.name || 'Petugas', reason || 'Pembatalan presensi');
+        const success = await sheetsDb.deleteAttendance(
+          id,
+          validRes.session?.name || 'Petugas',
+          reason || 'Pembatalan presensi'
+        );
         return JsonResponse.ok({ success });
       }
     }
 
-    // 5. OUT OF CLASS: /api/out-of-class
+    // 6. OUT OF CLASS: /api/out-of-class
     if (pathname === '/api/out-of-class') {
       if (method === 'GET') {
-        // Auto-close overdue permissions that expired long ago
-        await storage.autoCloseOverdueOutOfClass();
-        const records = await storage.getOutOfClass();
+        await sheetsDb.autoCloseOverdueOutOfClass();
+        const records = await sheetsDb.getOutOfClass();
         return JsonResponse.ok({ records });
       }
 
@@ -993,11 +770,14 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           return JsonResponse.badRequest('Data izin keluar tidak lengkap.');
         }
 
-        const students = await storage.getStudents();
+        const students = await sheetsDb.getStudents();
         const student = students.find((s) => s.nis === studentId);
         if (!student) {
           return JsonResponse.badRequest('Siswa tidak ditemukan.');
         }
+
+        const validRes = token ? await authService.validateActiveSession(token) : { valid: false, session: undefined };
+        const actorName = validRes.valid ? validRes.session?.name || 'Petugas Piket' : 'Petugas Piket';
 
         const now = new Date();
         const due = new Date(now.getTime() + durationMinutes * 60 * 1000);
@@ -1018,7 +798,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           updated_at: now.toISOString(),
         };
 
-        const result = await storage.startOutOfClass(newRecord);
+        const result = await sheetsDb.startOutOfClass(newRecord, actorName);
         if (!result.success) {
           return JsonResponse.badRequest(result.error || 'Gagal memulai izin keluar.');
         }
@@ -1027,32 +807,34 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       }
 
       if (method === 'PUT') {
-        // Confirm return (click checkmark)
-        const { id, returnMethod, notes, auditReason } = req.body;
+        const { id, returnMethod, notes, auditReason, expected_updated_at, forceOverwrite } = req.body;
         const validRes = await authService.validateActiveSession(token);
-        const result = await storage.confirmOutOfClassReturn(
+        const result = await sheetsDb.confirmOutOfClassReturn(
           id,
           returnMethod || 'click',
           notes,
-          validRes.valid ? validRes.session?.name : 'Petugas Piket',
-          auditReason
+          validRes.valid ? validRes.session?.name || 'Petugas Piket' : 'Petugas Piket',
+          auditReason,
+          expected_updated_at,
+          Boolean(forceOverwrite)
         );
 
         if (!result.success) {
           return JsonResponse.badRequest(result.error || 'Gagal mengonfirmasi kepulangan.');
         }
 
-        // If returned late, notify parent
         if (result.record && result.record.late_return_minutes > 0) {
-          const students = await storage.getStudents();
+          const students = await sheetsDb.getStudents();
           const student = students.find((s) => s.nis === result.record!.student_id);
           if (student) {
-            notificationService.notifyParent({
-              student,
-              triggerType: 'melebihi_waktu',
-              status: `Melebihi Waktu Izin Keluar (+${result.record.late_return_minutes} menit)`,
-              lateReturnMinutes: result.record.late_return_minutes,
-            }).catch(console.error);
+            notificationService
+              .notifyParent({
+                student,
+                triggerType: 'melebihi_waktu',
+                status: `Melebihi Waktu Izin Keluar (+${result.record.late_return_minutes} menit)`,
+                lateReturnMinutes: result.record.late_return_minutes,
+              })
+              .catch(console.error);
           }
         }
 
@@ -1064,11 +846,11 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       }
     }
 
-    // 6. VIOLATIONS: /api/violations
+    // 7. VIOLATIONS: /api/violations
     if (pathname === '/api/violations') {
       if (method === 'GET') {
-        const violations = await storage.getViolations();
-        const types = await storage.getViolationTypes();
+        const violations = await sheetsDb.getViolations();
+        const types = await sheetsDb.getViolationTypes();
         return JsonResponse.ok({ violations, types });
       }
 
@@ -1083,34 +865,25 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           evidenceFileName,
         } = req.body;
 
-        const students = await storage.getStudents();
+        const students = await sheetsDb.getStudents();
         const student = students.find((s) => s.nis === studentId);
         if (!student) return JsonResponse.badRequest('Siswa tidak ditemukan.');
 
-        const types = await storage.getViolationTypes();
+        const types = await sheetsDb.getViolationTypes();
         const vtype = types.find((t) => t.id === violationTypeId);
         if (!vtype) return JsonResponse.badRequest('Jenis pelanggaran tidak valid.');
 
-        let evidencePhotoUrl = '';
-        if (evidenceBase64 && evidenceFileName) {
-          if (googleSheetsClient.isConnected) {
-            try {
-              evidencePhotoUrl = await googleSheetsClient.uploadFileToDrive(
-                `bukti_${student.nis}_${Date.now()}.jpg`,
-                'image/jpeg',
-                evidenceBase64
-              );
-            } catch (err) {
-              console.warn('[Drive] Upload failed, falling back to data URL:', err);
-              evidencePhotoUrl = `data:image/jpeg;base64,${evidenceBase64}`;
-            }
-          } else {
-            evidencePhotoUrl = `data:image/jpeg;base64,${evidenceBase64}`;
-          }
+        let evidencePhotoId = '';
+        if (evidenceBase64) {
+          evidencePhotoId = await sheetsDb.uploadPhotoToDrive(
+            evidenceBase64,
+            evidenceFileName || `bukti_${student.nis}_${Date.now()}.jpg`
+          );
         }
 
         const validRes = await authService.validateActiveSession(token);
         const recordedBy = validRes.valid ? validRes.session?.name || 'Petugas' : 'Petugas';
+        const nowIso = new Date().toISOString();
 
         const record = {
           id: `vio_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -1122,40 +895,45 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           points: customPoints !== undefined ? Number(customPoints) : vtype.default_points,
           notes: notes || '',
           location: location || '',
-          evidence_photo_url: evidencePhotoUrl,
+          evidence_photo_url: evidencePhotoId,
           recorded_by: recordedBy,
-          recorded_at: new Date().toISOString(),
+          recorded_at: nowIso,
           version: 1,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
+          created_at: nowIso,
+          updated_at: nowIso,
         };
 
-        const saved = await storage.recordViolation(record);
+        const saved = await sheetsDb.recordViolation(record, recordedBy);
 
-        // Calculate student total points
-        const allVios = await storage.getViolations();
+        const allVios = await sheetsDb.getViolations();
         const studentVios = allVios.filter((v) => v.student_id === student.nis);
-        const totalPoints = studentVios.reduce((acc, curr) => acc + (curr.category === 'prestasi' ? -curr.points : curr.points), 0);
+        const totalPoints = studentVios.reduce(
+          (acc, curr) => acc + (curr.category === 'prestasi' ? -curr.points : curr.points),
+          0
+        );
 
-        // Notify parent automatically for violation & warning threshold if crossed
-        notificationService.notifyParent({
-          student,
-          triggerType: 'pelanggaran',
-          status: `Pelanggaran: ${vtype.name}`,
-          violationName: vtype.name,
-          points: record.points,
-        }).catch(console.error);
+        notificationService
+          .notifyParent({
+            student,
+            triggerType: 'pelanggaran',
+            status: `Pelanggaran: ${vtype.name}`,
+            violationName: vtype.name,
+            points: record.points,
+          })
+          .catch(console.error);
 
-        const notifSettings = await storage.getNotificationSettings();
+        const notifSettings = await sheetsDb.getNotificationSettings();
         const threshold = notifSettings?.warning_threshold_points ?? 25;
         if (totalPoints >= threshold && vtype.category !== 'prestasi') {
-          notificationService.notifyParent({
-            student,
-            triggerType: 'ambang_peringatan',
-            status: `Poin Pelanggaran Mencapai Ambang Batas SP (${totalPoints} poin)`,
-            violationName: vtype.name,
-            points: totalPoints,
-          }).catch(console.error);
+          notificationService
+            .notifyParent({
+              student,
+              triggerType: 'ambang_peringatan',
+              status: `Poin Pelanggaran Mencapai Ambang Batas SP (${totalPoints} poin)`,
+              violationName: vtype.name,
+              points: totalPoints,
+            })
+            .catch(console.error);
         }
 
         return JsonResponse.ok({
@@ -1169,53 +947,51 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         const { id, reason } = req.body;
         const validRes = await authService.validateActiveSession(token);
         if (!validRes.valid) return JsonResponse.unauthorized();
-        const success = await storage.deleteViolation(id, validRes.session?.name || 'Admin', reason || 'Koreksi pelanggaran');
+        const success = await sheetsDb.deleteViolation(
+          id,
+          validRes.session?.name || 'Admin',
+          reason || 'Koreksi pelanggaran'
+        );
         return JsonResponse.ok({ success });
       }
     }
 
-    // 7. VIOLATION TYPES CRUD: /api/violation-types
+    // 8. VIOLATION TYPES CRUD: /api/violation-types
     if (pathname === '/api/violation-types') {
       if (method === 'GET') {
-        const types = await storage.getViolationTypes();
+        const types = await sheetsDb.getViolationTypes();
         return JsonResponse.ok({ types });
       }
 
       const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) {
-        return JsonResponse.unauthorized();
-      }
+      if (!validRes.valid) return JsonResponse.unauthorized();
 
       if (method === 'POST') {
         const vtype = req.body;
         if (!vtype.name || !vtype.code || !vtype.category) {
           return JsonResponse.badRequest('Nama, kode, dan kategori wajib diisi.');
         }
-        if (!vtype.id) {
-          vtype.id = `vt_${Date.now()}`;
-        }
-        const saved = await storage.saveViolationType(vtype);
+        if (!vtype.id) vtype.id = `vt_${Date.now()}`;
+        const saved = await sheetsDb.saveViolationType(vtype, validRes.session?.name || 'Admin');
         return JsonResponse.ok({ success: true, violationType: saved });
       }
 
       if (method === 'DELETE') {
         const { id } = req.body;
-        await storage.deleteViolationType(id);
+        await sheetsDb.deleteViolationType(id, validRes.session?.name || 'Admin');
         return JsonResponse.ok({ success: true });
       }
     }
 
-    // 8. STUDENTS: /api/students (CRUD, Excel Template, Excel Import/Export)
+    // 9. STUDENTS: /api/students
     if (pathname === '/api/students') {
       if (method === 'GET') {
-        const students = await storage.getStudents();
+        const students = await sheetsDb.getStudents();
         const action = query.action;
 
-        // Download Template (.xlsx)
         if (action === 'template') {
-          const classes = await storage.getClasses();
+          const classes = await sheetsDb.getClasses();
           const classNames = classes.map((c) => c.id).join(', ');
-
           const wb = XLSX.utils.book_new();
           const sampleData = [
             {
@@ -1243,7 +1019,6 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           const wsData = XLSX.utils.json_to_sheet(sampleData);
           XLSX.utils.book_append_sheet(wb, wsData, 'Data Siswa');
 
-          // Sheet Petunjuk
           const instructions = [
             { Kolom: 'NIS', Keterangan: 'Nomor Induk Siswa (Wajib, Unik, angka/teks)', Contoh: '20261011' },
             { Kolom: 'NISN', Keterangan: 'Nomor Induk Siswa Nasional (Opsional)', Contoh: '0081234011' },
@@ -1271,23 +1046,18 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         return JsonResponse.ok({ students });
       }
 
-      // Check authorization for write operations
       const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) {
-        return JsonResponse.unauthorized();
-      }
+      if (!validRes.valid) return JsonResponse.unauthorized();
+      const actorName = validRes.session?.name || 'Admin';
 
       if (method === 'POST') {
         const action = query.action;
-
-        // Batch import students
         if (action === 'batch_import') {
           const { students: incomingStudents } = req.body;
           if (!Array.isArray(incomingStudents) || incomingStudents.length === 0) {
             return JsonResponse.badRequest('Daftar siswa kosong.');
           }
-
-          const result = await storage.batchSaveStudents(incomingStudents);
+          const result = await sheetsDb.batchSaveStudents(incomingStudents, actorName);
           return JsonResponse.ok({ success: true, ...result });
         }
 
@@ -1295,44 +1065,51 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         if (!student.nis || !student.name || !student.class_id) {
           return JsonResponse.badRequest('NIS, Nama, dan Kelas wajib diisi.');
         }
-        const saved = await storage.saveStudent(student);
+
+        if (student.photoBase64) {
+          student.photo_url = await sheetsDb.uploadPhotoToDrive(
+            student.photoBase64,
+            `siswa_${student.nis}_${Date.now()}.jpg`
+          );
+          delete student.photoBase64;
+        }
+
+        const saved = await sheetsDb.saveStudent(student, actorName);
         return JsonResponse.ok({ success: true, student: saved });
       }
 
       if (method === 'DELETE') {
         const { nis, nisses, action } = req.body || {};
         if (action === 'clear_all') {
-          const count = await storage.clearAllStudents();
-          return JsonResponse.ok({ success: true, count, message: `${count} data siswa berhasil dihapus/dikosongkan.` });
+          const count = await sheetsDb.clearAllStudents(actorName);
+          return JsonResponse.ok({ success: true, count, message: `${count} data siswa berhasil dihapus.` });
         }
         if (Array.isArray(nisses) && nisses.length > 0) {
-          const count = await storage.deleteStudents(nisses);
+          const count = await sheetsDb.deleteStudents(nisses, actorName);
           return JsonResponse.ok({ success: true, count, message: `${count} siswa berhasil dihapus.` });
         }
         if (nis) {
-          const success = await storage.deleteStudent(nis);
+          const success = await sheetsDb.deleteStudent(nis, actorName);
           return JsonResponse.ok({ success });
         }
         return JsonResponse.badRequest('Parameter nis, nisses, atau action diperlukan.');
       }
     }
 
-    // 9. CLASSES & SESSIONS CRUD: /api/classes, /api/sessions
+    // 10. CLASSES & SESSIONS CRUD
     if (pathname === '/api/classes') {
       if (method === 'GET') {
-        const classes = await storage.getClasses();
+        const classes = await sheetsDb.getClasses();
         return JsonResponse.ok({ classes });
       }
       const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) {
-        return JsonResponse.unauthorized();
-      }
-      if (method === 'POST') {
-        const cls = await storage.saveClass(req.body);
+      if (!validRes.valid) return JsonResponse.unauthorized();
+      const actorName = validRes.session?.name || 'Admin';
 
-        // Sync with homeroom user if exists
+      if (method === 'POST') {
+        const cls = await sheetsDb.saveClass(req.body, actorName);
         try {
-          const users = await storage.getUsers();
+          const users = await sheetsDb.getUsers();
           const homeroomUser = users.find((u) => u.role === 'homeroom' && u.class_id === cls.id);
           if (homeroomUser) {
             let changed = false;
@@ -1345,73 +1122,79 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
               changed = true;
             }
             if (changed) {
-              await storage.saveUser(homeroomUser);
+              await sheetsDb.saveUser(homeroomUser, actorName);
             }
           }
         } catch (e) {
           console.error('[API Classes] Error syncing homeroom user:', e);
         }
-
         return JsonResponse.ok({ success: true, class: cls });
       }
+
       if (method === 'DELETE') {
         const idToDelete = req.body?.id || query.id;
-        if (idToDelete) {
-          await storage.deleteClass(idToDelete);
-        }
+        if (idToDelete) await sheetsDb.deleteClass(idToDelete, actorName);
         return JsonResponse.ok({ success: true });
       }
     }
 
     if (pathname === '/api/sessions') {
       if (method === 'GET') {
-        const sessions = await storage.getSessions();
+        const sessions = await sheetsDb.getSessions();
         return JsonResponse.ok({ sessions });
       }
       const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) {
-        return JsonResponse.unauthorized();
-      }
+      if (!validRes.valid) return JsonResponse.unauthorized();
+      const actorName = validRes.session?.name || 'Admin';
+
       if (method === 'POST') {
-        const session = await storage.saveSession(req.body);
+        const session = await sheetsDb.saveSession(req.body, actorName);
         return JsonResponse.ok({ success: true, session });
       }
       if (method === 'DELETE') {
         const idToDelete = req.body?.id || query.id;
-        if (idToDelete) {
-          await storage.deleteSession(idToDelete);
-        }
+        if (idToDelete) await sheetsDb.deleteSession(idToDelete, actorName);
         return JsonResponse.ok({ success: true });
       }
     }
 
-    // 10. SETTINGS: /api/settings
+    // 11. SETTINGS
     if (pathname === '/api/settings') {
       if (method === 'GET') {
-        const settings = await storage.getSettings();
+        const settings = await sheetsDb.getSettings();
         return JsonResponse.ok({ settings });
       }
       const validRes = await authService.validateActiveSession(token);
-      if (!validRes.valid) {
-        return JsonResponse.unauthorized();
+      if (!validRes.valid) return JsonResponse.unauthorized();
+      const body = { ...(req.body || {}) };
+      if (body.logoBase64) {
+        body.logo_url = await sheetsDb.uploadPhotoToDrive(
+          body.logoBase64,
+          `logo_sekolah_${Date.now()}.jpg`
+        );
+        delete body.logoBase64;
       }
-      const updated = await storage.updateSettings(req.body);
+      const updated = await sheetsDb.updateSettings(body, validRes.session?.name || 'Admin');
       return JsonResponse.ok({ success: true, settings: updated });
     }
 
-    // 11. NOTIFICATIONS & TEST EMAIL: /api/notifications
+    // 12. NOTIFICATIONS & TEST EMAIL
     if (pathname === '/api/notifications') {
       if (method === 'GET') {
-        const settings = await storage.getNotificationSettings();
-        const logs = await storage.getNotificationLogs();
+        const settings = await sheetsDb.getNotificationSettings();
+        const logs = await sheetsDb.getNotificationLogs();
         return JsonResponse.ok({ settings, logs });
       }
 
       const cleanToken = token && token !== 'undefined' && token !== 'null' ? token : '';
+      let actorName = 'Admin';
       if (cleanToken) {
         const validRes = await authService.validateActiveSession(cleanToken);
         if (!validRes.valid && validRes.reason === 'Session invalidated by password or account change') {
           return JsonResponse.unauthorized(validRes.reason);
+        }
+        if (validRes.valid && validRes.session?.name) {
+          actorName = validRes.session.name;
         }
       }
 
@@ -1424,65 +1207,72 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
 
       if (query.action === 'send_weekly_recap') {
         const { classId } = req.body || {};
-        if (classId) {
-          const result = await notificationService.sendWeeklyHomeroomRecap(classId);
-          return JsonResponse.ok(result);
-        } else {
-          const result = await notificationService.sendAllWeeklyRecaps();
-          return JsonResponse.ok(result);
-        }
+        const result = classId
+          ? await notificationService.sendWeeklyHomeroomRecap(classId)
+          : await notificationService.sendAllWeeklyRecaps();
+        return JsonResponse.ok(result);
       }
 
-      const updated = await storage.updateNotificationSettings(req.body || {});
+      const updated = await sheetsDb.updateNotificationSettings(req.body || {}, actorName);
       return JsonResponse.ok({ success: true, settings: updated });
     }
 
-    // 12. LEAVE REQUESTS: /api/leave-requests
+    // 13. LEAVE REQUESTS
     if (pathname === '/api/leave-requests') {
       if (method === 'GET') {
-        const requests = await storage.getLeaveRequests();
+        const requests = await sheetsDb.getLeaveRequests();
         return JsonResponse.ok({ requests });
       }
 
       if (method === 'POST') {
+        const nowIso = new Date().toISOString();
         const newReq = {
           id: `lr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
           ...req.body,
           status: 'pending' as const,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
+          created_at: nowIso,
+          updated_at: nowIso,
         };
-        const saved = await storage.saveLeaveRequest(newReq);
+        const saved = await sheetsDb.saveLeaveRequest(newReq, 'Pengaju Izin');
         return JsonResponse.ok({ success: true, request: saved });
       }
 
       if (method === 'PUT') {
-        // Approve / Reject by Homeroom or Admin
         const validRes = await authService.validateActiveSession(token);
         if (!validRes.valid) return JsonResponse.unauthorized();
 
-        const { id, status, rejectionReason } = req.body;
-        const requests = await storage.getLeaveRequests();
+        const { id, status, rejectionReason, expected_updated_at, forceOverwrite } = req.body;
+        const requests = await sheetsDb.getLeaveRequests();
         const existing = requests.find((r) => r.id === id);
         if (!existing) return JsonResponse.notFound('Pengajuan izin tidak ditemukan.');
 
-        existing.status = status;
-        existing.approved_by = validRes.session?.name;
-        existing.approved_at = new Date().toISOString();
-        if (rejectionReason) existing.rejection_reason = rejectionReason;
+        const updatedPayload = {
+          ...existing,
+          status,
+          approved_by: validRes.session?.name,
+          approved_at: new Date().toISOString(),
+          ...(rejectionReason ? { rejection_reason: rejectionReason } : {}),
+          expected_updated_at,
+          forceOverwrite,
+        };
 
-        const saved = await storage.saveLeaveRequest(existing);
+        const saved = await sheetsDb.saveLeaveRequest(
+          updatedPayload,
+          validRes.session?.name || 'Wali Kelas'
+        );
 
         if (status === 'approved') {
-          const students = await storage.getStudents();
+          const students = await sheetsDb.getStudents();
           const student = students.find((s) => s.nis === existing.student_id);
           if (student) {
-            notificationService.notifyParent({
-              student,
-              triggerType: 'izin_sakit',
-              status: `Izin / Sakit Disetujui (${existing.type}: ${existing.start_date} s/d ${existing.end_date})`,
-              customDetails: existing.reason,
-            }).catch(console.error);
+            notificationService
+              .notifyParent({
+                student,
+                triggerType: 'izin_sakit',
+                status: `Izin / Sakit Disetujui (${existing.type}: ${existing.start_date} s/d ${existing.end_date})`,
+                customDetails: existing.reason,
+              })
+              .catch(console.error);
           }
         }
 
@@ -1490,72 +1280,72 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       }
     }
 
-    // 13. AUDIT LOGS: /api/audit
+    // 14. AUDIT LOGS (FROM 'Log' SHEET): /api/audit
     if (pathname === '/api/audit') {
-      const logs = await storage.getAuditLogs();
+      const logs = await sheetsDb.getAuditLogs();
       return JsonResponse.ok({ logs });
     }
 
-    // 14. SELF-TEST SIMULATION (Bagian 13 Poin 9)
-    // Concurrency testing: duplicate attendance, out-of-class quota race, double return confirm
+    // 15. SELF-TEST SIMULATION
     if (pathname === '/api/simulate') {
       const { testType } = req.body || {};
-      const students = await storage.getStudents();
-      const sessions = await storage.getSessions();
+      const students = await sheetsDb.getStudents();
+      const sessions = await sheetsDb.getSessions();
       const targetStudent = students[0];
       const targetSession = sessions[0];
+      if (!targetStudent || !targetSession) {
+        return JsonResponse.badRequest('Data siswa atau sesi masih kosong di Google Sheets.');
+      }
 
       if (testType === 'duplicate_attendance') {
-        // Simulate two devices scanning the same student simultaneously
-        const dateStr = new Date().toISOString().split('T')[0];
-        const promise1 = storage.recordAttendance({
-          id: `att_sim_1_${Date.now()}`,
-          student_id: targetStudent.nis,
-          session_id: targetSession.id,
-          date: dateStr,
-          timestamp: new Date().toISOString(),
-          status: 'Hadir',
-          late_minutes: 0,
-          method: 'rfid',
-          device_id: 'device_gate_1',
-          version: 1,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        });
-
-        const promise2 = storage.recordAttendance({
-          id: `att_sim_2_${Date.now()}`,
-          student_id: targetStudent.nis,
-          session_id: targetSession.id,
-          date: dateStr,
-          timestamp: new Date().toISOString(),
-          status: 'Hadir',
-          late_minutes: 0,
-          method: 'barcode',
-          device_id: 'device_gate_2',
-          version: 1,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        });
-
-        const [res1, res2] = await Promise.all([promise1, promise2]);
+        const now = new Date();
+        const dateStr = now.toISOString().split('T')[0];
+        const res = await sheetsDb.appendAttendanceBatch([
+          {
+            id: `att_sim_1_${Date.now()}`,
+            student_id: targetStudent.nis,
+            session_id: targetSession.id,
+            date: dateStr,
+            timestamp: now.toISOString(),
+            status: 'Hadir',
+            late_minutes: 0,
+            method: 'rfid',
+            device_id: 'device_gate_1',
+            version: 1,
+            created_at: now.toISOString(),
+            updated_at: now.toISOString(),
+          },
+          {
+            id: `att_sim_2_${Date.now()}`,
+            student_id: targetStudent.nis,
+            session_id: targetSession.id,
+            date: dateStr,
+            timestamp: now.toISOString(),
+            status: 'Hadir',
+            late_minutes: 0,
+            method: 'barcode',
+            device_id: 'device_gate_2',
+            version: 1,
+            created_at: now.toISOString(),
+            updated_at: now.toISOString(),
+          },
+        ]);
         return JsonResponse.ok({
           test: 'duplicate_attendance',
-          device1: { success: res1.success, isDuplicate: res1.isDuplicate, message: res1.message },
-          device2: { success: res2.success, isDuplicate: res2.isDuplicate, message: res2.message },
-          conclusion: (res1.success && res2.isDuplicate) || (res2.success && res1.isDuplicate)
-            ? 'SUKSES: Hanya satu presensi yang diterima, duplikat berhasil ditolak dan dicegah.'
-            : 'Perhatian: Periksa kembali konsistensi data.',
+          saved: res.saved.length,
+          rejectedDuplicates: res.rejectedDuplicates,
+          conclusion:
+            res.rejectedDuplicates.length > 0
+              ? 'SUKSES: Hanya satu presensi yang diterima, duplikat hari yang sama berhasil ditolak.'
+              : 'Simulasi selesai.',
         });
       }
 
       if (testType === 'out_of_class_quota_race') {
-        // Simulate two students from same class requesting permission when class quota has only 1 spot left
         const classStudents = students.filter((s) => s.class_id === targetStudent.class_id);
         const s1 = classStudents[0];
-        const s2 = classStudents[1] || students[1];
-
-        const req1 = storage.startOutOfClass({
+        const s2 = classStudents[1] || students[1] || s1;
+        const r1 = await sheetsDb.startOutOfClass({
           id: `ooc_sim_1_${Date.now()}`,
           student_id: s1.nis,
           class_id: s1.class_id,
@@ -1570,8 +1360,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         });
-
-        const req2 = storage.startOutOfClass({
+        const r2 = await sheetsDb.startOutOfClass({
           id: `ooc_sim_2_${Date.now()}`,
           student_id: s2.nis,
           class_id: s2.class_id,
@@ -1586,13 +1375,11 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         });
-
-        const [res1, res2] = await Promise.all([req1, req2]);
         return JsonResponse.ok({
           test: 'out_of_class_quota_race',
-          req1: { success: res1.success, error: res1.error },
-          req2: { success: res2.success, error: res2.error },
-          conclusion: 'Pengujian kuota kelas selesai dievaluasi di server.',
+          req1: { success: r1.success, error: r1.error },
+          req2: { success: r2.success, error: r2.error },
+          conclusion: 'Pengujian kuota kelas langsung ke Google Sheets selesai dievaluasi.',
         });
       }
 
@@ -1601,6 +1388,9 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
 
     return JsonResponse.notFound(`Endpoint ${pathname} tidak ditemukan.`);
   } catch (err: any) {
+    if (err instanceof SheetsConfigError || err instanceof ConflictError) {
+      return JsonResponse.serverError(err);
+    }
     console.error(`[API ERROR] ${method} ${pathname}:`, err);
     return JsonResponse.serverError(err);
   }

@@ -12,7 +12,6 @@ import {
   NotificationSettings,
   NotificationLog,
   AuditLog,
-  DeltaChange,
   AttendanceStatus,
   OutOfClassType,
   OutOfClassStatus,
@@ -33,7 +32,6 @@ export type {
   NotificationSettings,
   NotificationLog,
   AuditLog,
-  DeltaChange,
   AttendanceStatus,
   OutOfClassType,
   OutOfClassStatus,
@@ -63,3 +61,17 @@ export interface AuthSession {
 }
 
 export type SyncStatus = 'synced' | 'syncing' | 'offline' | 'error';
+
+export interface SaveStatusState {
+  state: 'idle' | 'saving' | 'saved' | 'error';
+  message: string;
+  updatedAt?: number;
+}
+
+export interface ConflictState {
+  title: string;
+  message: string;
+  currentData?: any;
+  onForceOverwrite: () => Promise<void>;
+  onReloadLatest: () => Promise<void>;
+}

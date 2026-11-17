@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { X, Calendar, AlertTriangle, DoorOpen, Award, Mail, User, ShieldCheck } from 'lucide-react';
 import { Student } from '../../types/index.js';
 import { useApp } from '../../context/AppContext.js';
+import { resolvePhotoSrc } from '../../utils/photo.js';
 
 interface StudentProfileModalProps {
   student: Student | null;
@@ -66,7 +67,7 @@ export const StudentProfileModal: React.FC<StudentProfileModalProps> = ({ studen
           <div className="flex items-center gap-3">
             <div className="w-12 h-12 rounded-full border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-800 dark:text-slate-200 font-bold overflow-hidden">
               {student.photo_url ? (
-                <img src={student.photo_url} alt={student.name} className="w-full h-full object-cover" />
+                <img src={resolvePhotoSrc(student.photo_url)} alt={student.name} className="w-full h-full object-cover" />
               ) : (
                 student.name.slice(0, 2).toUpperCase()
               )}
@@ -307,7 +308,7 @@ export const StudentProfileModal: React.FC<StudentProfileModalProps> = ({ studen
                       </span>
                       {v.evidence_photo_url && (
                         <a
-                          href={v.evidence_photo_url}
+                          href={resolvePhotoSrc(v.evidence_photo_url)}
                           target="_blank"
                           rel="noreferrer"
                           className="text-[11px] text-blue-600 hover:underline"

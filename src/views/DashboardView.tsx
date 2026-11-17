@@ -47,7 +47,7 @@ export const DashboardView: React.FC = () => {
     currentServerTime,
     isInitialLoading,
     initialLoadError,
-    syncNow,
+    refreshFromSheets,
     showToast,
   } = useApp();
 
@@ -395,7 +395,7 @@ export const DashboardView: React.FC = () => {
             <span>{initialLoadError}</span>
           </div>
           <button
-            onClick={() => syncNow()}
+            onClick={() => refreshFromSheets()}
             className="px-3 py-1 rounded bg-amber-600 hover:bg-amber-700 text-white font-semibold transition-colors"
           >
             Muat Ulang

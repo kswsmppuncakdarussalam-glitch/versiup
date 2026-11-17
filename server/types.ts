@@ -12,6 +12,7 @@ export interface User {
   is_active: boolean;
   created_at: string;
   updated_at: string;
+  diubah_pada?: string;
 }
 
 export interface Student {
@@ -27,6 +28,7 @@ export interface Student {
   parent_email: string;
   created_at: string;
   updated_at: string;
+  diubah_pada?: string;
 }
 
 export interface SchoolClass {
@@ -39,6 +41,7 @@ export interface SchoolClass {
   quota_limit: number;
   created_at: string;
   updated_at: string;
+  diubah_pada?: string;
 }
 
 export interface AttendanceSession {
@@ -53,6 +56,7 @@ export interface AttendanceSession {
   is_override?: boolean;
   created_at: string;
   updated_at: string;
+  diubah_pada?: string;
 }
 
 export type AttendanceStatus = 'Hadir' | 'Terlambat' | 'Izin' | 'Sakit' | 'Alpha';
@@ -67,12 +71,14 @@ export interface AttendanceRecord {
   late_minutes: number;
   method: 'rfid' | 'barcode' | 'manual';
   device_id: string;
+  photo_id?: string;
   notes?: string;
   audited_by?: string;
   audit_reason?: string;
   version: number;
   created_at: string;
   updated_at: string;
+  diubah_pada?: string;
 }
 
 export type OutOfClassType = 'BAK' | 'BAB' | 'Keperluan Lain';
@@ -99,6 +105,7 @@ export interface OutOfClassRecord {
   version: number;
   created_at: string;
   updated_at: string;
+  diubah_pada?: string;
 }
 
 export type ViolationCategory = 'ringan' | 'sedang' | 'berat' | 'prestasi';
@@ -113,6 +120,7 @@ export interface ViolationType {
   description: string;
   created_at: string;
   updated_at: string;
+  diubah_pada?: string;
 }
 
 export interface ViolationRecord {
@@ -131,6 +139,7 @@ export interface ViolationRecord {
   version: number;
   created_at: string;
   updated_at: string;
+  diubah_pada?: string;
 }
 
 export interface LeaveRequest {
@@ -148,6 +157,7 @@ export interface LeaveRequest {
   rejection_reason?: string;
   created_at: string;
   updated_at: string;
+  diubah_pada?: string;
 }
 
 export interface AppSettings {
@@ -182,27 +192,8 @@ export interface AppSettings {
   // Auto Session Switching (Peralihan Sesi Otomatis)
   auto_session_switch?: boolean;
   auto_session_switch_notify?: boolean;
-  // Google Drive & Sheets Integration
-  google_client_id?: string;
-  google_oauth_connected?: boolean;
-  google_account_email?: string;
-  google_account_name?: string;
-  google_account_photo?: string;
-  google_drive_folder_id?: string;
-  google_drive_folder_url?: string;
-  google_drive_backup_file_id?: string;
-  google_drive_backup_file_url?: string;
-  google_sheet_id?: string;
-  google_sheet_url?: string;
-  google_last_synced_at?: string;
-  google_accounts?: Array<{
-    email: string;
-    name: string;
-    photo?: string;
-    connected_at: string;
-    is_primary: boolean;
-  }>;
   updated_at: string;
+  diubah_pada?: string;
 }
 
 export interface NotificationSettings {
@@ -222,6 +213,7 @@ export interface NotificationSettings {
   weekly_recap_time?: string; // HH:mm (e.g. '15:00')
   weekly_recap_last_sent?: string;
   updated_at: string;
+  diubah_pada?: string;
 }
 
 export interface NotificationLog {
@@ -248,14 +240,4 @@ export interface AuditLog {
   new_values?: string;
   reason?: string;
   ip_or_device?: string;
-}
-
-export interface DeltaChange {
-  id: string;
-  version: number;
-  entity: string;
-  entity_id: string;
-  action: 'insert' | 'update' | 'delete';
-  changed_at: string;
-  data?: any;
 }
