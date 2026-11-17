@@ -1,5 +1,5 @@
 import nodemailer from 'nodemailer';
-import { sheetsDb } from './sheets.ts';
+import { sheetsDb, GoogleAuthExpiredError } from './sheets.ts';
 import type { NotificationLog, Student } from './types.ts';
 
 interface EmailPayload {
@@ -39,6 +39,91 @@ export class NotificationService {
         console.error('[NotificationService] Failed to init transporter:', err);
         this.isSmtpConfigured = false;
       }
+    }
+  }
+
+  public getEmailTransportStatus(): {
+    connected: boolean;
+    transport: 'gmail_oauth' | 'smtp' | 'unconfigured';
+  } {
+    if (sheetsDb.getOAuthAccessToken()) {
+      return { connected: true, transport: 'gmail_oauth' };
+    }
+    if (this.transporter && this.isSmtpConfigured) {
+      return { connected: true, transport: 'smtp' };
+    }
+    return { connected: false, transport: 'unconfigured' };
+  }
+
+  private encodeMimeHeaderUtf8(value: string): string {
+    const hasNonAscii = /[^\x20-\x7E]/.test(value);
+    if (!hasNonAscii) return value;
+    const b64 = Buffer.from(value, 'utf8').toString('base64');
+    return `=?UTF-8?B?${b64}?=`;
+  }
+
+  private async sendViaGmailApi(
+    accessToken: string,
+    opts: { to: string; subject: string; text: string; html?: string; fromName?: string }
+  ): Promise<void> {
+    const cleanSubject = opts.subject.replace(/[\r\n]+/g, ' ').trim();
+    const boundary = `dkb_boundary_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const lines: string[] = [
+      `To: ${opts.to}`,
+      `Subject: ${this.encodeMimeHeaderUtf8(cleanSubject)}`,
+      'MIME-Version: 1.0',
+    ];
+
+    if (opts.html) {
+      lines.push(`Content-Type: multipart/alternative; boundary="${boundary}"`);
+      lines.push('');
+      lines.push(`--${boundary}`);
+      lines.push('Content-Type: text/plain; charset="UTF-8"');
+      lines.push('Content-Transfer-Encoding: base64');
+      lines.push('');
+      lines.push(Buffer.from(opts.text, 'utf8').toString('base64'));
+      lines.push('');
+      lines.push(`--${boundary}`);
+      lines.push('Content-Type: text/html; charset="UTF-8"');
+      lines.push('Content-Transfer-Encoding: base64');
+      lines.push('');
+      lines.push(Buffer.from(opts.html, 'utf8').toString('base64'));
+      lines.push('');
+      lines.push(`--${boundary}--`);
+    } else {
+      lines.push('Content-Type: text/plain; charset="UTF-8"');
+      lines.push('Content-Transfer-Encoding: base64');
+      lines.push('');
+      lines.push(Buffer.from(opts.text, 'utf8').toString('base64'));
+    }
+
+    const rawMessage = lines.join('\r\n');
+    const encodedMessage = Buffer.from(rawMessage, 'utf8')
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ raw: encodedMessage }),
+    });
+
+    if (!res.ok) {
+      const errData: any = await res.json().catch(() => ({}));
+      const errMsg = errData?.error?.message || `Gmail API HTTP ${res.status}`;
+      if (res.status === 401) {
+        throw new GoogleAuthExpiredError('Sesi izin Gmail OAuth berakhir. Silakan hubungkan kembali akun Google/Gmail.');
+      }
+      if (res.status === 403) {
+        throw new Error('Izin kirim Gmail (gmail.send) belum diberikan. Klik "Hubungkan / Ganti Akun Gmail" untuk menyetujui izin kirim email.');
+      }
+      throw new Error(errMsg);
     }
   }
 
@@ -125,39 +210,42 @@ export class NotificationService {
         body = body.split(k).join(v);
       }
 
-      // If SMTP is not configured in environment, simulate successful delivery & log
-      if (!this.transporter || !this.isSmtpConfigured) {
-        console.log(`[NotificationService] (Simulated Delivery - SMTP not set in .env) To: ${email} | Subject: ${subject}`);
-        const log: NotificationLog = {
+      const oauthToken = sheetsDb.getOAuthAccessToken();
+      const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
+
+      if (oauthToken) {
+        await this.sendViaGmailApi(oauthToken, {
+          to: email,
+          subject,
+          text: body,
+          fromName,
+        });
+      } else if (this.transporter && this.isSmtpConfigured) {
+        const replyToEmail =
+          process.env.SMTP_USER && process.env.SMTP_USER.includes('@')
+            ? process.env.SMTP_USER.trim()
+            : undefined;
+        await this.transporter.sendMail({
+          from: `"${fromName}" <${process.env.SMTP_USER}>`,
+          ...(replyToEmail ? { replyTo: replyToEmail } : {}),
+          to: email,
+          subject,
+          text: body,
+        });
+      } else {
+        await sheetsDb.logNotification({
           id: `notif_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
           timestamp: now.toISOString(),
           student_id: payload.student.nis,
           student_name: payload.student.name,
           recipient_email: email,
           trigger_type: payload.triggerType,
-          status: 'sent',
-          error_message: undefined,
+          status: 'failed',
+          error_message: 'Email pengirim (Gmail / SMTP) belum dihubungkan.',
           created_at: now.toISOString(),
-        };
-        await sheetsDb.logNotification(log);
-        return { sent: true };
+        });
+        return { sent: false, reason: 'Email pengirim (Gmail / SMTP) belum dihubungkan.' };
       }
-
-      // Real SMTP send
-      const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
-      const replyToEmail =
-        process.env.SMTP_USER && process.env.SMTP_USER.includes('@')
-          ? process.env.SMTP_USER.trim()
-          : undefined;
-      const mailOptions = {
-        from: `"${fromName}" <${process.env.SMTP_USER}>`,
-        ...(replyToEmail ? { replyTo: replyToEmail } : {}),
-        to: email,
-        subject,
-        text: body,
-      };
-
-      await this.transporter.sendMail(mailOptions);
 
       const log: NotificationLog = {
         id: `notif_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -174,7 +262,6 @@ export class NotificationService {
       return { sent: true };
     } catch (err: any) {
       console.error('[NotificationService] Email send error:', err);
-      // Non-blocking: record error in log
       const now = new Date();
       const log: NotificationLog = {
         id: `notif_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -193,9 +280,9 @@ export class NotificationService {
   }
 
   /**
-   * Test sending an email
+   * Test sending an email via Gmail OAuth or SMTP
    */
-  async sendTestEmail(targetEmail: string): Promise<{ success: boolean; message: string }> {
+  async sendTestEmail(targetEmail: string): Promise<{ success: boolean; message: string; needsEmailAuth?: boolean }> {
     const settings = await sheetsDb.getSettings();
     const now = new Date();
     const cleanTarget = (targetEmail || '').trim();
@@ -203,7 +290,41 @@ export class NotificationService {
       return { success: false, message: 'Alamat email tujuan tidak valid.' };
     }
 
-    if (!this.transporter || !this.isSmtpConfigured) {
+    const oauthToken = sheetsDb.getOAuthAccessToken();
+    const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
+    const subject = `[Uji Coba] Sistem Notifikasi ${settings.school_name}`;
+    const text = `Halo,\n\nIni adalah pesan uji coba sistem notifikasi orang tua dari aplikasi DISIPLIN KITA BISA (${settings.school_name}). Konfigurasi email berfungsi dengan baik!`;
+
+    if (!oauthToken && (!this.transporter || !this.isSmtpConfigured)) {
+      return {
+        success: false,
+        needsEmailAuth: true,
+        message: 'Email pengirim belum terhubung. Klik "Hubungkan Akun Gmail" atau gunakan backend Apps Script terlebih dahulu.',
+      };
+    }
+
+    try {
+      if (oauthToken) {
+        await this.sendViaGmailApi(oauthToken, {
+          to: cleanTarget,
+          subject,
+          text,
+          fromName,
+        });
+      } else {
+        const replyToEmail =
+          process.env.SMTP_USER && process.env.SMTP_USER.includes('@')
+            ? process.env.SMTP_USER.trim()
+            : undefined;
+        await this.transporter.sendMail({
+          from: `"${fromName}" <${process.env.SMTP_USER}>`,
+          ...(replyToEmail ? { replyTo: replyToEmail } : {}),
+          to: cleanTarget,
+          subject,
+          text,
+        });
+      }
+
       await sheetsDb.logNotification({
         id: `notif_test_${Date.now()}`,
         timestamp: now.toISOString(),
@@ -216,36 +337,13 @@ export class NotificationService {
       });
       return {
         success: true,
-        message: `Uji coba berhasil dicatat untuk ${cleanTarget} (sinkronisasi log email aktif otomatis).`,
+        message: oauthToken
+          ? `Email uji coba berhasil dikirim via Gmail ke ${cleanTarget}`
+          : `Email uji coba berhasil dikirim ke ${cleanTarget}`,
       };
-    }
-
-    try {
-      const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
-      const replyToEmail =
-        process.env.SMTP_USER && process.env.SMTP_USER.includes('@')
-          ? process.env.SMTP_USER.trim()
-          : undefined;
-      await this.transporter.sendMail({
-        from: `"${fromName}" <${process.env.SMTP_USER}>`,
-        ...(replyToEmail ? { replyTo: replyToEmail } : {}),
-        to: cleanTarget,
-        subject: `[Uji Coba] Sistem Notifikasi ${settings.school_name}`,
-        text: `Halo,\n\nIni adalah pesan uji coba sistem notifikasi orang tua dari aplikasi DISIPLIN KITA BISA (${settings.school_name}). Konfigurasi email berfungsi dengan baik!`,
-      });
-      await sheetsDb.logNotification({
-        id: `notif_test_${Date.now()}`,
-        timestamp: now.toISOString(),
-        student_id: 'uji_coba',
-        student_name: 'Uji Coba Sistem Email',
-        recipient_email: cleanTarget,
-        trigger_type: 'uji_coba',
-        status: 'sent',
-        created_at: now.toISOString(),
-      });
-      return { success: true, message: `Email uji coba berhasil dikirim ke ${cleanTarget}` };
     } catch (err: any) {
-      console.error('[NotificationService] sendTestEmail SMTP error:', err);
+      if (err instanceof GoogleAuthExpiredError) throw err;
+      console.error('[NotificationService] sendTestEmail error:', err);
       await sheetsDb.logNotification({
         id: `notif_test_${Date.now()}`,
         timestamp: now.toISOString(),
@@ -254,10 +352,10 @@ export class NotificationService {
         recipient_email: cleanTarget,
         trigger_type: 'uji_coba',
         status: 'failed',
-        error_message: err?.message || 'Gagal autentikasi SMTP',
+        error_message: err?.message || 'Gagal mengirim email',
         created_at: now.toISOString(),
       });
-      return { success: false, message: `Gagal mengirim email: ${err?.message || 'Periksa konfigurasi SMTP'}` };
+      return { success: false, message: `Gagal mengirim email: ${err?.message || 'Periksa koneksi Gmail / SMTP'}` };
     }
   }
 
@@ -545,38 +643,38 @@ Laporan lengkap per sesi telah disertakan dalam versi HTML email ini.
 Email tujuan ini dikelola oleh Administrator Sekolah.
       `.trim();
 
-      // Dispatch or simulate
-      if (!this.transporter || !this.isSmtpConfigured) {
-        console.log(`[NotificationService] (Simulated Weekly Recap) To: ${email} | Subject: ${subject}`);
-        const log: NotificationLog = {
-          id: `notif_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-          timestamp: now.toISOString(),
-          student_id: cls.id,
-          student_name: `Kelas ${cls.name} (${cls.homeroom_teacher_name})`,
-          recipient_email: email,
-          trigger_type: 'rekap_mingguan',
-          status: 'sent',
-          error_message: undefined,
-          created_at: now.toISOString(),
+      const oauthToken = sheetsDb.getOAuthAccessToken();
+      const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
+
+      if (!oauthToken && (!this.transporter || !this.isSmtpConfigured)) {
+        return {
+          sent: false,
+          reason: 'Email pengirim (Gmail / SMTP) belum dihubungkan. Hubungkan Gmail di pengaturan notifikasi terlebih dahulu.',
         };
-        await sheetsDb.logNotification(log);
-        return { sent: true, recipient: email, studentCount: classStudents.length };
       }
 
-      // Real SMTP send
-      const fromName = process.env.MAIL_FROM_NAME || settings.school_name || 'DISIPLIN KITA BISA';
-      const replyToEmail =
-        process.env.SMTP_USER && process.env.SMTP_USER.includes('@')
-          ? process.env.SMTP_USER.trim()
-          : undefined;
-      await this.transporter.sendMail({
-        from: `"${fromName}" <${process.env.SMTP_USER}>`,
-        ...(replyToEmail ? { replyTo: replyToEmail } : {}),
-        to: email,
-        subject,
-        text: plainText,
-        html: htmlBody,
-      });
+      if (oauthToken) {
+        await this.sendViaGmailApi(oauthToken, {
+          to: email,
+          subject,
+          text: plainText,
+          html: htmlBody,
+          fromName,
+        });
+      } else {
+        const replyToEmail =
+          process.env.SMTP_USER && process.env.SMTP_USER.includes('@')
+            ? process.env.SMTP_USER.trim()
+            : undefined;
+        await this.transporter.sendMail({
+          from: `"${fromName}" <${process.env.SMTP_USER}>`,
+          ...(replyToEmail ? { replyTo: replyToEmail } : {}),
+          to: email,
+          subject,
+          text: plainText,
+          html: htmlBody,
+        });
+      }
 
       const log: NotificationLog = {
         id: `notif_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -592,6 +690,7 @@ Email tujuan ini dikelola oleh Administrator Sekolah.
 
       return { sent: true, recipient: email, studentCount: classStudents.length };
     } catch (err: any) {
+      if (err instanceof GoogleAuthExpiredError) throw err;
       console.error('[NotificationService] Failed to send weekly recap:', err);
       const now = new Date();
       const log: NotificationLog = {

@@ -337,11 +337,49 @@ export async function parseStudentExcel(file: File, fallbackClassId: string = '1
   return allRows;
 }
 
-export function downloadStudentTemplate() {
-  const link = document.createElement('a');
-  link.href = '/api/students?action=template';
-  link.setAttribute('download', 'template_siswa.xlsx');
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
+export async function downloadStudentTemplate(classList: { id: string }[] = []) {
+  const XLSX = await import('xlsx');
+  const firstClass = classList[0]?.id || '10-RPL-1';
+  const classNames = classList.length > 0 ? classList.map((c) => c.id).join(', ') : '10-RPL-1, 11-RPL-1';
+  const wb = XLSX.utils.book_new();
+  const sampleData = [
+    {
+      NIS: '20261011',
+      NISN: '0081234011',
+      Nama: 'Muhammad Faiz',
+      Kelas: firstClass,
+      Jenis_Kelamin: 'L',
+      UID_RFID: 'RFID-8821911',
+      Nama_Orang_Tua: 'Bambang Faiz',
+      Email_Orang_Tua: 'faiz.parent@example.com',
+    },
+    {
+      NIS: '20261012',
+      NISN: '0081234012',
+      Nama: 'Nadia Putri',
+      Kelas: firstClass,
+      Jenis_Kelamin: 'P',
+      UID_RFID: 'RFID-8821912',
+      Nama_Orang_Tua: 'Rudi Hermanto',
+      Email_Orang_Tua: 'nadia.parent@example.com',
+    },
+  ];
+
+  const wsData = XLSX.utils.json_to_sheet(sampleData);
+  XLSX.utils.book_append_sheet(wb, wsData, 'Data Siswa');
+
+  const instructions = [
+    { Kolom: 'NIS', Keterangan: 'Nomor Induk Siswa (Wajib, Unik, angka/teks)', Contoh: '20261011' },
+    { Kolom: 'NISN', Keterangan: 'Nomor Induk Siswa Nasional (Opsional)', Contoh: '0081234011' },
+    { Kolom: 'Nama', Keterangan: 'Nama Lengkap Siswa (Wajib)', Contoh: 'Muhammad Faiz' },
+    { Kolom: 'Kelas', Keterangan: `ID Kelas terdaftar (${classNames})`, Contoh: firstClass },
+    { Kolom: 'Jenis_Kelamin', Keterangan: 'L (Laki-laki) atau P (Perempuan)', Contoh: 'L' },
+    { Kolom: 'UID_RFID', Keterangan: 'Kode UID kartu RFID / Barcode (Wajib unik)', Contoh: 'RFID-8821911' },
+    { Kolom: 'Nama_Orang_Tua', Keterangan: 'Nama Orang Tua / Wali', Contoh: 'Bambang Faiz' },
+    { Kolom: 'Email_Orang_Tua', Keterangan: 'Alamat email aktif untuk notifikasi presensi & kedisiplinan', Contoh: 'faiz.parent@example.com' },
+  ];
+  const wsInstructions = XLSX.utils.json_to_sheet(instructions);
+  XLSX.utils.book_append_sheet(wb, wsInstructions, 'Petunjuk Format');
+
+  XLSX.writeFile(wb, 'template_siswa_disiplin_kita_bisa.xlsx');
 }

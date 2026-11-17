@@ -15,7 +15,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
 import { ActiveTab } from '../../types/index.js';
-import { resolvePhotoSrc } from '../../utils/photo.js';
+import { useResolvedPhotoSrc } from '../common/DriveImage.js';
 import { PWAInstallButton } from '../pwa/PWAInstallButton.js';
 
 interface SidebarProps {
@@ -35,7 +35,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
     settings,
   } = useApp();
 
-  const logoSrc = resolvePhotoSrc(settings.logo_url);
+  const logoSrc = useResolvedPhotoSrc(settings.logo_url);
 
   const handleMenuClick = (tab: ActiveTab) => {
     onClose();

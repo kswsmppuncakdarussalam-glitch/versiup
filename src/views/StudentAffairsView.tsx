@@ -20,7 +20,7 @@ import { useApp } from '../context/AppContext.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { exportToExcel, exportSessionRecapToExcel } from '../utils/excel.js';
 import { buildSessionRecapData } from '../utils/sessionHelper.js';
-import { resolvePhotoSrc } from '../utils/photo.js';
+import { DriveImage } from '../components/common/DriveImage.js';
 import { Student } from '../types/index.js';
 
 export const StudentAffairsView: React.FC = () => {
@@ -709,7 +709,7 @@ export const StudentAffairsView: React.FC = () => {
             {/* Kop */}
             <div className="flex items-center justify-center gap-3 border-b-2 border-slate-900 pb-3 mb-4 text-center">
               {settings.logo_url && (
-                <img src={resolvePhotoSrc(settings.logo_url)} alt="Logo Sekolah" className="w-12 h-12 object-contain shrink-0" />
+                <DriveImage srcValue={settings.logo_url} alt="Logo Sekolah" className="w-12 h-12 object-contain shrink-0" />
               )}
               <div>
                 <h2 className="text-base font-extrabold uppercase">{settings.school_name || 'SEKOLAH INDONESIA'}</h2>

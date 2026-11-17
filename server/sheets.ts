@@ -1,6 +1,7 @@
 import { google, sheets_v4, drive_v3 } from 'googleapis';
 import bcrypt from 'bcryptjs';
 import { Readable } from 'node:stream';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { buildSessionRecapData } from './sessionHelper.ts';
 import type {
   User,
@@ -22,6 +23,7 @@ import type {
 const SCOPES = [
   'https://www.googleapis.com/auth/spreadsheets',
   'https://www.googleapis.com/auth/drive.file',
+  'https://www.googleapis.com/auth/gmail.send',
 ];
 
 export const SHEET_TABS = {
@@ -257,6 +259,16 @@ export class SheetsConfigError extends Error {
     );
     this.name = 'SheetsConfigError';
     this.missingEnv = missingEnv;
+  }
+}
+
+export class GoogleAuthExpiredError extends Error {
+  public readonly statusCode = 401;
+  public readonly googleAuthExpired = true;
+
+  constructor(message = 'Sesi akses Google berakhir. Silakan masuk kembali dengan Google.') {
+    super(message);
+    this.name = 'GoogleAuthExpiredError';
   }
 }
 
@@ -576,12 +588,27 @@ export interface FullSheetDatabase {
 }
 
 export class SheetsDatabaseService {
+  private readonly oauthTokenStorage = new AsyncLocalStorage<string>();
+
+  public runWithOAuthToken<T>(token: string | undefined, fn: () => Promise<T>): Promise<T> {
+    const clean = (token || '').trim();
+    if (!clean) return fn();
+    return this.oauthTokenStorage.run(clean, fn);
+  }
+
+  public getOAuthAccessToken(): string | undefined {
+    const clean = (this.oauthTokenStorage.getStore() || '').trim();
+    return clean || undefined;
+  }
+
   private getCredentials(): {
     clientEmail: string;
     privateKey: string;
     spreadsheetId: string;
     driveFolderId: string;
+    oauthToken: string;
   } {
+    const oauthToken = (this.oauthTokenStorage.getStore() || '').trim();
     let clientEmail = (process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || '').trim();
     let rawKey = (process.env.GOOGLE_PRIVATE_KEY || '').trim();
 
@@ -618,24 +645,30 @@ export class SheetsDatabaseService {
     const sheetUrlMatch = spreadsheetId.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
     if (sheetUrlMatch?.[1]) {
       spreadsheetId = sheetUrlMatch[1];
+    } else {
+      spreadsheetId = spreadsheetId.split(/[?#/\s]/)[0].trim();
     }
 
     let driveFolderId = (process.env.DRIVE_FOLDER_ID || '').trim();
     const folderUrlMatch = driveFolderId.match(/\/folders\/([a-zA-Z0-9_-]+)/);
     if (folderUrlMatch?.[1]) {
       driveFolderId = folderUrlMatch[1];
+    } else {
+      driveFolderId = driveFolderId.split(/[?#/\s]/)[0].trim();
     }
 
-    return { clientEmail, privateKey, spreadsheetId, driveFolderId };
+    return { clientEmail, privateKey, spreadsheetId, driveFolderId, oauthToken };
   }
 
   public checkConfig(requireDrive = false): { configured: boolean; missingEnv: string[] } {
     const creds = this.getCredentials();
     const missingEnv: string[] = [];
-    if (!creds.clientEmail) missingEnv.push('GOOGLE_SERVICE_ACCOUNT_EMAIL');
-    if (!creds.privateKey) missingEnv.push('GOOGLE_PRIVATE_KEY');
+    if (!creds.oauthToken) {
+      if (!creds.clientEmail) missingEnv.push('GOOGLE_SERVICE_ACCOUNT_EMAIL');
+      if (!creds.privateKey) missingEnv.push('GOOGLE_PRIVATE_KEY');
+    }
     if (!creds.spreadsheetId) missingEnv.push('SPREADSHEET_ID');
-    if (requireDrive && !creds.driveFolderId) missingEnv.push('DRIVE_FOLDER_ID');
+    if (requireDrive && !creds.driveFolderId && !creds.oauthToken) missingEnv.push('DRIVE_FOLDER_ID');
     return {
       configured: missingEnv.length === 0,
       missingEnv,
@@ -649,22 +682,42 @@ export class SheetsDatabaseService {
     missingEnv: string[];
     spreadsheetConfigured: boolean;
     driveFolderConfigured: boolean;
+    hasServiceAccount: boolean;
+    authMode: 'google_oauth' | 'service_account' | 'unconfigured';
+    requiresGoogleSignIn: boolean;
   } {
     const creds = this.getCredentials();
+    const hasServiceAccount = Boolean(creds.clientEmail && creds.privateKey);
+    const hasGoogleOAuth = Boolean(creds.oauthToken);
+    const authMode: 'google_oauth' | 'service_account' | 'unconfigured' = hasGoogleOAuth
+      ? 'google_oauth'
+      : hasServiceAccount
+      ? 'service_account'
+      : 'unconfigured';
+
     const missingSheets: string[] = [];
-    if (!creds.clientEmail) missingSheets.push('GOOGLE_SERVICE_ACCOUNT_EMAIL');
-    if (!creds.privateKey) missingSheets.push('GOOGLE_PRIVATE_KEY');
+    if (!hasGoogleOAuth) {
+      if (!creds.clientEmail) missingSheets.push('GOOGLE_SERVICE_ACCOUNT_EMAIL');
+      if (!creds.privateKey) missingSheets.push('GOOGLE_PRIVATE_KEY');
+    }
     if (!creds.spreadsheetId) missingSheets.push('SPREADSHEET_ID');
+
     const missingAll = [...missingSheets];
-    if (!creds.driveFolderId) missingAll.push('DRIVE_FOLDER_ID');
+    if (!creds.driveFolderId && !hasGoogleOAuth) missingAll.push('DRIVE_FOLDER_ID');
+
+    const sheetsConfigured = missingSheets.length === 0;
+    const driveConfigured = sheetsConfigured && (Boolean(creds.driveFolderId) || hasGoogleOAuth);
 
     return {
       configured: missingAll.length === 0,
-      sheetsConfigured: missingSheets.length === 0,
-      driveConfigured: missingSheets.length === 0 && Boolean(creds.driveFolderId),
+      sheetsConfigured,
+      driveConfigured,
       missingEnv: missingAll,
       spreadsheetConfigured: Boolean(creds.spreadsheetId),
-      driveFolderConfigured: Boolean(creds.driveFolderId),
+      driveFolderConfigured: Boolean(creds.driveFolderId) || hasGoogleOAuth,
+      hasServiceAccount,
+      authMode,
+      requiresGoogleSignIn: !hasServiceAccount && !hasGoogleOAuth,
     };
   }
 
@@ -673,12 +726,25 @@ export class SheetsDatabaseService {
     drive: drive_v3.Drive;
     spreadsheetId: string;
     driveFolderId: string;
+    isOAuthMode: boolean;
   } {
     const check = this.checkConfig(requireDrive);
     if (!check.configured) {
       throw new SheetsConfigError(check.missingEnv);
     }
     const creds = this.getCredentials();
+    if (creds.oauthToken) {
+      const oauth2Client = new google.auth.OAuth2();
+      oauth2Client.setCredentials({ access_token: creds.oauthToken });
+      return {
+        sheets: google.sheets({ version: 'v4', auth: oauth2Client }),
+        drive: google.drive({ version: 'v3', auth: oauth2Client }),
+        spreadsheetId: creds.spreadsheetId,
+        driveFolderId: creds.driveFolderId,
+        isOAuthMode: true,
+      };
+    }
+
     const auth = new google.auth.JWT({
       email: creds.clientEmail,
       key: creds.privateKey,
@@ -689,12 +755,14 @@ export class SheetsDatabaseService {
       drive: google.drive({ version: 'v3', auth }),
       spreadsheetId: creds.spreadsheetId,
       driveFolderId: creds.driveFolderId,
+      isOAuthMode: false,
     };
   }
 
   private async withRetry429<T>(fn: () => Promise<T>): Promise<T> {
     const delays = [1000, 2500, 5000];
     let lastErr: any;
+    const inOAuthMode = Boolean(this.oauthTokenStorage.getStore());
     for (let attempt = 0; attempt <= delays.length; attempt++) {
       try {
         return await fn();
@@ -702,6 +770,17 @@ export class SheetsDatabaseService {
         lastErr = err;
         const status = err?.code || err?.status || err?.response?.status;
         const msg = String(err?.message || '').toLowerCase();
+
+        if (
+          inOAuthMode &&
+          (status === 401 ||
+            msg.includes('invalid credentials') ||
+            msg.includes('invalid authentication credentials') ||
+            msg.includes('request had invalid authentication'))
+        ) {
+          throw new GoogleAuthExpiredError();
+        }
+
         const is429 =
           status === 429 ||
           msg.includes('quota') ||
@@ -956,7 +1035,7 @@ export class SheetsDatabaseService {
     }
 
     const nowIso = new Date().toISOString();
-    const targetRow = {
+    const targetRow: Record<string, any> = {
       ...existing,
       ...newRowObj,
       id,
@@ -1119,8 +1198,35 @@ export class SheetsDatabaseService {
 
   // ==================== PHOTO STORAGE VIA PRIVATE GOOGLE DRIVE v3 ====================
 
+  private async ensureAppDriveFolder(drive: drive_v3.Drive): Promise<string> {
+    const folderName = 'DISIPLIN KITA BISA - Foto';
+    const existing = await this.withRetry429(() =>
+      drive.files.list({
+        q: `name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+        fields: 'files(id,name)',
+        pageSize: 1,
+      })
+    );
+    const foundId = existing.data.files?.[0]?.id;
+    if (foundId) return foundId;
+
+    const created = await this.withRetry429(() =>
+      drive.files.create({
+        requestBody: {
+          name: folderName,
+          mimeType: 'application/vnd.google-apps.folder',
+        },
+        fields: 'id',
+      })
+    );
+    if (!created.data.id) {
+      throw new Error('Gagal membuat folder foto di Google Drive.');
+    }
+    return created.data.id;
+  }
+
   public async uploadPhotoToDrive(base64Input: string, fileName: string): Promise<string> {
-    const { drive, driveFolderId } = this.createClients(true);
+    const { drive, driveFolderId, isOAuthMode } = this.createClients(true);
     let cleanBase64 = (base64Input || '').trim();
     let mimeType = 'image/jpeg';
 
@@ -1135,20 +1241,42 @@ export class SheetsDatabaseService {
       throw new Error('Data foto kosong atau tidak valid.');
     }
 
-    const res = await this.withRetry429(() =>
-      drive.files.create({
-        requestBody: {
-          name: fileName || `foto_${Date.now()}.jpg`,
-          parents: [driveFolderId],
-        },
-        media: {
-          mimeType,
-          body: Readable.from(buffer),
-        },
-        fields: 'id',
-        supportsAllDrives: true,
-      })
-    );
+    const createInFolder = async (folderId?: string) => {
+      return await this.withRetry429(() =>
+        drive.files.create({
+          requestBody: {
+            name: fileName || `foto_${Date.now()}.jpg`,
+            ...(folderId ? { parents: [folderId] } : {}),
+          },
+          media: {
+            mimeType,
+            body: Readable.from(buffer),
+          },
+          fields: 'id',
+          supportsAllDrives: true,
+        })
+      );
+    };
+
+    let res;
+    try {
+      if (driveFolderId) {
+        res = await createInFolder(driveFolderId);
+      } else {
+        const appFolderId = await this.ensureAppDriveFolder(drive);
+        res = await createInFolder(appFolderId);
+      }
+    } catch (err: any) {
+      const status = err?.code || err?.status || err?.response?.status;
+      if (isOAuthMode && (status === 403 || status === 404)) {
+        // Under drive.file scope, pre-existing folders created outside this app cannot be targeted directly;
+        // automatically fall back to an app-owned Drive folder.
+        const appFolderId = await this.ensureAppDriveFolder(drive);
+        res = await createInFolder(appFolderId);
+      } else {
+        throw err;
+      }
+    }
 
     const fileId = res.data.id;
     if (!fileId) {

@@ -4,7 +4,8 @@ import { Sidebar } from './components/layout/Sidebar.js';
 import { Header } from './components/layout/Header.js';
 import { OfflineIndicatorBanner } from './components/pwa/OfflineIndicatorBanner.js';
 import { DutyLoginScreen } from './components/modals/AuthLoginModal.js';
-import { CheckCircle2, AlertCircle, Info, X, Lock, AlertTriangle, RefreshCw } from 'lucide-react';
+import { GoogleSignInButton } from './components/auth/GoogleSignInButton.js';
+import { CheckCircle2, AlertCircle, Info, X, Lock, AlertTriangle, RefreshCw, Trash2 } from 'lucide-react';
 
 const DashboardView = React.lazy(() => import('./views/DashboardView.js').then((m) => ({ default: m.DashboardView })));
 const AttendanceView = React.lazy(() => import('./views/AttendanceView.js').then((m) => ({ default: m.AttendanceView })));
@@ -74,7 +75,10 @@ const MainAppContent: React.FC = () => {
     toasts,
     dismissToast,
     configError,
-    missingEnv,
+    needsGoogleAuth,
+    isGoogleSigningIn,
+    connectGoogleAccount,
+    confirmDialog,
     saveStatus,
     conflictPrompt,
   } = useApp();
@@ -83,12 +87,11 @@ const MainAppContent: React.FC = () => {
   if (!session) {
     return (
       <>
-        {configError && (
+        {configError && !needsGoogleAuth && (
           <div className="bg-rose-600 text-white px-4 py-2.5 text-xs flex items-center justify-center gap-2 text-center">
             <AlertTriangle className="w-4 h-4 shrink-0" />
             <span>
-              <strong>Konfigurasi Server Belum Lengkap:</strong> {configError}
-              {missingEnv.length > 0 && ` (Variable: ${missingEnv.join(', ')})`}
+              <strong>Konfigurasi Server Belum Lengkap:</strong> {configError}. Atur pada Environment Variables server (Vercel / .env).
             </span>
           </div>
         )}
@@ -106,14 +109,28 @@ const MainAppContent: React.FC = () => {
       <div className="flex-1 flex flex-col min-w-0 lg:pl-64">
         <Header onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)} />
 
-        {configError && (
+        {needsGoogleAuth && (
+          <div className="bg-sky-50 dark:bg-sky-950/40 border-b border-sky-200 dark:border-sky-800 px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="text-xs text-sky-900 dark:text-sky-100">
+              <strong className="block font-semibold">Hubungkan Akun Google untuk Menyinkronkan Google Sheets &amp; Drive</strong>
+              <span className="text-sky-700 dark:text-sky-300">
+                Masuk dengan akun Google Anda agar aplikasi otomatis membaca dan menyimpan data langsung ke Spreadsheet.
+              </span>
+            </div>
+            <div className="shrink-0">
+              <GoogleSignInButton
+                onClick={connectGoogleAccount}
+                loading={isGoogleSigningIn}
+              />
+            </div>
+          </div>
+        )}
+
+        {configError && !needsGoogleAuth && (
           <div className="bg-rose-600 text-white px-4 py-2.5 text-xs flex items-center gap-2.5 border-b border-rose-700">
             <AlertTriangle className="w-4 h-4 shrink-0" />
             <span>
-              <strong>Google Sheets / Drive Server Belum Terkonfigurasi:</strong> {configError}{' '}
-              {missingEnv.length > 0 && (
-                <span className="font-mono underline ml-1">[{missingEnv.join(', ')}]</span>
-              )}
+              <strong>Google Sheets / Drive Server Belum Terkonfigurasi:</strong> {configError}. Atur pada Environment Variables server (Vercel / .env).
             </span>
           </div>
         )}
@@ -198,6 +215,52 @@ const MainAppContent: React.FC = () => {
                 className="px-3.5 py-2 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white shadow-xs"
               >
                 Timpa Dengan Data Saya
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Global Confirmation Dialog (Destructive/Mutating Actions) */}
+      {confirmDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 shadow-2xl space-y-4">
+            <div className="flex items-start gap-3">
+              <div
+                className={`p-2 rounded-full shrink-0 ${
+                  confirmDialog.variant === 'warning'
+                    ? 'bg-amber-100 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300'
+                    : 'bg-rose-100 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300'
+                }`}
+              >
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-sm font-bold text-slate-900 dark:text-white">{confirmDialog.title}</h3>
+                <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                  {confirmDialog.message}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={confirmDialog.onCancel}
+                className="px-3.5 py-2 rounded-lg text-xs font-semibold border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+              >
+                {confirmDialog.cancelLabel || 'Batal'}
+              </button>
+              <button
+                type="button"
+                onClick={confirmDialog.onConfirm}
+                className={`px-3.5 py-2 rounded-lg text-xs font-semibold text-white shadow-xs ${
+                  confirmDialog.variant === 'warning'
+                    ? 'bg-amber-600 hover:bg-amber-700'
+                    : 'bg-rose-600 hover:bg-rose-700'
+                }`}
+              >
+                {confirmDialog.confirmLabel || 'Ya, Lanjutkan'}
               </button>
             </div>
           </div>

@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { X, Calendar, AlertTriangle, DoorOpen, Award, Mail, User, ShieldCheck } from 'lucide-react';
 import { Student } from '../../types/index.js';
 import { useApp } from '../../context/AppContext.js';
-import { resolvePhotoSrc } from '../../utils/photo.js';
+import { DriveImage } from '../common/DriveImage.js';
 
 interface StudentProfileModalProps {
   student: Student | null;
@@ -12,6 +12,7 @@ interface StudentProfileModalProps {
 export const StudentProfileModal: React.FC<StudentProfileModalProps> = ({ student, onClose }) => {
   const { attendance, outOfClass, violations, settings } = useApp();
   const [activeTab, setActiveTab] = useState<'overview' | 'attendance' | 'out_of_class' | 'violations'>('overview');
+  const [previewEvidencePhoto, setPreviewEvidencePhoto] = useState<string | null>(null);
 
   if (!student) return null;
 
@@ -67,7 +68,7 @@ export const StudentProfileModal: React.FC<StudentProfileModalProps> = ({ studen
           <div className="flex items-center gap-3">
             <div className="w-12 h-12 rounded-full border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-800 dark:text-slate-200 font-bold overflow-hidden">
               {student.photo_url ? (
-                <img src={resolvePhotoSrc(student.photo_url)} alt={student.name} className="w-full h-full object-cover" />
+                <DriveImage srcValue={student.photo_url} alt={student.name} className="w-full h-full object-cover" />
               ) : (
                 student.name.slice(0, 2).toUpperCase()
               )}
@@ -307,14 +308,13 @@ export const StudentProfileModal: React.FC<StudentProfileModalProps> = ({ studen
                         {v.category === 'prestasi' ? `+${v.points}` : `-${v.points}`} Poin
                       </span>
                       {v.evidence_photo_url && (
-                        <a
-                          href={resolvePhotoSrc(v.evidence_photo_url)}
-                          target="_blank"
-                          rel="noreferrer"
+                        <button
+                          type="button"
+                          onClick={() => setPreviewEvidencePhoto(v.evidence_photo_url || null)}
                           className="text-[11px] text-blue-600 hover:underline"
                         >
                           Lihat Bukti Foto
-                        </a>
+                        </button>
                       )}
                     </div>
                   </div>
@@ -324,6 +324,36 @@ export const StudentProfileModal: React.FC<StudentProfileModalProps> = ({ studen
           )}
         </div>
       </div>
+
+      {previewEvidencePhoto && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-4"
+          onClick={() => setPreviewEvidencePhoto(null)}
+        >
+          <div
+            className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg max-w-lg w-full p-3 space-y-2 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-2">
+              <span className="text-xs font-bold text-slate-900 dark:text-white">Bukti Foto Pelanggaran</span>
+              <button
+                type="button"
+                onClick={() => setPreviewEvidencePhoto(null)}
+                className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="max-h-[70vh] overflow-hidden rounded bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
+              <DriveImage
+                srcValue={previewEvidencePhoto}
+                alt="Bukti Pelanggaran"
+                className="max-h-[70vh] w-auto object-contain"
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

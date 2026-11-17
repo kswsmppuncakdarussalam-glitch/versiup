@@ -51,7 +51,12 @@ import {
   exportToExcel,
   StudentImportRow,
 } from '../utils/excel.js';
-import { uploadPhotoToBackend, resolvePhotoSrc } from '../utils/photo.js';
+import { uploadPhotoToBackend } from '../utils/photo.js';
+import { DriveImage } from '../components/common/DriveImage.js';
+import { getGoogleAccessToken } from '../utils/googleAuth.js';
+import { apiFetch } from '../utils/apiClient.js';
+import { GoogleSignInButton } from '../components/auth/GoogleSignInButton.js';
+import { AppsScriptPanel } from '../components/auth/AppsScriptPanel.js';
 import {
   SCHOOL_NAME_PRESETS,
   SCHOOL_LOGO_PRESETS,
@@ -99,6 +104,14 @@ export const AdminView: React.FC = () => {
     envStatus,
     configError,
     missingEnv,
+    needsGoogleAuth,
+    isGoogleSigningIn,
+    googleAccessToken,
+    googleUser,
+    connectGoogleAccount,
+    disconnectGoogleAccount,
+    appsScriptUrl,
+    requestConfirm,
     saveStatus,
     syncStatus,
     lastSyncTime,
@@ -108,6 +121,7 @@ export const AdminView: React.FC = () => {
     speak,
     showToast,
     updateSessionToken,
+    refreshFromSheets,
   } = useApp();
 
   const [activeSection, setActiveSection] = useState<
@@ -254,15 +268,22 @@ export const AdminView: React.FC = () => {
     }
   };
 
+  const getAdminHeaders = (extra?: Record<string, string>): Record<string, string> => {
+    const gToken = googleAccessToken || getGoogleAccessToken();
+    return {
+      ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+      ...(gToken ? { 'X-Google-Access-Token': gToken } : {}),
+      ...(extra || {}),
+    };
+  };
+
   // Fetch all user accounts from server
   const fetchUsers = async () => {
-    if (!session?.token || configError) return;
+    if (!session?.token || configError || (needsGoogleAuth && !appsScriptUrl)) return;
     setLoadingUsers(true);
     try {
-      const res = await fetch('/api/auth?action=manage_accounts', {
-        headers: {
-          Authorization: `Bearer ${session.token}`,
-        },
+      const res = await apiFetch('/api/auth?action=manage_accounts', {
+        headers: getAdminHeaders(),
       });
       const data = await safeReadJson(res);
       if (res.ok && Array.isArray(data.users)) {
@@ -276,10 +297,10 @@ export const AdminView: React.FC = () => {
   };
 
   useEffect(() => {
-    if ((activeSection === 'accounts' || !usersList.length) && !configError) {
+    if ((activeSection === 'accounts' || !usersList.length) && !configError && (!needsGoogleAuth || Boolean(appsScriptUrl))) {
       fetchUsers();
     }
-  }, [activeSection, session?.token, configError]);
+  }, [activeSection, session?.token, configError, needsGoogleAuth, appsScriptUrl, googleAccessToken]);
 
   const handleSaveTargetPassword = async (targetUser: User, newPass: string, confirmPass?: string) => {
     if (!newPass || newPass.trim().length < 4) {
@@ -293,12 +314,9 @@ export const AdminView: React.FC = () => {
 
     setUpdatingPassword(true);
     try {
-      const res = await fetch('/api/auth?action=manage_accounts', {
+      const res = await apiFetch('/api/auth?action=manage_accounts', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
-        },
+        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           targetUserId: targetUser.id,
           newPassword: newPass.trim(),
@@ -321,6 +339,7 @@ export const AdminView: React.FC = () => {
       setTargetConfirmPassword('');
       setSelectedUserForPassword(null);
       await fetchUsers();
+      void refreshFromSheets(true, undefined, { afterWrite: true });
     } catch (err: any) {
       showToast(`Terjadi kesalahan: ${err.message}`, 'error');
     } finally {
@@ -340,12 +359,9 @@ export const AdminView: React.FC = () => {
 
     setUpdatingPassword(true);
     try {
-      const res = await fetch('/api/auth?action=manage_accounts', {
+      const res = await apiFetch('/api/auth?action=manage_accounts', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
-        },
+        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           targetRole,
           newPassword: newPass.trim(),
@@ -377,6 +393,7 @@ export const AdminView: React.FC = () => {
       }
 
       await fetchUsers();
+      void refreshFromSheets(true, undefined, { afterWrite: true });
       return true;
     } catch (err: any) {
       showToast(`Terjadi kesalahan: ${err.message}`, 'error');
@@ -406,12 +423,9 @@ export const AdminView: React.FC = () => {
     };
 
     try {
-      const res = await fetch('/api/auth?action=manage_accounts', {
+      const res = await apiFetch('/api/auth?action=manage_accounts', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
-        },
+        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           user: payload,
           newPassword: newAccountPassword.trim(),
@@ -429,6 +443,7 @@ export const AdminView: React.FC = () => {
       setNewAccountLabel('');
       setNewAccountPassword('');
       await fetchUsers();
+      void refreshFromSheets(true, undefined, { afterWrite: true });
     } catch (err: any) {
       showToast(`Terjadi kesalahan: ${err.message}`, 'error');
     }
@@ -439,15 +454,17 @@ export const AdminView: React.FC = () => {
       showToast('Akun administrator utama tidak dapat dihapus.', 'error');
       return;
     }
-    if (!confirm(`Hapus akun "${name}"? Tindakan ini tidak dapat dibatalkan.`)) return;
+    const confirmed = await requestConfirm({
+      title: 'Hapus Akun Petugas?',
+      message: `Hapus akun "${name}" dari Google Sheets? Tindakan ini tidak dapat dibatalkan.`,
+      confirmLabel: 'Ya, Hapus Akun',
+    });
+    if (!confirmed) return;
 
     try {
-      const res = await fetch('/api/auth?action=manage_accounts', {
+      const res = await apiFetch('/api/auth?action=manage_accounts', {
         method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${session?.token}`,
-        },
+        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ id }),
       });
       const data = await safeReadJson(res);
@@ -457,6 +474,7 @@ export const AdminView: React.FC = () => {
       }
       showToast(`Akun "${name}" telah dihapus.`, 'success');
       await fetchUsers();
+      void refreshFromSheets(true, undefined, { afterWrite: true });
     } catch (err: any) {
       showToast(`Gagal menghapus akun: ${err.message}`, 'error');
     }
@@ -620,9 +638,6 @@ export const AdminView: React.FC = () => {
 
   const handleDeleteSelectedStudents = async () => {
     if (selectedStudentNis.size === 0) return;
-    if (!window.confirm(`Yakin ingin menghapus ${selectedStudentNis.size} data siswa terpilih? Tindakan ini tidak dapat dibatalkan.`)) {
-      return;
-    }
     setIsDeletingBulk(true);
     try {
       const ok = await deleteStudents(Array.from(selectedStudentNis));
@@ -653,9 +668,9 @@ export const AdminView: React.FC = () => {
     setSimulationResult(null);
 
     try {
-      const res = await fetch('/api/simulate', {
+      const res = await apiFetch('/api/simulate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ testType }),
       });
       const data = await safeReadJson(res);
@@ -788,7 +803,7 @@ export const AdminView: React.FC = () => {
               {/* Unduh Template Otomatis */}
               <button
                 type="button"
-                onClick={downloadStudentTemplate}
+                onClick={() => downloadStudentTemplate(classes)}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300"
               >
                 <Download className="w-3.5 h-3.5 text-blue-600" />
@@ -986,11 +1001,7 @@ export const AdminView: React.FC = () => {
                             </button>
                             <button
                               type="button"
-                              onClick={async () => {
-                                if (window.confirm(`Yakin ingin menghapus nama dan data siswa "${s.name}" (NIS: ${s.nis})?`)) {
-                                  await deleteStudent(s.nis);
-                                }
-                              }}
+                              onClick={() => deleteStudent(s.nis)}
                               className="p-1 text-slate-400 hover:text-rose-600"
                               title="Hapus Siswa Ini"
                             >
@@ -1374,11 +1385,7 @@ export const AdminView: React.FC = () => {
                   </button>
                   <button
                     type="button"
-                    onClick={() => {
-                      if (confirm(`Hapus jenis pelanggaran ${vt.name}?`)) {
-                        deleteViolationType(vt.id);
-                      }
-                    }}
+                    onClick={() => deleteViolationType(vt.id)}
                     className="p-1 text-slate-400 hover:text-rose-600"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
@@ -2279,8 +2286,8 @@ export const AdminView: React.FC = () => {
                 <div className="relative group">
                   {settings.logo_url ? (
                     <div className="w-24 h-24 rounded-lg border-2 border-slate-200 dark:border-slate-600 bg-white dark:bg-slate-900 p-1 flex items-center justify-center overflow-hidden shadow-xs">
-                      <img
-                        src={resolvePhotoSrc(settings.logo_url)}
+                      <DriveImage
+                        srcValue={settings.logo_url}
                         alt="Logo Sekolah"
                         className="w-full h-full object-contain"
                       />
@@ -2582,8 +2589,8 @@ export const AdminView: React.FC = () => {
                 </div>
                 <div className="p-3 rounded-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center gap-2.5 shadow-xs">
                   {settings.logo_url ? (
-                    <img
-                      src={resolvePhotoSrc(settings.logo_url)}
+                    <DriveImage
+                      srcValue={settings.logo_url}
                       alt="Logo"
                       className="w-9 h-9 rounded object-contain bg-white dark:bg-slate-800 p-0.5 border border-slate-200 dark:border-slate-700 shadow-xs shrink-0"
                     />
@@ -2615,8 +2622,8 @@ export const AdminView: React.FC = () => {
                 </div>
                 <div className="p-3 rounded-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center gap-3 shadow-xs">
                   {settings.logo_url ? (
-                    <img
-                      src={resolvePhotoSrc(settings.logo_url)}
+                    <DriveImage
+                      srcValue={settings.logo_url}
                       alt="Logo"
                       className="w-10 h-10 rounded object-contain bg-white dark:bg-slate-800 p-0.5 border border-slate-200 dark:border-slate-700 shadow-xs shrink-0"
                     />
@@ -2654,8 +2661,8 @@ export const AdminView: React.FC = () => {
                 <div className="p-3 rounded-md bg-white text-slate-900 border border-slate-200 shadow-xs text-center space-y-1">
                   <div className="flex items-center justify-center gap-1.5">
                     {settings.logo_url && (
-                      <img
-                        src={resolvePhotoSrc(settings.logo_url)}
+                      <DriveImage
+                        srcValue={settings.logo_url}
                         alt="Logo"
                         className="w-5 h-5 object-contain shrink-0"
                       />
@@ -2793,8 +2800,8 @@ export const AdminView: React.FC = () => {
                 </div>
 
                 <div className="w-64 h-64 mx-auto rounded-lg bg-white dark:bg-slate-800 border-2 border-slate-200 dark:border-slate-700 p-3 flex items-center justify-center shadow-inner">
-                  <img
-                    src={resolvePhotoSrc(settings.logo_url)}
+                  <DriveImage
+                    srcValue={settings.logo_url}
                     alt="Logo Sekolah Besar"
                     className="max-w-full max-h-full object-contain"
                   />
@@ -2962,6 +2969,76 @@ export const AdminView: React.FC = () => {
               <label htmlFor="email-toggle" className="font-semibold text-slate-800 dark:text-slate-200 cursor-pointer">
                 Aktifkan Notifikasi Email
               </label>
+            </div>
+          </div>
+
+          {/* Hubungkan Email Pengirim (Gmail / Apps Script GmailApp) */}
+          <div
+            className={`p-4 rounded-xl border space-y-2.5 ${
+              envStatus.emailConnected
+                ? 'border-emerald-200 dark:border-emerald-800 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-900 dark:text-emerald-100'
+                : 'border-amber-200 dark:border-amber-800 bg-amber-50/70 dark:bg-amber-950/30 text-amber-900 dark:text-amber-100'
+            }`}
+          >
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Mail className="w-4 h-4 shrink-0" />
+                  <span className="font-bold">Hubungkan Email Pengirim (Gmail)</span>
+                  <span
+                    className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                      envStatus.emailConnected
+                        ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-200'
+                        : 'bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200'
+                    }`}
+                  >
+                    {envStatus.emailTransport === 'apps_script_gmail'
+                      ? `Aktif via Apps Script (${envStatus.senderEmail || 'GmailApp'})`
+                      : envStatus.emailTransport === 'gmail_oauth'
+                      ? `Terhubung via Gmail (${googleUser?.email || 'Aktif'})`
+                      : envStatus.emailTransport === 'smtp'
+                      ? 'Terhubung via SMTP Server'
+                      : 'Email Pengirim Belum Terhubung'}
+                  </span>
+                </div>
+                <p className="text-[11px] opacity-85 leading-relaxed">
+                  {envStatus.emailTransport === 'apps_script_gmail'
+                    ? `Email notifikasi orang tua & rekap mingguan wali kelas dikirim langsung melalui layanan GmailApp dari akun pemilik Google Apps Script${envStatus.senderEmail ? ` (${envStatus.senderEmail})` : ''}.`
+                    : envStatus.emailTransport === 'gmail_oauth'
+                    ? `Email dikirim langsung menggunakan Gmail API dari akun Google ${googleUser?.email || ''}. Anda dapat mengganti atau menghubungkan ulang akun pengirim kapan saja.`
+                    : envStatus.emailTransport === 'smtp'
+                    ? 'Email dikirim menggunakan konfigurasi SMTP server. Anda juga dapat menghubungkan akun Gmail secara langsung via tombol di sebelah kanan.'
+                    : 'Hubungkan akun Google Anda (beri izin Gmail Send) agar sistem dapat mengirim email notifikasi orang tua dan rekap mingguan ke wali kelas secara nyata.'}
+                </p>
+              </div>
+
+              {!appsScriptUrl && envStatus.authMode !== 'apps_script' && (
+                <div className="shrink-0 flex flex-wrap items-center gap-2">
+                  {googleAccessToken ? (
+                    <>
+                      <GoogleSignInButton
+                        onClick={connectGoogleAccount}
+                        loading={isGoogleSigningIn}
+                        label="Ganti / Izinkan Ulang Gmail"
+                      />
+                      <button
+                        type="button"
+                        onClick={disconnectGoogleAccount}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-900 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-100 transition-colors"
+                      >
+                        <LogOut className="w-3.5 h-3.5" />
+                        <span>Putuskan</span>
+                      </button>
+                    </>
+                  ) : (
+                    <GoogleSignInButton
+                      onClick={connectGoogleAccount}
+                      loading={isGoogleSigningIn}
+                      label="Hubungkan Email Gmail"
+                    />
+                  )}
+                </div>
+              )}
             </div>
           </div>
 
@@ -3166,7 +3243,9 @@ export const AdminView: React.FC = () => {
                 setTestEmailSending(true);
                 const res = await sendTestEmail(testEmailAddress);
                 setTestEmailSending(false);
-                showToast(res.message, res.success ? 'success' : 'error');
+                if (!res.cancelled) {
+                  showToast(res.message, res.success ? 'success' : 'error');
+                }
               }}
               className="px-3 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold disabled:opacity-50"
             >
@@ -3201,9 +3280,12 @@ export const AdminView: React.FC = () => {
         </div>
       )}
 
-      {/* SECTION 10: KONEKSI LANGSUNG GOOGLE SHEETS API v4 & DRIVE API v3 (SERVICE ACCOUNT) */}
+      {/* SECTION 10: KONEKSI LANGSUNG GOOGLE APPS SCRIPT / SHEETS API v4 & DRIVE API v3 */}
       {activeSection === 'sync_status' && (
         <div className="space-y-5 text-xs">
+          {/* Backend Google Apps Script (.gs) Panel */}
+          <AppsScriptPanel />
+
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-5">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-4">
               <div className="flex items-center gap-3">
@@ -3214,30 +3296,75 @@ export const AdminView: React.FC = () => {
                 </div>
                 <div>
                   <h2 className="text-sm font-bold text-slate-900 dark:text-white flex flex-wrap items-center gap-2">
-                    Integrasi Langsung Google Sheets API v4 &amp; Drive API v3
+                    Integrasi Langsung Google Sheets, Drive &amp; Apps Script
                     <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
                       envStatus.configured
                         ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
                         : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
                     }`}>
-                      {envStatus.configured ? 'Terhubung via Service Account Server' : 'Menunggu Environment Variable'}
+                      {envStatus.authMode === 'apps_script' || Boolean(appsScriptUrl)
+                        ? `Terhubung via Google Apps Script${envStatus.senderEmail ? ` (${envStatus.senderEmail})` : ''}`
+                        : envStatus.authMode === 'google_oauth'
+                        ? `Terhubung via Akun Google (${googleUser?.email || 'Aktif'})`
+                        : envStatus.configured
+                        ? 'Terhubung via Service Account Server'
+                        : 'Menunggu Koneksi Google'}
                     </span>
                   </h2>
                   <p className="text-slate-500">
-                    Seluruh data dibaca dan ditulis langsung ke Google Spreadsheet menggunakan Service Account di backend serverless Vercel. Tidak ada penyimpanan draf lokal atau kunci di browser.
+                    Seluruh data dibaca dan ditulis langsung ke Google Spreadsheet menggunakan Google Apps Script Web App atau akun Google Anda tanpa penyimpanan draf lokal.
                   </p>
                 </div>
               </div>
             </div>
 
-            {missingEnv.length > 0 && (
+            {(needsGoogleAuth || envStatus.authMode === 'google_oauth') && (
+              <div className={`p-4 rounded-xl border space-y-2.5 ${
+                googleAccessToken
+                  ? 'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/30 text-emerald-900 dark:text-emerald-100'
+                  : 'border-sky-200 dark:border-sky-800 bg-sky-50 dark:bg-sky-950/30 text-sky-900 dark:text-sky-100'
+              }`}>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <div className="font-bold">
+                      {googleAccessToken && googleUser
+                        ? `Akun Google Terhubung: ${googleUser.email || googleUser.displayName}`
+                        : 'Hubungkan Akun Google Anda'}
+                    </div>
+                    <p className="text-[11px] opacity-85 mt-0.5">
+                      {googleAccessToken
+                        ? 'Aplikasi membaca & menulis Google Sheets dan Google Drive langsung melalui akun Google ini.'
+                        : 'Masuk dengan akun Google Anda agar sinkronisasi berjalan otomatis tanpa file JSON Service Account.'}
+                    </p>
+                  </div>
+                  <div className="shrink-0 flex items-center gap-2">
+                    {googleAccessToken ? (
+                      <button
+                        type="button"
+                        onClick={disconnectGoogleAccount}
+                        className="px-3 py-1.5 rounded-lg text-xs font-semibold border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-900 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-100 transition-colors"
+                      >
+                        Ganti / Putuskan Akun
+                      </button>
+                    ) : (
+                      <GoogleSignInButton
+                        onClick={connectGoogleAccount}
+                        loading={isGoogleSigningIn}
+                      />
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {!needsGoogleAuth && envStatus.authMode !== 'google_oauth' && missingEnv.length > 0 && (
               <div className="p-4 rounded-xl border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-100 space-y-2">
                 <div className="flex items-center gap-2 font-bold">
                   <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
                   <span>Environment Variable Server Belum Lengkap</span>
                 </div>
                 <p className="text-[11px] leading-relaxed">
-                  Untuk alasan keamanan, kredensial Service Account, ID Spreadsheet, dan ID Folder Drive hanya dibaca dari environment variable server (Vercel Project Settings &rarr; Environment Variables). Variabel yang belum terdeteksi:
+                  Variabel server yang belum terdeteksi:
                 </p>
                 <div className="flex flex-wrap gap-1.5 font-mono text-[11px]">
                   {missingEnv.map((envName) => (
@@ -3564,7 +3691,7 @@ export const AdminView: React.FC = () => {
             <div className="text-center border-b border-slate-200 pb-3 mb-3">
               <div className="flex items-center justify-center gap-2 mb-1">
                 {settings.logo_url && (
-                  <img src={resolvePhotoSrc(settings.logo_url)} alt="Logo" className="w-7 h-7 object-contain shrink-0" />
+                  <DriveImage srcValue={settings.logo_url} alt="Logo" className="w-7 h-7 object-contain shrink-0" />
                 )}
                 <h3 className="font-extrabold text-sm uppercase">{settings.school_name || 'SEKOLAH INDONESIA'}</h3>
               </div>
@@ -3574,7 +3701,7 @@ export const AdminView: React.FC = () => {
             <div className="flex gap-3 items-center mb-4">
               <div className="w-16 h-16 rounded border border-slate-200 bg-slate-100 flex items-center justify-center font-bold text-lg overflow-hidden shrink-0">
                 {printCardStudent.photo_url ? (
-                  <img src={resolvePhotoSrc(printCardStudent.photo_url)} alt={printCardStudent.name} className="w-full h-full object-cover" />
+                  <DriveImage srcValue={printCardStudent.photo_url} alt={printCardStudent.name} className="w-full h-full object-cover" />
                 ) : (
                   printCardStudent.name.slice(0, 2).toUpperCase()
                 )}
@@ -3721,8 +3848,8 @@ export const AdminView: React.FC = () => {
             <div className="flex items-center gap-3 p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40">
               <div className="w-12 h-12 rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 flex items-center justify-center font-bold text-slate-500 overflow-hidden shrink-0">
                 {editingStudent.photo_url ? (
-                  <img
-                    src={resolvePhotoSrc(editingStudent.photo_url)}
+                  <DriveImage
+                    srcValue={editingStudent.photo_url}
                     alt="Foto Siswa"
                     className="w-full h-full object-cover"
                   />
@@ -3768,10 +3895,8 @@ export const AdminView: React.FC = () => {
                 <button
                   type="button"
                   onClick={async () => {
-                    if (window.confirm(`Hapus siswa ${editingStudent.name} (${editingStudent.nis})? Tindakan ini tidak dapat dibatalkan.`)) {
-                      await deleteStudent(editingStudent.nis!);
-                      setEditingStudent(null);
-                    }
+                    const ok = await deleteStudent(editingStudent.nis!);
+                    if (ok) setEditingStudent(null);
                   }}
                   className="px-2.5 py-1.5 rounded text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 font-semibold flex items-center gap-1.5 transition-colors text-xs"
                 >

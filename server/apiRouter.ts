@@ -1,4 +1,4 @@
-import { sheetsDb, SheetsConfigError, ConflictError } from './sheets.ts';
+import { sheetsDb, SheetsConfigError, GoogleAuthExpiredError, ConflictError } from './sheets.ts';
 import { authService } from './auth.ts';
 import { notificationService } from './emailer.ts';
 import { resolveSessionSchedule } from './sessionHelper.ts';
@@ -6,6 +6,12 @@ import * as XLSX from 'xlsx';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import type { AttendanceRecord } from './types.ts';
+import {
+  getSavedAppsScriptUrl,
+  saveAppsScriptUrlConfig,
+  clearAppsScriptUrlConfig,
+  isValidServerAppsScriptUrl,
+} from './appsScriptConfig.ts';
 
 function sanitizePayloadForSigning(obj: Record<string, any>): Record<string, any> {
   const copy = { ...obj };
@@ -79,17 +85,41 @@ export class JsonResponse {
     };
   }
 
-  static serviceUnavailable(message: string, missingEnv: string[]): ApiResponse {
+  static serviceUnavailable(
+    message: string,
+    missingEnv: string[],
+    extra?: { requiresGoogleSignIn?: boolean; authMode?: string; hasServiceAccount?: boolean }
+  ): ApiResponse {
     return {
       statusCode: 503,
       headers: { 'Content-Type': 'application/json' },
-      body: { error: message, configured: false, missingEnv },
+      body: {
+        error: message,
+        configured: false,
+        missingEnv,
+        requiresGoogleSignIn: extra?.requiresGoogleSignIn ?? false,
+        authMode: extra?.authMode ?? 'unconfigured',
+        hasServiceAccount: extra?.hasServiceAccount ?? false,
+        savedAppsScriptUrl: getSavedAppsScriptUrl() || undefined,
+      },
     };
   }
 
   static serverError(err: any): ApiResponse {
     if (err instanceof SheetsConfigError) {
-      return JsonResponse.serviceUnavailable(err.message, err.missingEnv);
+      const envStatus = sheetsDb.getFullEnvStatus();
+      return JsonResponse.serviceUnavailable(err.message, err.missingEnv, {
+        requiresGoogleSignIn: envStatus.requiresGoogleSignIn,
+        authMode: envStatus.authMode,
+        hasServiceAccount: envStatus.hasServiceAccount,
+      });
+    }
+    if (err instanceof GoogleAuthExpiredError) {
+      return {
+        statusCode: 401,
+        headers: { 'Content-Type': 'application/json' },
+        body: { error: err.message, googleAuthExpired: true },
+      };
     }
     if (err instanceof ConflictError) {
       return JsonResponse.conflict(err.message, err.current);
@@ -117,18 +147,53 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
 
   const authHeader = req.headers['authorization'] || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : '';
+  const googleAccessToken = (req.headers['x-google-access-token'] || '').trim();
 
+  return await sheetsDb.runWithOAuthToken(googleAccessToken, async () => {
   try {
+    // 0. APPS SCRIPT PERSISTENT CONFIG: /api/apps-script-config
+    if (pathname === '/api/apps-script-config') {
+      if (method === 'GET') {
+        return JsonResponse.ok(
+          { appsScriptUrl: getSavedAppsScriptUrl() },
+          { 'Cache-Control': 'no-store, no-cache, must-revalidate' }
+        );
+      }
+      if (method === 'POST') {
+        const rawUrl = String(req.body?.appsScriptUrl || '').trim();
+        if (!isValidServerAppsScriptUrl(rawUrl)) {
+          return JsonResponse.badRequest(
+            'URL harus berupa alamat Web App Google Apps Script HTTPS yang valid (https://script.google.com/macros/s/.../exec).'
+          );
+        }
+        const saved = saveAppsScriptUrlConfig(rawUrl);
+        return JsonResponse.ok({ success: true, appsScriptUrl: saved });
+      }
+      if (method === 'DELETE') {
+        clearAppsScriptUrlConfig();
+        return JsonResponse.ok({ success: true, appsScriptUrl: '' });
+      }
+      return JsonResponse.badRequest('Method tidak didukung untuk /api/apps-script-config.');
+    }
+
     // 1. SETUP & CONFIG CHECK: /api/setup
     if (pathname === '/api/setup') {
       const envStatus = sheetsDb.getFullEnvStatus();
       if (!envStatus.sheetsConfigured) {
         return JsonResponse.serviceUnavailable(
-          `Environment variable server belum lengkap: ${envStatus.missingEnv.join(', ')}`,
-          envStatus.missingEnv
+          envStatus.requiresGoogleSignIn
+            ? 'Hubungkan akun Google Anda untuk mengakses Google Sheets & Drive secara otomatis.'
+            : `Environment variable server belum lengkap: ${envStatus.missingEnv.join(', ')}`,
+          envStatus.missingEnv,
+          {
+            requiresGoogleSignIn: envStatus.requiresGoogleSignIn,
+            authMode: envStatus.authMode,
+            hasServiceAccount: envStatus.hasServiceAccount,
+          }
         );
       }
       await sheetsDb.ensureSheetsAndHeaders();
+      const emailStatus = notificationService.getEmailTransportStatus();
       return JsonResponse.ok({
         success: true,
         configured: envStatus.configured,
@@ -136,6 +201,12 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
         driveConfigured: envStatus.driveConfigured,
         spreadsheetConfigured: envStatus.spreadsheetConfigured,
         driveFolderConfigured: envStatus.driveFolderConfigured,
+        hasServiceAccount: envStatus.hasServiceAccount,
+        authMode: envStatus.authMode,
+        requiresGoogleSignIn: envStatus.requiresGoogleSignIn,
+        emailConnected: emailStatus.connected,
+        emailTransport: emailStatus.transport,
+        savedAppsScriptUrl: getSavedAppsScriptUrl() || undefined,
         missingEnv: envStatus.missingEnv,
         serverTime: new Date().toISOString(),
       });
@@ -146,8 +217,15 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       const envStatus = sheetsDb.getFullEnvStatus();
       if (!envStatus.driveConfigured) {
         return JsonResponse.serviceUnavailable(
-          `Environment variable Google Drive belum lengkap: ${envStatus.missingEnv.join(', ')}`,
-          envStatus.missingEnv
+          envStatus.requiresGoogleSignIn
+            ? 'Hubungkan akun Google Anda untuk mengakses foto di Google Drive.'
+            : `Environment variable Google Drive belum lengkap: ${envStatus.missingEnv.join(', ')}`,
+          envStatus.missingEnv,
+          {
+            requiresGoogleSignIn: envStatus.requiresGoogleSignIn,
+            authMode: envStatus.authMode,
+            hasServiceAccount: envStatus.hasServiceAccount,
+          }
         );
       }
 
@@ -180,8 +258,15 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       const envStatus = sheetsDb.getFullEnvStatus();
       if (!envStatus.sheetsConfigured) {
         return JsonResponse.serviceUnavailable(
-          `Konfigurasi Google Service Account / Spreadsheet belum lengkap di environment variable server: ${envStatus.missingEnv.join(', ')}`,
-          envStatus.missingEnv
+          envStatus.requiresGoogleSignIn
+            ? 'Hubungkan akun Google Anda terlebih dahulu untuk mengakses aplikasi.'
+            : `Konfigurasi Google Service Account / Spreadsheet belum lengkap di environment variable server: ${envStatus.missingEnv.join(', ')}`,
+          envStatus.missingEnv,
+          {
+            requiresGoogleSignIn: envStatus.requiresGoogleSignIn,
+            authMode: envStatus.authMode,
+            hasServiceAccount: envStatus.hasServiceAccount,
+          }
         );
       }
 
@@ -477,11 +562,19 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       const envStatus = sheetsDb.getFullEnvStatus();
       if (!envStatus.sheetsConfigured) {
         return JsonResponse.serviceUnavailable(
-          `Konfigurasi Google Service Account / Spreadsheet belum lengkap di environment variable server: ${envStatus.missingEnv.join(', ')}`,
-          envStatus.missingEnv
+          envStatus.requiresGoogleSignIn
+            ? 'Hubungkan akun Google Anda untuk menyinkronkan data Google Sheets.'
+            : `Konfigurasi Google Service Account / Spreadsheet belum lengkap di environment variable server: ${envStatus.missingEnv.join(', ')}`,
+          envStatus.missingEnv,
+          {
+            requiresGoogleSignIn: envStatus.requiresGoogleSignIn,
+            authMode: envStatus.authMode,
+            hasServiceAccount: envStatus.hasServiceAccount,
+          }
         );
       }
       const db = await sheetsDb.getFullDatabase();
+      const emailStatus = notificationService.getEmailTransportStatus();
 
       return JsonResponse.ok(
         {
@@ -491,6 +584,12 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
           driveConfigured: envStatus.driveConfigured,
           spreadsheetConfigured: envStatus.spreadsheetConfigured,
           driveFolderConfigured: envStatus.driveFolderConfigured,
+          hasServiceAccount: envStatus.hasServiceAccount,
+          authMode: envStatus.authMode,
+          requiresGoogleSignIn: envStatus.requiresGoogleSignIn,
+          emailConnected: emailStatus.connected,
+          emailTransport: emailStatus.transport,
+          savedAppsScriptUrl: getSavedAppsScriptUrl() || undefined,
           missingEnv: envStatus.missingEnv,
           serverTime: new Date().toISOString(),
           data: {
@@ -1183,7 +1282,13 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       if (method === 'GET') {
         const settings = await sheetsDb.getNotificationSettings();
         const logs = await sheetsDb.getNotificationLogs();
-        return JsonResponse.ok({ settings, logs });
+        const emailStatus = notificationService.getEmailTransportStatus();
+        return JsonResponse.ok({
+          settings,
+          logs,
+          emailConnected: emailStatus.connected,
+          emailTransport: emailStatus.transport,
+        });
       }
 
       const cleanToken = token && token !== 'undefined' && token !== 'null' ? token : '';
@@ -1388,10 +1493,15 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
 
     return JsonResponse.notFound(`Endpoint ${pathname} tidak ditemukan.`);
   } catch (err: any) {
-    if (err instanceof SheetsConfigError || err instanceof ConflictError) {
+    if (
+      err instanceof SheetsConfigError ||
+      err instanceof GoogleAuthExpiredError ||
+      err instanceof ConflictError
+    ) {
       return JsonResponse.serverError(err);
     }
     console.error(`[API ERROR] ${method} ${pathname}:`, err);
     return JsonResponse.serverError(err);
   }
+  });
 }

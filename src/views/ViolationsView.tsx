@@ -17,7 +17,7 @@ import { useApp } from '../context/AppContext.js';
 import { CameraCaptureModal } from '../components/modals/CameraCaptureModal.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { exportToExcel } from '../utils/excel.js';
-import { resolvePhotoSrc } from '../utils/photo.js';
+import { DriveImage } from '../components/common/DriveImage.js';
 import { Student, ViolationType, ViolationRecord } from '../types/index.js';
 
 export const ViolationsView: React.FC = () => {
@@ -55,6 +55,7 @@ export const ViolationsView: React.FC = () => {
 
   // Selected student drilldown modal
   const [profileStudent, setProfileStudent] = useState<Student | null>(null);
+  const [previewEvidence, setPreviewEvidence] = useState<ViolationRecord | null>(null);
 
   // Selected violation type object
   const currentType = violationTypes.find((t) => t.id === selectedTypeId) || violationTypes[0];
@@ -609,15 +610,14 @@ export const ViolationsView: React.FC = () => {
                         </td>
                         <td className="py-2.5">
                           {v.evidence_photo_url ? (
-                            <a
-                              href={resolvePhotoSrc(v.evidence_photo_url)}
-                              target="_blank"
-                              rel="noreferrer"
+                            <button
+                              type="button"
+                              onClick={() => setPreviewEvidence(v)}
                               className="text-blue-600 hover:underline flex items-center gap-1"
                             >
                               <Eye className="w-3.5 h-3.5" />
                               <span>Lihat</span>
-                            </a>
+                            </button>
                           ) : (
                             <span className="text-slate-400">-</span>
                           )}
@@ -625,12 +625,7 @@ export const ViolationsView: React.FC = () => {
                         <td className="py-2.5">
                           <button
                             type="button"
-                            onClick={() => {
-                              const reason = prompt('Masukkan alasan penghapusan data:');
-                              if (reason) {
-                                deleteViolation(v.id, reason);
-                              }
-                            }}
+                            onClick={() => deleteViolation(v.id, 'Koreksi data pelanggaran oleh petugas')}
                             title="Hapus Catatan"
                             className="text-slate-400 hover:text-rose-600 p-1"
                           >
@@ -669,18 +664,17 @@ export const ViolationsView: React.FC = () => {
                       key={v.id}
                       className="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden bg-slate-50 dark:bg-slate-800 flex flex-col justify-between"
                     >
-                      <a
-                        href={resolvePhotoSrc(v.evidence_photo_url)}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="block aspect-video bg-black/10 overflow-hidden"
+                      <button
+                        type="button"
+                        onClick={() => setPreviewEvidence(v)}
+                        className="block w-full text-left aspect-video bg-black/10 overflow-hidden"
                       >
-                        <img
-                          src={resolvePhotoSrc(v.evidence_photo_url)}
+                        <DriveImage
+                          srcValue={v.evidence_photo_url}
                           alt={v.type_name}
                           className="w-full h-full object-cover hover:scale-105 transition-transform"
                         />
-                      </a>
+                      </button>
                       <div className="p-2.5 text-xs">
                         <p className="font-semibold text-slate-900 dark:text-white truncate">
                           {student?.name || v.student_id}
@@ -711,6 +705,45 @@ export const ViolationsView: React.FC = () => {
         student={profileStudent}
         onClose={() => setProfileStudent(null)}
       />
+
+      {/* Evidence Photo Preview Lightbox */}
+      {previewEvidence && previewEvidence.evidence_photo_url && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
+          onClick={() => setPreviewEvidence(null)}
+        >
+          <div
+            className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg max-w-xl w-full p-4 space-y-3 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-2">
+              <div>
+                <h3 className="text-xs font-bold text-slate-900 dark:text-white">
+                  Bukti Foto: {previewEvidence.type_name}
+                </h3>
+                <p className="text-[11px] text-slate-500">
+                  {students.find((s) => s.nis === previewEvidence.student_id)?.name || previewEvidence.student_id} •{' '}
+                  {new Date(previewEvidence.recorded_at).toLocaleString('id-ID')}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPreviewEvidence(null)}
+                className="p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="max-h-[70vh] overflow-hidden rounded bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
+              <DriveImage
+                srcValue={previewEvidence.evidence_photo_url}
+                alt={previewEvidence.type_name}
+                className="max-h-[70vh] w-auto object-contain"
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

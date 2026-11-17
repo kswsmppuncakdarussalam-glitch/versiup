@@ -192,6 +192,7 @@ export interface AppSettings {
   // Auto Session Switching (Peralihan Sesi Otomatis)
   auto_session_switch?: boolean;
   auto_session_switch_notify?: boolean;
+  apps_script_url?: string;
   updated_at: string;
   diubah_pada?: string;
 }

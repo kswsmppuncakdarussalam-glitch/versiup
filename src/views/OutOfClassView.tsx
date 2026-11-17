@@ -18,7 +18,7 @@ import {
   formatDuration,
 } from '../utils/time.js';
 import { soundEffects } from '../utils/audio.js';
-import { resolvePhotoSrc } from '../utils/photo.js';
+import { DriveImage } from '../components/common/DriveImage.js';
 import { Student, OutOfClassRecord, OutOfClassType } from '../types/index.js';
 
 export const OutOfClassView: React.FC = () => {
@@ -426,7 +426,7 @@ export const OutOfClassView: React.FC = () => {
                     <div className="flex items-center gap-3">
                       <div className="w-10 h-10 rounded-full border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 flex items-center justify-center font-bold text-slate-800 dark:text-slate-200 text-xs overflow-hidden shrink-0">
                         {student?.photo_url ? (
-                          <img src={resolvePhotoSrc(student.photo_url)} alt={student.name} className="w-full h-full object-cover" />
+                          <DriveImage srcValue={student.photo_url} alt={student.name} className="w-full h-full object-cover" />
                         ) : (
                           student?.name.slice(0, 2).toUpperCase() || '!'
                         )}

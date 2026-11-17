@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { CheckCircle2, AlertTriangle, Info, X } from 'lucide-react';
 import { Student, AttendanceRecord, AttendanceSession } from '../../types/index.js';
-import { resolvePhotoSrc } from '../../utils/photo.js';
+import { DriveImage } from '../common/DriveImage.js';
 
 interface AttendanceNotificationModalProps {
   student: Student | null;
@@ -110,8 +110,8 @@ export const AttendanceNotificationModal: React.FC<AttendanceNotificationModalPr
           {/* Avatar or Photo */}
           <div className="mx-auto w-20 h-20 rounded-full border-2 border-slate-200 dark:border-slate-700 overflow-hidden flex items-center justify-center bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xl font-bold mb-4 shadow-sm">
             {student?.photo_url ? (
-              <img
-                src={resolvePhotoSrc(student.photo_url)}
+              <DriveImage
+                srcValue={student.photo_url}
                 alt={student.name}
                 className="w-full h-full object-cover"
               />
