@@ -277,7 +277,7 @@ export const AdminView: React.FC = () => {
     };
   };
 
-  // Fetch all user accounts from server
+  // Fetch all user accounts from server (with automatic 401 session renewal)
   const fetchUsers = async () => {
     if (!session?.token || configError || (needsGoogleAuth && !appsScriptUrl)) return;
     setLoadingUsers(true);
@@ -286,6 +286,28 @@ export const AdminView: React.FC = () => {
         headers: getAdminHeaders(),
       });
       const data = await safeReadJson(res);
+      if (res.status === 401 && !data?.googleAuthExpired && !data?.googleDeploymentUnauthorized) {
+        const refreshRes = await apiFetch('/api/auth?action=refresh_session', {
+          method: 'POST',
+          headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({}),
+        });
+        const refreshData = await safeReadJson(refreshRes);
+        if (refreshRes.ok && refreshData?.token) {
+          updateSessionToken(refreshData.token);
+          const retryRes = await apiFetch('/api/auth?action=manage_accounts', {
+            headers: {
+              ...getAdminHeaders(),
+              Authorization: `Bearer ${refreshData.token}`,
+            },
+          });
+          const retryData = await safeReadJson(retryRes);
+          if (retryRes.ok && Array.isArray(retryData.users)) {
+            setUsersList(retryData.users);
+          }
+          return;
+        }
+      }
       if (res.ok && Array.isArray(data.users)) {
         setUsersList(data.users);
       }

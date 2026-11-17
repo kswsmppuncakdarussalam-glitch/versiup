@@ -313,14 +313,50 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
       if (action === 'verify_session') {
         if (!token) return JsonResponse.unauthorized();
         const validRes = await authService.validateActiveSession(token);
-        if (!validRes.valid) return JsonResponse.unauthorized(validRes.reason);
+        if (!validRes.valid) {
+          return {
+            statusCode: 401,
+            headers: { 'Content-Type': 'application/json' },
+            body: { error: validRes.reason || 'Unauthorized', sessionInvalidated: Boolean(validRes.invalidated) },
+          };
+        }
         return JsonResponse.ok({ valid: true, session: validRes.session });
+      }
+
+      if (action === 'refresh_session') {
+        if (!token) return JsonResponse.unauthorized();
+        const validRes = await authService.validateActiveSession(token);
+        if (!validRes.valid || !validRes.session || !validRes.user) {
+          return {
+            statusCode: 401,
+            headers: { 'Content-Type': 'application/json' },
+            body: { error: validRes.reason || 'Unauthorized', sessionInvalidated: Boolean(validRes.invalidated) },
+          };
+        }
+        const JWT_SECRET = process.env.JWT_SECRET || 'disiplin-kita-bisa-secure-secret-key-2026';
+        const refreshed = jwt.sign(
+          sanitizePayloadForSigning({
+            ...validRes.session,
+            userId: validRes.user.id,
+            tokenVersion: validRes.user.token_version,
+          }),
+          JWT_SECRET,
+          { expiresIn: '30d' }
+        );
+        return JsonResponse.ok({ valid: true, token: refreshed, session: validRes.session });
       }
 
       if (action === 'manage_accounts') {
         const validRes = await authService.validateActiveSession(token);
         if (!validRes.valid || !validRes.session) {
-          return JsonResponse.unauthorized('Sesi tidak valid atau telah berakhir.');
+          return {
+            statusCode: 401,
+            headers: { 'Content-Type': 'application/json' },
+            body: {
+              error: validRes.reason || 'Sesi tidak valid atau telah berakhir.',
+              sessionInvalidated: Boolean(validRes.invalidated),
+            },
+          };
         }
 
         if (method === 'GET') {
@@ -375,7 +411,7 @@ export async function handleApiRoute(req: ApiRequest): Promise<ApiResponse> {
                   tokenVersion: target.token_version,
                 }),
                 JWT_SECRET,
-                { expiresIn: '12h' }
+                { expiresIn: '30d' }
               );
             } else if (targetRole === 'student_affairs') {
               target = users.find((u) => u.role === 'student_affairs') || {

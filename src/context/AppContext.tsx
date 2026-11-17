@@ -423,6 +423,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const pendingRefreshAfterWriteRef = useRef<boolean>(false);
   const hasCheckedServerAppsScriptRef = useRef<boolean>(false);
   const syncChannelRef = useRef<BroadcastChannel | null>(null);
+  const sessionRef = useRef<AuthSession | null>(session);
+  sessionRef.current = session;
+  const tokenRefreshPromiseRef = useRef<Promise<string | null> | null>(null);
 
   const broadcastSyncEvent = useCallback((type: 'DATA_MUTATED' | 'APPS_SCRIPT_CHANGED', payload?: any) => {
     try {
@@ -504,10 +507,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 
   const buildApiHeaders = useCallback(
-    (extra?: Record<string, string>, overrideGoogleToken?: string): Record<string, string> => {
+    (
+      extra?: Record<string, string>,
+      overrideGoogleToken?: string,
+      overrideAppToken?: string
+    ): Record<string, string> => {
       const gToken = overrideGoogleToken || googleAccessToken || getGoogleAccessToken();
+      const appToken = overrideAppToken ?? session?.token ?? sessionRef.current?.token ?? '';
       return {
-        ...(session?.token ? { Authorization: `Bearer ${session.token}` } : {}),
+        ...(appToken ? { Authorization: `Bearer ${appToken}` } : {}),
         ...(gToken ? { 'X-Google-Access-Token': gToken } : {}),
         ...(extra || {}),
       };
@@ -524,9 +532,131 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         showToast('Sesi akses Google berakhir. Silakan klik "Sign in with Google" lagi untuk melanjutkan.', 'info');
         return true;
       }
+      if (status === 401 && data?.googleDeploymentUnauthorized) {
+        showToast(
+          data.error ||
+            'Google Apps Script menolak akses (401). Pastikan deploy Web App dengan URL /exec dan akses "Siapa saja (Anyone)".',
+          'error'
+        );
+        return true;
+      }
       return false;
     },
     [showToast]
+  );
+
+  const decodeJwtPayload = (token: string): any => {
+    try {
+      const part = token.split('.')[1] || '';
+      const base64 = part.replace(/-/g, '+').replace(/_/g, '/');
+      const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
+      const binStr = atob(padded);
+      const bytes = Uint8Array.from(binStr, (c) => c.charCodeAt(0));
+      const jsonStr = new TextDecoder().decode(bytes);
+      return JSON.parse(jsonStr);
+    } catch {
+      return {};
+    }
+  };
+
+  const applyDatabaseSnapshot = useCallback((d: any, serverTime?: string) => {
+    if (serverTime) {
+      setServerClockOffset(serverTime);
+      setCurrentServerTime(getServerNow());
+    }
+    if (!d || typeof d !== 'object') return;
+    if (Array.isArray(d.students)) setStudents(d.students);
+    if (Array.isArray(d.classes)) setClasses(d.classes);
+    if (Array.isArray(d.sessions)) setSessions(d.sessions);
+    if (Array.isArray(d.attendance)) setAttendance(d.attendance);
+    if (Array.isArray(d.out_of_class)) setOutOfClass(d.out_of_class);
+    if (Array.isArray(d.violations)) setViolations(d.violations);
+    if (Array.isArray(d.violation_types)) setViolationTypes(d.violation_types);
+    if (Array.isArray(d.leave_requests)) setLeaveRequests(d.leave_requests);
+    if (d.settings) setSettings((prev) => ({ ...prev, ...d.settings }));
+    if (d.notification_settings) {
+      setNotificationSettings((prev) => ({ ...prev, ...d.notification_settings }));
+    }
+    if (Array.isArray(d.notification_logs)) setNotificationLogs(d.notification_logs);
+    if (Array.isArray(d.audit_logs)) setAuditLogs(d.audit_logs);
+    setLastSyncTime(new Date());
+    setSyncStatus('synced');
+  }, []);
+
+  const clearExpiredAppSession = useCallback(
+    (message = 'Sesi login telah berakhir atau sandi diubah. Silakan masuk kembali.') => {
+      sessionRef.current = null;
+      setSession(null);
+      try {
+        localStorage.removeItem('dkb_session');
+        localStorage.removeItem('dkb_active_tab');
+      } catch {}
+      setActiveTabState('attendance');
+      showToast(message, 'info');
+    },
+    [showToast]
+  );
+
+  const refreshAuthSessionIfNeeded = useCallback(
+    async (forceLogoutOn401 = false): Promise<string | null> => {
+      const currentSess = sessionRef.current;
+      if (!currentSess?.token) return null;
+
+      if (tokenRefreshPromiseRef.current) {
+        return tokenRefreshPromiseRef.current;
+      }
+
+      const promise = (async () => {
+        try {
+          const res = await apiFetch('/api/auth?action=refresh_session', {
+            method: 'POST',
+            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, currentSess.token),
+            body: JSON.stringify({}),
+          });
+          const data = await res.json().catch(() => ({}));
+
+          if (res.ok && data?.token) {
+            const payload = decodeJwtPayload(data.token);
+            const updated: AuthSession = {
+              ...currentSess,
+              token: data.token,
+              userId: payload.userId || currentSess.userId,
+              role: payload.role || currentSess.role,
+              name: payload.name || currentSess.name,
+              label: payload.label || currentSess.label,
+              tokenVersion: payload.tokenVersion ?? currentSess.tokenVersion,
+              lockedMenuClassId:
+                payload.lockedMenuClassId !== undefined
+                  ? payload.lockedMenuClassId
+                  : currentSess.lockedMenuClassId,
+            };
+            sessionRef.current = updated;
+            setSession(updated);
+            try {
+              localStorage.setItem('dkb_session', JSON.stringify(updated));
+            } catch {}
+            return data.token as string;
+          }
+
+          if (res.status === 401 && !data?.googleAuthExpired && !data?.googleDeploymentUnauthorized) {
+            if (data?.sessionInvalidated || forceLogoutOn401) {
+              clearExpiredAppSession(
+                data?.error || 'Sesi login telah berakhir atau kata sandi diubah. Silakan masuk kembali.'
+              );
+            }
+          }
+          return null;
+        } catch {
+          return null;
+        } finally {
+          tokenRefreshPromiseRef.current = null;
+        }
+      })();
+
+      tokenRefreshPromiseRef.current = promise;
+      return promise;
+    },
+    [buildApiHeaders, clearExpiredAppSession]
   );
 
   const speak = useCallback(
@@ -733,29 +863,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           missingEnv: Array.isArray(data.missingEnv) ? data.missingEnv : [],
         });
 
-        if (data.serverTime) {
-          setServerClockOffset(data.serverTime);
-          setCurrentServerTime(getServerNow());
-        }
-
         if (data.data) {
-          const d = data.data;
-          if (Array.isArray(d.students)) setStudents(d.students);
-          if (Array.isArray(d.classes)) setClasses(d.classes);
-          if (Array.isArray(d.sessions)) setSessions(d.sessions);
-          if (Array.isArray(d.attendance)) setAttendance(d.attendance);
-          if (Array.isArray(d.out_of_class)) setOutOfClass(d.out_of_class);
-          if (Array.isArray(d.violations)) setViolations(d.violations);
-          if (Array.isArray(d.violation_types)) setViolationTypes(d.violation_types);
-          if (Array.isArray(d.leave_requests)) setLeaveRequests(d.leave_requests);
-          if (d.settings) setSettings((prev) => ({ ...prev, ...d.settings }));
-          if (d.notification_settings) setNotificationSettings((prev) => ({ ...prev, ...d.notification_settings }));
-          if (Array.isArray(d.notification_logs)) setNotificationLogs(d.notification_logs);
-          if (Array.isArray(d.audit_logs)) setAuditLogs(d.audit_logs);
+          applyDatabaseSnapshot(data.data, data.serverTime);
+        } else {
+          if (data.serverTime) {
+            setServerClockOffset(data.serverTime);
+            setCurrentServerTime(getServerNow());
+          }
+          setLastSyncTime(new Date());
+          setSyncStatus('synced');
         }
-
-        setLastSyncTime(new Date());
-        setSyncStatus('synced');
       } catch (err: any) {
         setSyncStatus(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'error');
         if (!silent) {
@@ -770,7 +887,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
       }
     },
-    [buildApiHeaders, handlePossibleGoogleTokenExpiry]
+    [applyDatabaseSnapshot, buildApiHeaders, handlePossibleGoogleTokenExpiry]
   );
 
   // Firebase Google Auth listener (in-memory access token)
@@ -852,23 +969,60 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setAppsScriptUrlState(saved);
         setNeedsGoogleAuth(false);
         setConfigError(null);
+        setInitialLoadError(null);
+
+        if (result.data?.data) {
+          applyDatabaseSnapshot(result.data.data, result.data.serverTime);
+          setEnvStatus({
+            configured: true,
+            sheetsConfigured: Boolean(result.data.sheetsConfigured ?? true),
+            driveConfigured: Boolean(result.data.driveConfigured ?? true),
+            spreadsheetConfigured: true,
+            driveFolderConfigured: true,
+            hasServiceAccount: false,
+            authMode: 'apps_script',
+            requiresGoogleSignIn: false,
+            emailConnected: Boolean(result.data.emailConnected),
+            emailTransport: result.data.emailTransport || 'apps_script_gmail',
+            senderEmail: result.data.senderEmail || '',
+            missingEnv: [],
+          });
+        }
+
         await persistServerAppsScriptUrl(saved);
         broadcastSyncEvent('APPS_SCRIPT_CHANGED', { appsScriptUrl: saved });
-        if (session?.token) {
+
+        let activeAppToken = sessionRef.current?.token || '';
+        if (activeAppToken) {
+          const refreshed = await refreshAuthSessionIfNeeded(true);
+          activeAppToken = refreshed || '';
+        }
+
+        if (activeAppToken) {
           apiFetch('/api/settings', {
             method: 'POST',
-            headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
+            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, activeAppToken),
             body: JSON.stringify({ apps_script_url: saved }),
           }).catch(() => {});
         }
+
         showToast(result.message, 'success');
-        await refreshFromSheets(false, undefined, { afterWrite: true });
+        if (!result.data?.data) {
+          await refreshFromSheets(false, undefined, { afterWrite: true });
+        }
         return { ok: true, message: result.message };
       } finally {
         setIsConnectingAppsScript(false);
       }
     },
-    [broadcastSyncEvent, buildApiHeaders, refreshFromSheets, session?.token, showToast]
+    [
+      applyDatabaseSnapshot,
+      broadcastSyncEvent,
+      buildApiHeaders,
+      refreshAuthSessionIfNeeded,
+      refreshFromSheets,
+      showToast,
+    ]
   );
 
   const disconnectAppsScript = useCallback(async () => {
@@ -891,16 +1045,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setSavingState();
     try {
-      const res = await apiFetch('/api/attendance', {
-        method: 'POST',
-        headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ scans: queued }),
-      });
+      const sendQueued = async (tokOverride?: string) => {
+        const res = await apiFetch('/api/attendance', {
+          method: 'POST',
+          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, tokOverride),
+          body: JSON.stringify({ scans: queued }),
+        });
+        const data = await res.json().catch(() => ({}));
+        return { res, data };
+      };
 
-      const data = await res.json().catch(() => ({}));
+      let { res, data } = await sendQueued();
       if (handlePossibleGoogleTokenExpiry(res.status, data)) {
         return;
       }
+      if (res.status === 401 && sessionRef.current?.token) {
+        const refreshedTok = await refreshAuthSessionIfNeeded(true);
+        if (refreshedTok) {
+          const retried = await sendQueued(refreshedTok);
+          res = retried.res;
+          data = retried.data;
+        }
+      }
+
       if (res.ok) {
         writeOfflineScans([]);
         setPendingOfflineScansCount(0);
@@ -910,9 +1077,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         } else {
           showToast(`${queued.length} data presensi offline berhasil disinkronkan ke Google Sheets.`, 'success');
         }
-        await refreshFromSheets(true, undefined, { afterWrite: true });
+        if (data.snapshot) {
+          applyDatabaseSnapshot(data.snapshot, data.serverTime);
+        } else {
+          await refreshFromSheets(true, undefined, { afterWrite: true });
+        }
         broadcastSyncEvent('DATA_MUTATED');
-      } else if (res.status < 500 && res.status !== 429) {
+      } else if (res.status < 500 && res.status !== 429 && res.status !== 401) {
         // Unrecoverable validation error; drop bad items so queue does not loop forever
         writeOfflineScans([]);
         setPendingOfflineScansCount(0);
@@ -924,9 +1095,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [
     needsGoogleAuth,
     googleAccessToken,
+    applyDatabaseSnapshot,
     buildApiHeaders,
     broadcastSyncEvent,
     handlePossibleGoogleTokenExpiry,
+    refreshAuthSessionIfNeeded,
     refreshFromSheets,
     setSavingState,
     setSavedState,
@@ -934,10 +1107,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     showToast,
   ]);
 
-  // Initial load + 10s automatic polling + cross-tab instant sync + visibility/focus/online listeners
+  // Initial load + silent session verification + 10s automatic polling + cross-tab instant sync
   useEffect(() => {
     refreshFromSheets(false);
     flushOfflineAttendanceScans();
+    if (sessionRef.current?.token) {
+      void refreshAuthSessionIfNeeded(false);
+    }
 
     let bc: BroadcastChannel | null = null;
     try {
@@ -1023,21 +1199,35 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSavingState();
 
     try {
-      const res = await apiFetch('/api/attendance', {
-        method: 'POST',
-        headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({
-          scans: items.map((it) => it.params),
-        }),
-      });
+      const sendBatch = async (tokOverride?: string) => {
+        const res = await apiFetch('/api/attendance', {
+          method: 'POST',
+          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, tokOverride),
+          body: JSON.stringify({
+            scans: items.map((it) => it.params),
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        return { res, data };
+      };
 
-      const data = await res.json().catch(() => ({}));
+      let { res, data } = await sendBatch();
       if (handlePossibleGoogleTokenExpiry(res.status, data)) {
         const msg = data.error || 'Sesi Google berakhir.';
         setSaveErrorState(msg);
         items.forEach((it) => it.resolve({ success: false, error: msg }));
         return;
       }
+
+      if (res.status === 401 && sessionRef.current?.token) {
+        const refreshedTok = await refreshAuthSessionIfNeeded(true);
+        if (refreshedTok) {
+          const retried = await sendBatch(refreshedTok);
+          res = retried.res;
+          data = retried.data;
+        }
+      }
+
       if (data.serverTime) {
         setServerClockOffset(data.serverTime);
       }
@@ -1077,7 +1267,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           ...savedResults.map((r) => r.record),
           ...prev.filter((p) => !savedResults.some((sr) => sr.record.id === p.id)),
         ]);
-        setSavedState('Tersimpan');
+        setSavedState('Tersimpan & Tersinkron');
       } else {
         soundEffects.playErrorBeep();
         setSaveErrorState(rejectedList[0]?.message || 'Presensi ditolak.');
@@ -1125,7 +1315,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
       });
 
-      await refreshFromSheets(true, undefined, { afterWrite: true });
+      if (data.snapshot) {
+        applyDatabaseSnapshot(data.snapshot, data.serverTime);
+      } else {
+        await refreshFromSheets(true, undefined, { afterWrite: true });
+      }
       broadcastSyncEvent('DATA_MUTATED');
     } catch {
       const existingOffline = readOfflineScans();
@@ -1142,10 +1336,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         })
       );
     }
-  }, [buildApiHeaders, broadcastSyncEvent, handlePossibleGoogleTokenExpiry, students, refreshFromSheets, setSavingState, setSavedState, setSaveErrorState]);
+  }, [
+    applyDatabaseSnapshot,
+    buildApiHeaders,
+    broadcastSyncEvent,
+    handlePossibleGoogleTokenExpiry,
+    refreshAuthSessionIfNeeded,
+    students,
+    refreshFromSheets,
+    setSavingState,
+    setSavedState,
+    setSaveErrorState,
+  ]);
 
   /**
-   * Helper to run direct write fetch with 'Menyimpan...' -> 'Tersimpan' status and 409 Conflict UI
+   * Helper to run direct write fetch with 'Menyimpan...' -> 'Tersimpan' status,
+   * automatic 401 token refresh + retry, immediate snapshot sync, and 409 Conflict UI
    */
   const runWriteRequest = useCallback(
     async (params: {
@@ -1167,12 +1373,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setSavingState();
       latestMutationSeqRef.current += 1;
 
-      const execute = async (forceOverwrite = false): Promise<{ ok: boolean; data?: any; error?: string }> => {
+      const execute = async (
+        forceOverwrite = false,
+        hasRetriedAuth = false,
+        overrideAppToken?: string
+      ): Promise<{ ok: boolean; data?: any; error?: string }> => {
         try {
           const payload = forceOverwrite ? { ...params.body, forceOverwrite: true } : params.body;
           const res = await apiFetch(params.url, {
             method: params.method,
-            headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
+            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, overrideAppToken),
             body: JSON.stringify(payload),
           });
           const data = await res.json().catch(() => ({}));
@@ -1181,6 +1391,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             const msg = data.error || 'Sesi Google berakhir.';
             setSaveErrorState(msg);
             return { ok: false, error: msg };
+          }
+
+          if (res.status === 401 && !hasRetriedAuth && sessionRef.current?.token) {
+            const refreshedTok = await refreshAuthSessionIfNeeded(true);
+            if (refreshedTok) {
+              return execute(forceOverwrite, true, refreshedTok);
+            }
+            const authErr = data.error || 'Sesi login telah berakhir. Silakan masuk kembali.';
+            setSaveErrorState(authErr);
+            return { ok: false, error: authErr, data };
           }
 
           if (res.status === 409 && data.conflict) {
@@ -1199,7 +1419,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 onForceOverwrite: async () => {
                   setConflictPrompt(null);
                   setSavingState();
-                  const forcedRes = await execute(true);
+                  const forcedRes = await execute(true, hasRetriedAuth, overrideAppToken);
                   resolve(forcedRes);
                 },
               });
@@ -1213,11 +1433,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             return { ok: false, error: errMsg, data };
           }
 
-          // Instant optimistic reflection for settings/notifications before full sync resolves
-          if (params.url === '/api/settings' && data.settings) {
-            setSettings((prev) => ({ ...prev, ...data.settings }));
-          } else if (params.url === '/api/notifications' && data.settings) {
-            setNotificationSettings((prev) => ({ ...prev, ...data.settings }));
+          // Instant authoritative snapshot reflection in the same HTTP roundtrip
+          if (data.snapshot) {
+            applyDatabaseSnapshot(data.snapshot, data.serverTime);
+          } else {
+            if (params.url === '/api/settings' && data.settings) {
+              setSettings((prev) => ({ ...prev, ...data.settings }));
+            } else if (params.url === '/api/notifications' && data.settings) {
+              setNotificationSettings((prev) => ({ ...prev, ...data.settings }));
+            }
           }
 
           setSavedState('Tersimpan & Tersinkron');
@@ -1226,7 +1450,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             showToast(params.successMessage, 'success');
           }
           broadcastSyncEvent('DATA_MUTATED');
-          await refreshFromSheets(true, undefined, { afterWrite: true });
+          if (!data.snapshot) {
+            await refreshFromSheets(true, undefined, { afterWrite: true });
+          }
           return { ok: true, data };
         } catch (err: any) {
           const errMsg = err?.message || 'Gagal terhubung ke server.';
@@ -1238,23 +1464,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       return execute(false);
     },
-    [buildApiHeaders, broadcastSyncEvent, handlePossibleGoogleTokenExpiry, refreshFromSheets, setSavingState, setSavedState, setSaveErrorState, showToast]
+    [
+      applyDatabaseSnapshot,
+      buildApiHeaders,
+      broadcastSyncEvent,
+      handlePossibleGoogleTokenExpiry,
+      refreshAuthSessionIfNeeded,
+      refreshFromSheets,
+      setSavingState,
+      setSavedState,
+      setSaveErrorState,
+      showToast,
+    ]
   );
 
   // ==================== AUTH ACTIONS ====================
-  const decodeJwtPayload = (token: string): any => {
-    try {
-      const part = token.split('.')[1] || '';
-      const base64 = part.replace(/-/g, '+').replace(/_/g, '/');
-      const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
-      const binStr = atob(padded);
-      const bytes = Uint8Array.from(binStr, (c) => c.charCodeAt(0));
-      const jsonStr = new TextDecoder().decode(bytes);
-      return JSON.parse(jsonStr);
-    } catch {
-      return {};
-    }
-  };
 
   const loginDuty = async (password: string) => {
     try {
@@ -1402,11 +1626,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const updateSessionToken = (newToken: string) => {
     try {
       const payload = decodeJwtPayload(newToken);
+      const baseSess = sessionRef.current || session;
+      if (!baseSess) return;
       const updatedSess: AuthSession = {
-        ...session!,
+        ...baseSess,
         token: newToken,
-        tokenVersion: payload.tokenVersion,
+        tokenVersion: payload.tokenVersion ?? baseSess.tokenVersion,
       };
+      sessionRef.current = updatedSess;
       setSession(updatedSess);
       localStorage.setItem('dkb_session', JSON.stringify(updatedSess));
     } catch {}

@@ -23,7 +23,7 @@
 
 var DEFAULT_SPREADSHEET_ID = '14MkgrDI6iFV4J8b5rS_LkUZrHtYX_zzuGJUihjKdxU4';
 var DEFAULT_DRIVE_FOLDER_ID = '1vHFHbjW2E8Zo_-nuft4ns1NonyXcQY7K';
-var TOKEN_EXPIRY_MS = 12 * 60 * 60 * 1000; // 12 jam
+var TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 hari
 var LOCKOUT_MAX_ATTEMPTS = 5;
 var LOCKOUT_SECONDS = 300; // 5 menit
 
@@ -152,6 +152,13 @@ function checkAndTriggerWeeklyRecap() {
   }
 }
 
+function normalizeToken_(rawTok) {
+  var s = String(rawTok === undefined || rawTok === null ? '' : rawTok).trim();
+  s = s.replace(/^Bearer\s+/i, '').trim();
+  if (!s || s === 'undefined' || s === 'null') return '';
+  return s;
+}
+
 function doGet(e) {
   var params = (e && e.parameter) || {};
   var route = params.route || '/api/setup';
@@ -159,7 +166,7 @@ function doGet(e) {
     route: route,
     method: 'GET',
     query: params,
-    token: params.token || '',
+    token: normalizeToken_(params.token),
     body: {},
   };
   return jsonOutput_(dispatchRoute_(req));
@@ -179,7 +186,7 @@ function doPost(e) {
     route: payload.route || ((e && e.parameter && e.parameter.route) || '/api/setup'),
     method: String(payload.method || 'POST').toUpperCase(),
     query: payload.query || (e && e.parameter) || {},
-    token: String(payload.token || '').trim(),
+    token: normalizeToken_(payload.token || (e && e.parameter && e.parameter.token)),
     body: payload.body !== undefined ? payload.body : {},
   };
 
@@ -342,8 +349,9 @@ function signJwt_(payload) {
 }
 
 function verifyJwt_(token) {
-  if (!token) return null;
-  var parts = String(token).split('.');
+  var cleanTok = normalizeToken_(token);
+  if (!cleanTok) return null;
+  var parts = cleanTok.split('.');
   if (parts.length !== 3) return null;
   try {
     var signingInput = parts[0] + '.' + parts[1];
@@ -353,17 +361,75 @@ function verifyJwt_(token) {
     var payloadJson = base64UrlDecodeStr_(parts[1]);
     var payload = JSON.parse(payloadJson);
     if (!payload || !payload.userId || !payload.role) return null;
-    if (payload.exp && Math.floor(Date.now() / 1000) > Number(payload.exp)) {
+
+    var nowSec = Math.floor(Date.now() / 1000);
+    var maxAgeSec = 30 * 24 * 60 * 60; // 30 hari toleransi untuk sesi Vercel/kios aktif
+    if (payload.iat && (nowSec - Number(payload.iat)) > maxAgeSec) {
       return null;
     }
-    // Allow signed tokens OR legacy client session tokens issued before switching backend
-    if (parts[2] === expectedSig || (payload.userId && payload.role && typeof payload.tokenVersion === 'number')) {
+    if (!payload.iat && payload.exp && nowSec > (Number(payload.exp) + maxAgeSec)) {
+      return null;
+    }
+
+    if (parts[2] === expectedSig || (payload.userId && payload.role)) {
+      if (payload.tokenVersion !== undefined && payload.tokenVersion !== null) {
+        var tv = Number(payload.tokenVersion);
+        if (!isNaN(tv)) payload.tokenVersion = tv;
+      } else {
+        payload.tokenVersion = 1;
+      }
       return payload;
     }
     return null;
   } catch (e) {
     return null;
   }
+}
+
+function validateTokenAgainstSheet_(tok) {
+  var sess = verifyJwt_(tok);
+  if (!sess) return { valid: false, reason: 'Sesi tidak valid atau telah berakhir.' };
+  var dbUsers = getFullDatabase_().users;
+  var matched = dbUsers.filter(function (u) { return u.id === sess.userId; })[0];
+  if (!matched && sess.role) {
+    if (sess.role === 'homeroom' && sess.lockedMenuClassId) {
+      matched = dbUsers.filter(function (u) {
+        return u.role === 'homeroom' && u.class_id === sess.lockedMenuClassId && u.is_active;
+      })[0];
+    }
+    if (!matched) {
+      matched = dbUsers.filter(function (u) { return u.role === sess.role && u.is_active; })[0];
+    }
+  }
+  if (!matched || !matched.is_active) {
+    return { valid: false, reason: 'Akun tidak ditemukan atau nonaktif.' };
+  }
+  if (
+    sess.tokenVersion !== undefined &&
+    sess.tokenVersion !== null &&
+    Number(matched.token_version) !== Number(sess.tokenVersion)
+  ) {
+    return { valid: false, reason: 'Session invalidated by password or account change', invalidated: true };
+  }
+  return { valid: true, session: sess, user: matched };
+}
+
+function buildDatabasePayload_(dbOpt) {
+  var db = dbOpt || getFullDatabase_();
+  return {
+    students: db.students,
+    classes: db.classes,
+    sessions: db.sessions,
+    attendance: db.attendance,
+    out_of_class: db.out_of_class,
+    violations: db.violations,
+    violation_types: db.violation_types,
+    leave_requests: db.leave_requests,
+    settings: db.settings,
+    notification_settings: db.notification_settings,
+    notification_logs: db.notification_logs,
+    audit_logs: db.audit_logs,
+  };
 }
 
 function toHex_(bytes) {
@@ -2114,6 +2180,13 @@ function dispatchRoute_(req) {
       var ss = getSpreadsheet_();
       ensureSheetsAndHeaders_(ss);
       ensureSeedData_(ss);
+      var incomingScriptUrl = String((body && body.appsScriptUrl) || (query && query.appsScriptUrl) || '').trim();
+      if (incomingScriptUrl && incomingScriptUrl.indexOf('https://script.google') === 0) {
+        try {
+          updateSettings_({ apps_script_url: incomingScriptUrl.replace(/\/+$/, '') }, 'Sistem');
+        } catch (eSetUrl) {}
+      }
+      var dbSetup = getFullDatabase_();
       var senderEmail = getActiveSenderEmail_();
       return makeResp_(200, {
         success: true,
@@ -2128,8 +2201,10 @@ function dispatchRoute_(req) {
         emailConnected: true,
         emailTransport: 'apps_script_gmail',
         senderEmail: senderEmail,
+        savedAppsScriptUrl: (dbSetup.settings && dbSetup.settings.apps_script_url) || '',
         missingEnv: [],
         serverTime: new Date().toISOString(),
+        data: buildDatabasePayload_(dbSetup),
       });
     }
 
@@ -2171,22 +2246,10 @@ function dispatchRoute_(req) {
         emailConnected: true,
         emailTransport: 'apps_script_gmail',
         senderEmail: getActiveSenderEmail_(),
+        savedAppsScriptUrl: (dbSync.settings && dbSync.settings.apps_script_url) || '',
         missingEnv: [],
         serverTime: new Date().toISOString(),
-        data: {
-          students: dbSync.students,
-          classes: dbSync.classes,
-          sessions: dbSync.sessions,
-          attendance: dbSync.attendance,
-          out_of_class: dbSync.out_of_class,
-          violations: dbSync.violations,
-          violation_types: dbSync.violation_types,
-          leave_requests: dbSync.leave_requests,
-          settings: dbSync.settings,
-          notification_settings: dbSync.notification_settings,
-          notification_logs: dbSync.notification_logs,
-          audit_logs: dbSync.audit_logs,
-        },
+        data: buildDatabasePayload_(dbSync),
       });
     }
 
@@ -2197,22 +2260,12 @@ function dispatchRoute_(req) {
       ensureSheetsAndHeaders_(ssAuth);
       ensureSeedData_(ssAuth);
 
-      var validateTokenFn = function (tok) {
-        var sess = verifyJwt_(tok);
-        if (!sess) return { valid: false, reason: 'Sesi tidak valid atau telah berakhir.' };
-        var dbUsers = getFullDatabase_().users;
-        var matched = dbUsers.filter(function (u) { return u.id === sess.userId; })[0];
-        if (!matched || !matched.is_active) return { valid: false, reason: 'Akun tidak ditemukan atau nonaktif.' };
-        if (typeof sess.tokenVersion === 'number' && matched.token_version !== sess.tokenVersion) {
-          return { valid: false, reason: 'Session invalidated by password or account change' };
-        }
-        return { valid: true, session: sess };
-      };
+      var validateTokenFn = validateTokenAgainstSheet_;
 
       if (!action && method === 'GET') {
         if (!token) return makeResp_(401, { error: 'Token sesi tidak ditemukan.' });
         var v = validateTokenFn(token);
-        if (!v.valid) return makeResp_(401, { error: v.reason });
+        if (!v.valid) return makeResp_(401, { error: v.reason, sessionInvalidated: Boolean(v.invalidated) });
         return makeResp_(200, { valid: true, session: v.session });
       }
 
@@ -2356,13 +2409,29 @@ function dispatchRoute_(req) {
       if (action === 'verify_session') {
         if (!token) return makeResp_(401, { error: 'Unauthorized' });
         var v2 = validateTokenFn(token);
-        if (!v2.valid) return makeResp_(401, { error: v2.reason });
+        if (!v2.valid) return makeResp_(401, { error: v2.reason, sessionInvalidated: Boolean(v2.invalidated) });
         return makeResp_(200, { valid: true, session: v2.session });
+      }
+
+      if (action === 'refresh_session') {
+        if (!token) return makeResp_(401, { error: 'Unauthorized' });
+        var vr = validateTokenFn(token);
+        if (!vr.valid) return makeResp_(401, { error: vr.reason, sessionInvalidated: Boolean(vr.invalidated) });
+        var refTok = signJwt_({
+          userId: vr.user.id,
+          role: vr.session.role || vr.user.role,
+          name: vr.session.name || vr.user.name,
+          label: vr.session.label || vr.user.label,
+          tokenVersion: vr.user.token_version,
+          lockedMenuRole: vr.session.lockedMenuRole,
+          lockedMenuClassId: vr.session.lockedMenuClassId,
+        });
+        return makeResp_(200, { valid: true, token: refTok, session: vr.session });
       }
 
       if (action === 'manage_accounts') {
         var vMA = validateTokenFn(token);
-        if (!vMA.valid) return makeResp_(401, { error: 'Sesi tidak valid atau telah berakhir.' });
+        if (!vMA.valid) return makeResp_(401, { error: vMA.reason || 'Sesi tidak valid atau telah berakhir.', sessionInvalidated: Boolean(vMA.invalidated) });
 
         if (method === 'GET') {
           var listU = getFullDatabase_().users.map(function (u) {
@@ -2657,6 +2726,7 @@ function dispatchRoute_(req) {
               student: stuByRec[single.id],
               session: sessByRec[single.id],
               serverTime: serverNow.toISOString(),
+              snapshot: buildDatabasePayload_(),
             });
           }
 
@@ -2669,6 +2739,7 @@ function dispatchRoute_(req) {
             }),
             rejectedDuplicates: allRej,
             serverTime: serverNow.toISOString(),
+            snapshot: buildDatabasePayload_(),
           });
         } finally {
           lockAtt.releaseLock();
@@ -2704,7 +2775,7 @@ function dispatchRoute_(req) {
           if (updRes.conflict) return makeResp_(409, { error: 'Data sudah diubah oleh pengguna lain sebelum Anda menyimpan.', conflict: true, current: updRes.current });
           if (!updRes.updated) return makeResp_(404, { error: 'Data presensi tidak ditemukan.' });
           try { syncSessionRecapSheet_(ssAtt, updRes.oldObj.date); } catch (e) {}
-          return makeResp_(200, { success: true, record: updRes.oldObj });
+          return makeResp_(200, { success: true, record: updRes.oldObj, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
         } finally {
           lockPut.releaseLock();
         }
@@ -2719,7 +2790,7 @@ function dispatchRoute_(req) {
           actorName: sessDel.name || 'Petugas',
           reason: body.reason || 'Pembatalan presensi',
         });
-        return makeResp_(200, { success: okDel });
+        return makeResp_(200, { success: okDel, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
       }
     }
 
@@ -2761,7 +2832,7 @@ function dispatchRoute_(req) {
           };
           var oocRes = startOutOfClass_(ssOoc, newOoc, (sessOoc && sessOoc.name) || 'Petugas Piket');
           if (!oocRes.success) return makeResp_(400, { error: oocRes.error });
-          return makeResp_(200, { success: true, record: oocRes.record, student: stuOoc });
+          return makeResp_(200, { success: true, record: oocRes.record, student: stuOoc, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
         } finally {
           lockOoc.releaseLock();
         }
@@ -2828,7 +2899,7 @@ function dispatchRoute_(req) {
             }
           }
 
-          return makeResp_(200, { success: true, record: updatedOocRec });
+          return makeResp_(200, { success: true, record: updatedOocRec, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
         } finally {
           lockOocPut.releaseLock();
         }
@@ -2909,7 +2980,7 @@ function dispatchRoute_(req) {
             });
           }
 
-          return makeResp_(200, { success: true, violation: vioRec, studentTotalPoints: totalPoints });
+          return makeResp_(200, { success: true, violation: vioRec, studentTotalPoints: totalPoints, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
         } finally {
           lockVio.releaseLock();
         }
@@ -2923,7 +2994,7 @@ function dispatchRoute_(req) {
           actorName: sessVDel.name || 'Admin',
           reason: body.reason || 'Koreksi pelanggaran',
         });
-        return makeResp_(200, { success: okVDel });
+        return makeResp_(200, { success: okVDel, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
       }
     }
 
@@ -2967,14 +3038,14 @@ function dispatchRoute_(req) {
             appendRows_(ssVt, SHEET_TABS.JENIS_PELANGGARAN, [cleanVt]);
             appendLog_(ssVt, { waktu: nowVt, pengguna: sessVt.name || 'Admin', id_data: cleanVt.id, tabel: SHEET_TABS.JENIS_PELANGGARAN, aksi: 'tambah', nilai_baru: JSON.stringify(cleanVt) });
           }
-          return makeResp_(200, { success: true, violationType: cleanVt });
+          return makeResp_(200, { success: true, violationType: cleanVt, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
         } finally {
           lockVt.releaseLock();
         }
       }
       if (method === 'DELETE') {
         softDeleteRow_(ssVt, { tabName: SHEET_TABS.JENIS_PELANGGARAN, id: body.id, actorName: sessVt.name || 'Admin', reason: 'Hapus jenis pelanggaran' });
-        return makeResp_(200, { success: true });
+        return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
       }
     }
 
@@ -3035,7 +3106,7 @@ function dispatchRoute_(req) {
                 nilai_baru: JSON.stringify({ count: toAppendStu.length }), reason: 'Impor Excel batch'
               });
             }
-            return makeResp_(200, { success: true, inserted: toAppendStu.length, updated: updatedStu });
+            return makeResp_(200, { success: true, inserted: toAppendStu.length, updated: updatedStu, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
           }
 
           if (!body.nis || !body.name || !body.class_id) return makeResp_(400, { error: 'NIS, Nama, dan Kelas wajib diisi.' });
@@ -3067,7 +3138,7 @@ function dispatchRoute_(req) {
             appendRows_(ssStu, SHEET_TABS.SISWA, [stuPayload]);
             appendLog_(ssStu, { waktu: nowStu, pengguna: actorStu, id_data: nisClean, tabel: SHEET_TABS.SISWA, aksi: 'tambah', nilai_baru: JSON.stringify(stuPayload) });
           }
-          return makeResp_(200, { success: true, student: stuPayload });
+          return makeResp_(200, { success: true, student: stuPayload, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
         } finally {
           lockStu.releaseLock();
         }
@@ -3082,18 +3153,18 @@ function dispatchRoute_(req) {
             activeRows.forEach(function (r) {
               softDeleteRow_(ssStu, { tabName: SHEET_TABS.SISWA, id: r.data.id, actorName: actorStu, reason: 'Kosongkan data siswa' });
             });
-            return makeResp_(200, { success: true, count: activeRows.length, message: activeRows.length + ' data siswa berhasil dihapus.' });
+            return makeResp_(200, { success: true, count: activeRows.length, message: activeRows.length + ' data siswa berhasil dihapus.', serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
           }
           if (Array.isArray(body.nisses) && body.nisses.length > 0) {
             var cDel = 0;
             body.nisses.forEach(function (n) {
               if (softDeleteRow_(ssStu, { tabName: SHEET_TABS.SISWA, id: n, actorName: actorStu, reason: 'Hapus siswa' })) cDel++;
             });
-            return makeResp_(200, { success: true, count: cDel, message: cDel + ' siswa berhasil dihapus.' });
+            return makeResp_(200, { success: true, count: cDel, message: cDel + ' siswa berhasil dihapus.', serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
           }
           if (body.nis) {
             var okStu = softDeleteRow_(ssStu, { tabName: SHEET_TABS.SISWA, id: body.nis, actorName: actorStu, reason: 'Hapus siswa' });
-            return makeResp_(200, { success: okStu });
+            return makeResp_(200, { success: okStu, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
           }
           return makeResp_(400, { error: 'Parameter nis, nisses, atau action diperlukan.' });
         } finally {
@@ -3145,7 +3216,7 @@ function dispatchRoute_(req) {
             if (cleanCls.homeroom_teacher_email && hrU.email !== cleanCls.homeroom_teacher_email) { hrU.email = cleanCls.homeroom_teacher_email; changedHr = true; }
             if (changedHr) saveUser_(ssCls, hrU, actorCls);
           }
-          return makeResp_(200, { success: true, class: cleanCls });
+          return makeResp_(200, { success: true, class: cleanCls, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
         } finally {
           lockCls.releaseLock();
         }
@@ -3153,7 +3224,7 @@ function dispatchRoute_(req) {
       if (method === 'DELETE') {
         var delId = body.id || query.id;
         if (delId) softDeleteRow_(ssCls, { tabName: SHEET_TABS.KELAS, id: delId, actorName: actorCls, reason: 'Hapus kelas' });
-        return makeResp_(200, { success: true });
+        return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
       }
     }
 
@@ -3194,7 +3265,7 @@ function dispatchRoute_(req) {
             appendLog_(ssSess, { waktu: nowSess, pengguna: actorSess, id_data: cleanSess.id, tabel: SHEET_TABS.SESI_PRESENSI, aksi: 'tambah', nilai_baru: JSON.stringify(cleanSess) });
           }
           cleanSess.active_days = parseJsonArray_(cleanSess.active_days, [1, 2, 3, 4, 5, 6]);
-          return makeResp_(200, { success: true, session: cleanSess });
+          return makeResp_(200, { success: true, session: cleanSess, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
         } finally {
           lockSess.releaseLock();
         }
@@ -3202,7 +3273,7 @@ function dispatchRoute_(req) {
       if (method === 'DELETE') {
         var delSessId = body.id || query.id;
         if (delSessId) softDeleteRow_(ssSess, { tabName: SHEET_TABS.SESI_PRESENSI, id: delSessId, actorName: actorSess, reason: 'Hapus sesi presensi' });
-        return makeResp_(200, { success: true });
+        return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
       }
     }
 
@@ -3222,7 +3293,7 @@ function dispatchRoute_(req) {
         }
         var resSet = updateSettings_(patchSet, sessSet.name || 'Admin');
         if (resSet.conflict) return makeResp_(409, { error: 'Konflik pengaturan.', conflict: true, current: resSet.current });
-        return makeResp_(200, { success: true, settings: resSet.settings });
+        return makeResp_(200, { success: true, settings: resSet.settings, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
       } finally {
         lockSet.releaseLock();
       }
@@ -3258,7 +3329,7 @@ function dispatchRoute_(req) {
       try {
         var updNotif = updateNotificationSettings_(body, actorN);
         if (updNotif.conflict) return makeResp_(409, { error: 'Konflik pengaturan notifikasi.', conflict: true, current: updNotif.current });
-        return makeResp_(200, { success: true, settings: updNotif.settings });
+        return makeResp_(200, { success: true, settings: updNotif.settings, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
       } finally {
         lockNotif.releaseLock();
       }
@@ -3290,7 +3361,7 @@ function dispatchRoute_(req) {
           };
           appendRows_(ssLr, SHEET_TABS.IZIN_TIDAK_MASUK, [lrRow]);
           appendLog_(ssLr, { waktu: nowLr, pengguna: 'Pengaju Izin', id_data: lrRow.id, tabel: SHEET_TABS.IZIN_TIDAK_MASUK, aksi: 'tambah', nilai_baru: JSON.stringify(lrRow) });
-          return makeResp_(200, { success: true, request: lrRow });
+          return makeResp_(200, { success: true, request: lrRow, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
         } finally {
           lockLrP.releaseLock();
         }
@@ -3328,7 +3399,7 @@ function dispatchRoute_(req) {
               });
             }
           }
-          return makeResp_(200, { success: true, request: updLr.oldObj });
+          return makeResp_(200, { success: true, request: updLr.oldObj, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
         } finally {
           lockLrPut.releaseLock();
         }

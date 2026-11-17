@@ -12,6 +12,7 @@ import {
   ChevronDown,
   ChevronUp,
   Edit3,
+  Share2,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
 import appsScriptSource from '../../../apps-script/Code.gs?raw';
@@ -51,6 +52,8 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
     }
   }, [appsScriptUrl]);
 
+  const [copiedLink, setCopiedLink] = useState(false);
+
   const handleCopyCode = async () => {
     try {
       await navigator.clipboard.writeText(appsScriptSource);
@@ -59,6 +62,19 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
       setTimeout(() => setCopied(false), 2500);
     } catch {
       showToast('Gagal menyalin otomatis. Gunakan tombol Unduh Code.gs.', 'error');
+    }
+  };
+
+  const handleCopyDeviceLink = async () => {
+    if (!appsScriptUrl || typeof window === 'undefined') return;
+    const shareUrl = `${window.location.origin}/?script=${encodeURIComponent(appsScriptUrl)}`;
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      setCopiedLink(true);
+      showToast('Link sinkronisasi otomatis perangkat disalin! Buka link ini di perangkat lain agar langsung tersambung.', 'success');
+      setTimeout(() => setCopiedLink(false), 2500);
+    } catch {
+      showToast(`Salin link berikut: ${shareUrl}`, 'info');
     }
   };
 
@@ -154,7 +170,16 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
         </div>
 
         {isConnected && (
-          <div className="flex items-center gap-1.5 shrink-0 self-start sm:self-center">
+          <div className="flex flex-wrap items-center gap-1.5 shrink-0 self-start sm:self-center">
+            <button
+              type="button"
+              onClick={handleCopyDeviceLink}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-900 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 font-semibold text-[11px]"
+              title="Salin link Vercel dengan koneksi Apps Script otomatis untuk perangkat/browser lain"
+            >
+              {copiedLink ? <CheckCircle2 className="w-3 h-3" /> : <Share2 className="w-3 h-3" />}
+              <span>{copiedLink ? 'Link Disalin' : 'Link Perangkat'}</span>
+            </button>
             <button
               type="button"
               onClick={() => setShowUrlEditor((v) => !v)}
@@ -185,7 +210,7 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
             </span>
           </div>
           <span className="text-[10px] font-semibold text-emerald-700 dark:text-emerald-300 shrink-0">
-            Siap Pakai
+            Sinkron Otomatis Aktif
           </span>
         </div>
       )}
@@ -249,7 +274,7 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
               Pilih fungsi <code className="px-1 py-0.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-mono">setupAppsScript</code> lalu klik <strong>Jalankan</strong> &amp; izinkan akses (Sheets, Drive, dan GmailApp) menggunakan akun <span className="font-mono">kswsmp.puncakdarussalam@gmail.com</span>.
             </li>
             <li>
-              Klik <strong>Terapkan (Deploy) → Deployment baru → Jenis: Aplikasi web</strong>. Atur <em>Jalankan sebagai</em> = <strong>Saya</strong> dan <em>Yang memiliki akses</em> = <strong>Siapa saja (Anyone)</strong>, lalu tempel URL Web App (<code className="font-mono">https://script.google.com/macros/s/.../exec</code>) satu kali di bawah ini.
+              Klik <strong>Terapkan (Deploy) → Deployment baru → Jenis: Aplikasi web</strong> (atau jika memperbarui kode, pilih <strong>Kelola deployment → Edit → Versi baru</strong>). Atur <em>Jalankan sebagai</em> = <strong>Saya</strong> dan <em>Yang memiliki akses</em> = <strong>Siapa saja (Anyone)</strong>, lalu tempel URL berakhiran <code className="font-mono">/exec</code> satu kali di bawah ini (jangan gunakan URL <code className="font-mono">/dev</code>).
             </li>
           </ol>
         </div>

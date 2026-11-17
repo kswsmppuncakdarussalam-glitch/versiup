@@ -5,11 +5,17 @@
  */
 
 const APPS_SCRIPT_URL_KEY = 'dkb_apps_script_url';
+const SESSION_STORAGE_KEY = 'dkb_session';
 
 export function normalizeAppsScriptUrl(raw?: string | null): string {
   const trimmed = (raw || '').trim();
   if (!trimmed) return '';
   return trimmed.replace(/\/+$/, '');
+}
+
+export function isAppsScriptDevUrl(raw?: string | null): boolean {
+  const clean = normalizeAppsScriptUrl(raw);
+  return /\/dev(?:[?#].*)?$/i.test(clean);
 }
 
 export function isValidAppsScriptUrl(raw?: string | null): boolean {
@@ -24,14 +30,55 @@ export function isValidAppsScriptUrl(raw?: string | null): boolean {
   }
 }
 
+export function captureAppsScriptUrlFromLocation(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    const currentUrl = new URL(window.location.href);
+    let paramUrl =
+      currentUrl.searchParams.get('script') ||
+      currentUrl.searchParams.get('appsScript') ||
+      currentUrl.searchParams.get('apps_script') ||
+      '';
+
+    if (!paramUrl && currentUrl.hash) {
+      const hashQuery = currentUrl.hash.replace(/^#/, '');
+      const hashParams = new URLSearchParams(hashQuery);
+      paramUrl =
+        hashParams.get('script') ||
+        hashParams.get('appsScript') ||
+        hashParams.get('apps_script') ||
+        '';
+    }
+
+    const normalized = normalizeAppsScriptUrl(paramUrl);
+    if (normalized && isValidAppsScriptUrl(normalized) && !isAppsScriptDevUrl(normalized)) {
+      setAppsScriptUrl(normalized);
+      currentUrl.searchParams.delete('script');
+      currentUrl.searchParams.delete('appsScript');
+      currentUrl.searchParams.delete('apps_script');
+      if (currentUrl.hash && /(?:script|appsScript|apps_script)=/i.test(currentUrl.hash)) {
+        currentUrl.hash = '';
+      }
+      try {
+        window.history.replaceState({}, document.title, currentUrl.toString());
+      } catch {}
+      return normalized;
+    }
+  } catch {}
+  return '';
+}
+
 export function getAppsScriptUrl(): string {
+  const fromLocation = captureAppsScriptUrlFromLocation();
+  if (fromLocation) return fromLocation;
+
   try {
     const stored = normalizeAppsScriptUrl(localStorage.getItem(APPS_SCRIPT_URL_KEY));
-    if (stored) return stored;
+    if (stored && !isAppsScriptDevUrl(stored)) return stored;
   } catch {}
   try {
     const sessionStored = normalizeAppsScriptUrl(sessionStorage.getItem(APPS_SCRIPT_URL_KEY));
-    if (sessionStored) {
+    if (sessionStored && !isAppsScriptDevUrl(sessionStored)) {
       try {
         localStorage.setItem(APPS_SCRIPT_URL_KEY, sessionStored);
       } catch {}
@@ -70,6 +117,19 @@ export function clearAppsScriptUrl(): void {
   } catch {}
 }
 
+function getStoredSessionToken(): string {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return '';
+    const parsed = JSON.parse(raw);
+    const tok = typeof parsed?.token === 'string' ? parsed.token.trim() : '';
+    if (!tok || tok === 'null' || tok === 'undefined') return '';
+    return tok;
+  } catch {
+    return '';
+  }
+}
+
 export async function fetchServerAppsScriptUrl(): Promise<string> {
   try {
     const res = await fetch('/api/apps-script-config', {
@@ -79,7 +139,7 @@ export async function fetchServerAppsScriptUrl(): Promise<string> {
     if (!res.ok) return '';
     const data = await res.json().catch(() => ({}));
     const url = normalizeAppsScriptUrl(data?.appsScriptUrl);
-    return isValidAppsScriptUrl(url) ? url : '';
+    return isValidAppsScriptUrl(url) && !isAppsScriptDevUrl(url) ? url : '';
   } catch {
     return '';
   }
@@ -154,7 +214,7 @@ function createSyntheticJsonResponse(payload: any, httpStatusFallback = 200): Re
 /**
  * Drop-in replacement for window.fetch('/api/...', init) that automatically
  * dispatches to Google Apps Script Web App when configured, using CORS simple requests
- * (Content-Type: text/plain;charset=utf-8) so Apps Script does not fail on preflight OPTIONS.
+ * (Content-Type: text/plain;charset=utf-8, credentials: omit) so Apps Script does not fail on preflight OPTIONS.
  */
 export async function apiFetch(
   inputUrl: string,
@@ -165,14 +225,23 @@ export async function apiFetch(
     ? ''
     : normalizeAppsScriptUrl(options.appsScriptUrlOverride ?? getAppsScriptUrl());
 
+  const authHeader = getHeaderValue(init.headers, 'authorization');
+  const explicitToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : authHeader.trim();
+  const fallbackToken = explicitToken && explicitToken !== 'null' && explicitToken !== 'undefined'
+    ? explicitToken
+    : getStoredSessionToken();
+
   if (!scriptUrl || !inputUrl.startsWith('/api')) {
+    if (fallbackToken && !authHeader && inputUrl.startsWith('/api')) {
+      const nextHeaders = new Headers(init.headers || {});
+      nextHeaders.set('Authorization', `Bearer ${fallbackToken}`);
+      return fetch(inputUrl, { ...init, headers: nextHeaders });
+    }
     return fetch(inputUrl, init);
   }
 
   const method = (init.method || 'GET').toUpperCase();
   const { route, query } = parseUrlAndQuery(inputUrl);
-  const authHeader = getHeaderValue(init.headers, 'authorization');
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : authHeader.trim();
 
   let parsedBody: any = undefined;
   if (typeof init.body === 'string' && init.body.trim()) {
@@ -189,14 +258,16 @@ export async function apiFetch(
     route,
     method,
     query,
-    token,
+    token: fallbackToken,
     body: parsedBody,
   };
 
-  // Use text/plain;charset=utf-8 to avoid browser CORS preflight (Apps Script has no doOptions)
+  // Use text/plain;charset=utf-8 + credentials:'omit' for reliable cross-origin Apps Script POST from Vercel
   const res = await fetch(scriptUrl, {
     method: 'POST',
     mode: 'cors',
+    credentials: 'omit',
+    cache: 'no-store',
     redirect: 'follow',
     headers: {
       'Content-Type': 'text/plain;charset=utf-8',
@@ -205,16 +276,23 @@ export async function apiFetch(
   });
 
   const rawText = await res.text();
-  let jsonData: any = {};
+  let jsonData: any = null;
   try {
     jsonData = rawText ? JSON.parse(rawText) : {};
   } catch {
     const looksHtml = rawText.trim().startsWith('<');
-    throw new Error(
-      looksHtml
-        ? 'URL Google Apps Script mengembalikan HTML (bukan JSON). Pastikan Web App di-deploy dengan akses "Siapa saja (Anyone)" dan menggunakan URL /exec.'
-        : 'Respons Google Apps Script tidak valid.'
-    );
+    if (res.status === 401 || res.status === 403 || looksHtml) {
+      return createSyntheticJsonResponse(
+        {
+          _status: res.status === 401 || res.status === 403 ? 401 : 502,
+          googleDeploymentUnauthorized: true,
+          error:
+            'Google Apps Script menolak akses (401 Unauthorized / HTML). Pastikan Web App di-deploy dengan URL /exec, "Jalankan sebagai: Saya", dan "Yang memiliki akses: Siapa saja (Anyone)".',
+        },
+        401
+      );
+    }
+    throw new Error('Respons Google Apps Script tidak valid.');
   }
 
   return createSyntheticJsonResponse(jsonData, res.status);
@@ -230,9 +308,23 @@ export async function testAppsScriptConnection(
       message: 'URL harus berupa alamat Web App Google Apps Script HTTPS yang valid (https://script.google.com/macros/s/.../exec).',
     };
   }
+  if (isAppsScriptDevUrl(cleanUrl)) {
+    return {
+      ok: false,
+      message: 'URL berakhiran /dev adalah tautan uji coba pribadi dan selalu memicu 401 Unauthorized. Gunakan URL Deployment Produksi yang berakhiran /exec dengan akses "Siapa saja (Anyone)".',
+    };
+  }
 
   try {
-    const res = await apiFetch('/api/setup', { method: 'GET' }, { appsScriptUrlOverride: cleanUrl });
+    const res = await apiFetch(
+      '/api/setup',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ appsScriptUrl: cleanUrl }),
+      },
+      { appsScriptUrlOverride: cleanUrl }
+    );
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.success) {
       return {

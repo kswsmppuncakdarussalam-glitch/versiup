@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Eye, EyeOff, Lock, ShieldAlert, GraduationCap, Sliders, AlertCircle, X, CheckCircle2, LogOut, Terminal } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
 import { DriveImage } from '../common/DriveImage.js';
@@ -23,7 +23,17 @@ export const DutyLoginScreen: React.FC = () => {
     envStatus,
   } = useApp();
   const [selectedRole, setSelectedRole] = useState<'duty' | 'homeroom' | 'student_affairs' | 'admin'>('duty');
-  const [showAppsScriptBox, setShowAppsScriptBox] = useState<boolean>(Boolean(appsScriptUrl));
+  const [showAppsScriptBox, setShowAppsScriptBox] = useState<boolean>(
+    () => Boolean(appsScriptUrl) || !envStatus.hasServiceAccount
+  );
+  const autoOpenedRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    if (!autoOpenedRef.current && !appsScriptUrl && !envStatus.hasServiceAccount && !googleAccessToken) {
+      setShowAppsScriptBox(true);
+      autoOpenedRef.current = true;
+    }
+  }, [appsScriptUrl, envStatus.hasServiceAccount, googleAccessToken]);
 
   // Input states
   const [password, setPassword] = useState('');

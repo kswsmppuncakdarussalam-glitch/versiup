@@ -4,7 +4,7 @@ import { sheetsDb } from './sheets.ts';
 import type { UserRole } from './types.ts';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'disiplin-kita-bisa-secure-secret-key-2026';
-const TOKEN_EXPIRY = '12h';
+const TOKEN_EXPIRY = '30d';
 
 // Rate limiting & lockout for Duty login (5 failed attempts -> 5 min lock)
 interface LockoutInfo {
@@ -289,23 +289,41 @@ export class AuthService {
   /**
    * Async session validation that verifies token_version from database
    */
-  async validateActiveSession(token: string): Promise<{ valid: boolean; session?: SessionPayload; reason?: string }> {
-    const session = this.verifyToken(token);
+  async validateActiveSession(token: string): Promise<{ valid: boolean; session?: SessionPayload; reason?: string; user?: any; invalidated?: boolean }> {
+    const cleanTok = String(token || '').replace(/^Bearer\s+/i, '').trim();
+    if (!cleanTok || cleanTok === 'undefined' || cleanTok === 'null') {
+      return { valid: false, reason: 'Token sesi tidak ditemukan' };
+    }
+    const session = this.verifyToken(cleanTok);
     if (!session) {
       return { valid: false, reason: 'Invalid or expired token' };
     }
 
     const users = await sheetsDb.getUsers();
-    const user = users.find((u) => u.id === session.userId);
+    let user = users.find((u) => u.id === session.userId);
+    if (!user && session.role) {
+      if (session.role === 'homeroom' && session.lockedMenuClassId) {
+        user = users.find(
+          (u) => u.role === 'homeroom' && u.class_id === session.lockedMenuClassId && u.is_active
+        );
+      }
+      if (!user) {
+        user = users.find((u) => u.role === session.role && u.is_active);
+      }
+    }
     if (!user || !user.is_active) {
       return { valid: false, reason: 'User not found or inactive' };
     }
 
-    if (typeof session.tokenVersion === 'number' && user.token_version !== session.tokenVersion) {
-      return { valid: false, reason: 'Session invalidated by password or account change' };
+    if (
+      session.tokenVersion !== undefined &&
+      session.tokenVersion !== null &&
+      Number(user.token_version) !== Number(session.tokenVersion)
+    ) {
+      return { valid: false, reason: 'Session invalidated by password or account change', invalidated: true };
     }
 
-    return { valid: true, session };
+    return { valid: true, session, user };
   }
 }
 
