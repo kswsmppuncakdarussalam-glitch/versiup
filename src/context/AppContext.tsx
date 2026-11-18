@@ -65,6 +65,7 @@ export interface OfflineAttendanceScan {
 }
 
 const OFFLINE_SCANS_KEY = 'dkb_offline_attendance_scans';
+const DB_CACHE_KEY = 'dkb_db_cache_v1';
 const SYNC_BROADCAST_CHANNEL = 'dkb_sync_channel';
 const REALTIME_SYNC_COOLDOWN_MS = 350;
 const FULL_RECONCILE_INTERVAL_MS = 15000;
@@ -316,6 +317,40 @@ function writeOfflineScans(list: OfflineAttendanceScan[]): void {
   } catch {}
 }
 
+interface CachedDbPayload {
+  rev?: string;
+  serverTime?: string;
+  data?: Record<string, any>;
+}
+
+function readLocalDbCache(): CachedDbPayload | null {
+  try {
+    const raw = localStorage.getItem(DB_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && parsed.data && typeof parsed.data === 'object') {
+      return parsed as CachedDbPayload;
+    }
+  } catch {}
+  return null;
+}
+
+function writeLocalDbCache(payload: CachedDbPayload): void {
+  if (!payload?.data) return;
+  try {
+    localStorage.setItem(DB_CACHE_KEY, JSON.stringify(payload));
+  } catch {
+    try {
+      const compactData = {
+        ...payload.data,
+        audit_logs: Array.isArray(payload.data.audit_logs) ? payload.data.audit_logs.slice(0, 80) : [],
+        notification_logs: Array.isArray(payload.data.notification_logs) ? payload.data.notification_logs.slice(0, 80) : [],
+      };
+      localStorage.setItem(DB_CACHE_KEY, JSON.stringify({ ...payload, data: compactData }));
+    } catch {}
+  }
+}
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [session, setSession] = useState<AuthSession | null>(() => {
     try {
@@ -358,22 +393,33 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [saveStatus, setSaveStatus] = useState<SaveStatusState>({ state: 'idle', message: '' });
   const saveResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const [isInitialLoading, setIsInitialLoading] = useState<boolean>(true);
+  const initialDbCacheRef = useRef<CachedDbPayload | null | undefined>(undefined);
+  if (initialDbCacheRef.current === undefined) {
+    initialDbCacheRef.current = readLocalDbCache();
+    if (initialDbCacheRef.current?.serverTime) {
+      setServerClockOffset(initialDbCacheRef.current.serverTime);
+    }
+  }
+  const cachedInitData = initialDbCacheRef.current?.data;
+
+  const [isInitialLoading, setIsInitialLoading] = useState<boolean>(
+    () => !(Boolean(cachedInitData) || hasCompleteAppsScriptConfig())
+  );
   const [initialLoadError, setInitialLoadError] = useState<string | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
   const [missingEnv, setMissingEnv] = useState<string[]>(() => getMissingClientConfig());
-  const [envStatus, setEnvStatus] = useState<EnvConfigStatus>({
-    configured: false,
-    sheetsConfigured: false,
-    driveConfigured: false,
-    spreadsheetConfigured: false,
-    driveFolderConfigured: false,
-    authMode: 'unconfigured',
-    emailConnected: false,
-    emailTransport: 'unconfigured',
+  const [envStatus, setEnvStatus] = useState<EnvConfigStatus>(() => ({
+    configured: Boolean(cachedInitData) || hasCompleteAppsScriptConfig(),
+    sheetsConfigured: Boolean(cachedInitData),
+    driveConfigured: Boolean(cachedInitData),
+    spreadsheetConfigured: Boolean(cachedInitData),
+    driveFolderConfigured: Boolean(cachedInitData),
+    authMode: hasCompleteAppsScriptConfig() ? 'apps_script' : 'unconfigured',
+    emailConnected: Boolean(cachedInitData),
+    emailTransport: hasCompleteAppsScriptConfig() ? 'apps_script_gmail' : 'unconfigured',
     senderEmail: '',
     missingEnv: getMissingClientConfig(),
-  });
+  }));
   const [appsScriptUrl, setAppsScriptUrlState] = useState<string>(() => getAppsScriptUrl());
   const [appsScriptSecretConfigured, setAppsScriptSecretConfigured] = useState<boolean>(() =>
     hasAppsScriptSecretToken()
@@ -386,7 +432,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [conflictPrompt, setConflictPrompt] = useState<ConflictState | null>(null);
   const dismissConflictPrompt = useCallback(() => setConflictPrompt(null), []);
 
-  const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
+  const [lastSyncTime, setLastSyncTime] = useState<Date | null>(
+    () => (cachedInitData ? new Date() : null)
+  );
   const [currentServerTime, setCurrentServerTime] = useState<Date>(getServerNow());
   const [isKioskFullscreen, setIsKioskFullscreen] = useState<boolean>(false);
   const [pendingOfflineScansCount, setPendingOfflineScansCount] = useState<number>(() => readOfflineScans().length);
@@ -406,26 +454,55 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const prevLiveSessionIdRef = useRef<string | null>(null);
   const prevLiveSessionNameRef = useRef<string | null>(null);
 
-  // Domain States (Read directly from Google Sheets)
-  const [settings, setSettings] = useState<AppSettings>(defaultSettings);
-  const [classes, setClasses] = useState<SchoolClass[]>([]);
-  const [sessions, setSessions] = useState<AttendanceSession[]>([]);
-  const [students, setStudents] = useState<Student[]>([]);
-  const [violationTypes, setViolationTypes] = useState<ViolationType[]>([]);
-  const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
-  const [outOfClass, setOutOfClass] = useState<OutOfClassRecord[]>([]);
-  const [violations, setViolations] = useState<ViolationRecord[]>([]);
-  const [leaveRequests, setLeaveRequests] = useState<LeaveRequest[]>([]);
-  const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(defaultNotificationSettings);
-  const [notificationLogs, setNotificationLogs] = useState<NotificationLog[]>([]);
-  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  // Domain States (Hydrated synchronously from local snapshot cache, reconciled with Google Sheets)
+  const [settings, setSettings] = useState<AppSettings>(() =>
+    cachedInitData?.settings ? { ...defaultSettings, ...cachedInitData.settings } : defaultSettings
+  );
+  const [classes, setClasses] = useState<SchoolClass[]>(() =>
+    Array.isArray(cachedInitData?.classes) ? cachedInitData.classes : []
+  );
+  const [sessions, setSessions] = useState<AttendanceSession[]>(() =>
+    Array.isArray(cachedInitData?.sessions) ? cachedInitData.sessions : []
+  );
+  const [students, setStudents] = useState<Student[]>(() =>
+    Array.isArray(cachedInitData?.students) ? cachedInitData.students : []
+  );
+  const [violationTypes, setViolationTypes] = useState<ViolationType[]>(() =>
+    Array.isArray(cachedInitData?.violation_types) ? cachedInitData.violation_types : []
+  );
+  const [attendance, setAttendance] = useState<AttendanceRecord[]>(() =>
+    Array.isArray(cachedInitData?.attendance) ? cachedInitData.attendance : []
+  );
+  const [outOfClass, setOutOfClass] = useState<OutOfClassRecord[]>(() =>
+    Array.isArray(cachedInitData?.out_of_class) ? cachedInitData.out_of_class : []
+  );
+  const [violations, setViolations] = useState<ViolationRecord[]>(() =>
+    Array.isArray(cachedInitData?.violations) ? cachedInitData.violations : []
+  );
+  const [leaveRequests, setLeaveRequests] = useState<LeaveRequest[]>(() =>
+    Array.isArray(cachedInitData?.leave_requests) ? cachedInitData.leave_requests : []
+  );
+  const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(() =>
+    cachedInitData?.notification_settings
+      ? { ...defaultNotificationSettings, ...cachedInitData.notification_settings }
+      : defaultNotificationSettings
+  );
+  const [notificationLogs, setNotificationLogs] = useState<NotificationLog[]>(() =>
+    Array.isArray(cachedInitData?.notification_logs) ? cachedInitData.notification_logs : []
+  );
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>(() =>
+    Array.isArray(cachedInitData?.audit_logs) ? cachedInitData.audit_logs : []
+  );
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
 
   const isFetchingRef = useRef<boolean>(false);
   const latestMutationSeqRef = useRef<number>(0);
   const pendingRefreshAfterWriteRef = useRef<boolean>(false);
+  const pendingWriteCountRef = useRef<number>(0);
+  const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const latestModifiedByEntityKeyRef = useRef<Record<string, string>>({});
   const hasHydratedConfigRef = useRef<boolean>(false);
-  const lastKnownRevRef = useRef<string>('');
+  const lastKnownRevRef = useRef<string>(String(initialDbCacheRef.current?.rev || ''));
   const lastFullSyncAtRef = useRef<number>(0);
   const consecutiveSyncErrorsRef = useRef<number>(0);
   const inFlightOptimisticIdsRef = useRef<Set<string>>(new Set());
@@ -440,6 +517,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         | 'DATA_MUTATED'
         | 'DATA_SNAPSHOT'
         | 'DATA_OPTIMISTIC_ATTENDANCE'
+        | 'DATA_OPTIMISTIC_OUT_OF_CLASS'
+        | 'DATA_OPTIMISTIC_VIOLATION'
         | 'APPS_SCRIPT_CHANGED',
       payload?: any
     ) => {
@@ -622,6 +701,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (Array.isArray(d.audit_logs)) setAuditLogs(d.audit_logs);
     setLastSyncTime(new Date());
     setSyncStatus('synced');
+    writeLocalDbCache({ rev: rev || lastKnownRevRef.current, serverTime, data: d });
   }, []);
 
   const clearExpiredAppSession = useCallback(
@@ -809,6 +889,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return;
       }
 
+      if (pendingWriteCountRef.current > 0 && !options?.forceFull) {
+        return;
+      }
+
       isFetchingRef.current = true;
       if (options?.afterWrite) {
         pendingRefreshAfterWriteRef.current = false;
@@ -825,11 +909,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           setAppsScriptUrlState(hydrated.appsScriptUrl);
           setAppsScriptSecretConfigured(Boolean(hydrated.secretToken));
           setIsAppsScriptLockedState(hydrated.locked);
+          if (hydrated.appsScriptUrl && hydrated.secretToken) {
+            // Segera buka layar login begitu URL & token terhidrasi tanpa menunggu snapshot penuh 13 tab
+            setIsInitialLoading(false);
+          }
         } else {
           const curUrl = getAppsScriptUrl();
           if (curUrl) setAppsScriptUrlState(curUrl);
           setAppsScriptSecretConfigured(hasAppsScriptSecretToken());
           setIsAppsScriptLockedState(isAppsScriptConfigLocked());
+          setIsInitialLoading(false);
         }
 
         const clientMissing = getMissingClientConfig();
@@ -857,17 +946,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         const nowMs = Date.now();
+        const isPeriodicReconcile =
+          Boolean(lastKnownRevRef.current) &&
+          !options?.afterWrite &&
+          !options?.forceFull &&
+          nowMs - lastFullSyncAtRef.current >= FULL_RECONCILE_INTERVAL_MS;
         const needsFullReconcile =
           Boolean(options?.forceFull) ||
           Boolean(options?.afterWrite) ||
           !lastKnownRevRef.current ||
-          nowMs - lastFullSyncAtRef.current >= FULL_RECONCILE_INTERVAL_MS;
+          isPeriodicReconcile;
 
         const syncParams = new URLSearchParams();
         if (!needsFullReconcile && lastKnownRevRef.current) {
           syncParams.set('rev', lastKnownRevRef.current);
         } else {
           syncParams.set('full', '1');
+          if (isPeriodicReconcile) {
+            syncParams.set('fresh', '1');
+          }
         }
         const syncEndpoint = `/api/sync?${syncParams.toString()}`;
 
@@ -876,8 +973,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
         const data = await res.json().catch(() => ({}));
 
-        // Abaikan snapshot lama bila ada penulisan yang baru dimulai
-        if (latestMutationSeqRef.current > fetchStartMutationSeq) {
+        // Abaikan snapshot lama bila ada penulisan atau antrean optimistik yang masih berjalan
+        if (latestMutationSeqRef.current > fetchStartMutationSeq || pendingWriteCountRef.current > 0) {
           pendingRefreshAfterWriteRef.current = true;
           return;
         }
@@ -1207,7 +1304,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     const bootSync = async () => {
-      await refreshFromSheets(false, { forceFull: true });
+      const hasCachedRev = Boolean(lastKnownRevRef.current);
+      await refreshFromSheets(hasCachedRev);
       await flushOfflineAttendanceScans();
       if (sessionRef.current?.token) {
         void refreshAuthSessionIfNeeded(false);
@@ -1235,6 +1333,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             const optRec = msg.payload.record as AttendanceRecord;
             setAttendance((prev) =>
               prev.some((a) => a.id === optRec.id) ? prev : [optRec, ...prev]
+            );
+          } else if (msg.type === 'DATA_OPTIMISTIC_OUT_OF_CLASS' && msg.payload?.record) {
+            const optOoc = msg.payload.record as OutOfClassRecord;
+            setOutOfClass((prev) =>
+              prev.some((o) => o.id === optOoc.id) ? prev : [optOoc, ...prev]
+            );
+          } else if (msg.type === 'DATA_OPTIMISTIC_VIOLATION' && msg.payload?.violation) {
+            const optVio = msg.payload.violation as ViolationRecord;
+            setViolations((prev) =>
+              prev.some((v) => v.id === optVio.id) ? prev : [optVio, ...prev]
             );
           } else if (msg.type === 'DATA_MUTATED') {
             void refreshFromSheets(true, { afterWrite: true, forceFull: true });
@@ -1545,12 +1653,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       url: string;
       method: 'POST' | 'PUT' | 'DELETE';
       body: any;
+      entityKey?: string;
       conflictTitle?: string;
       applyOptimistic?: () => () => void;
       onSuccess?: (data: any) => void;
       successMessage?: string;
       silentToast?: boolean;
-    }): Promise<{ ok: boolean; data?: any; error?: string }> => {
+      optimisticReturn?: boolean;
+      optimisticData?: any;
+      onOptimisticBroadcast?: () => void;
+    }): Promise<{ ok: boolean; optimistic?: boolean; data?: any; error?: string }> => {
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         const offlineMsg = 'Tidak ada koneksi internet. Operasi edit/simpan data memerlukan koneksi ke Google Sheets.';
         setSaveErrorState(offlineMsg);
@@ -1559,8 +1671,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       const rollbackOptimistic = params.applyOptimistic ? params.applyOptimistic() : undefined;
+      const shouldReturnOptimistic = Boolean(params.applyOptimistic) && params.optimisticReturn !== false;
+
       setSavingState();
       latestMutationSeqRef.current += 1;
+
+      if (shouldReturnOptimistic) {
+        params.onOptimisticBroadcast?.();
+      }
 
       const execute = async (
         forceOverwrite = false,
@@ -1568,7 +1686,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         overrideAppToken?: string
       ): Promise<{ ok: boolean; data?: any; error?: string }> => {
         try {
-          const payload = forceOverwrite ? { ...params.body, forceOverwrite: true } : params.body;
+          let baseBody = params.body;
+          if (
+            !forceOverwrite &&
+            params.entityKey &&
+            latestModifiedByEntityKeyRef.current[params.entityKey] &&
+            baseBody &&
+            typeof baseBody === 'object'
+          ) {
+            baseBody = {
+              ...baseBody,
+              expected_updated_at: latestModifiedByEntityKeyRef.current[params.entityKey],
+            };
+          }
+          const payload = forceOverwrite ? { ...baseBody, forceOverwrite: true } : baseBody;
           const res = await apiFetch(params.url, {
             method: params.method,
             headers: buildApiHeaders({ 'Content-Type': 'application/json' }, overrideAppToken),
@@ -1591,10 +1722,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             rollbackOptimistic?.();
             const authErr = data.error || 'Sesi login telah berakhir. Silakan masuk kembali.';
             setSaveErrorState(authErr);
+            if (shouldReturnOptimistic) showToast(authErr, 'error');
             return { ok: false, error: authErr, data };
           }
 
           if (res.status === 409 && data.conflict) {
+            if (params.entityKey && data.current?.diubah_pada) {
+              latestModifiedByEntityKeyRef.current[params.entityKey] = String(data.current.diubah_pada);
+            }
             rollbackOptimistic?.();
             const msg = data.error || 'Data sudah diubah oleh pengguna lain sebelum Anda menyimpan.';
             setSaveErrorState('Konflik edit terdeteksi');
@@ -1620,47 +1755,92 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
           if (!res.ok) {
             rollbackOptimistic?.();
+            soundEffects.playErrorBeep();
             const errMsg = data.error || `Gagal menyimpan data (${res.status})`;
             setSaveErrorState(errMsg);
-            if (!params.silentToast) showToast(errMsg, 'error');
+            if (!params.silentToast || shouldReturnOptimistic) showToast(errMsg, 'error');
             return { ok: false, error: errMsg, data };
           }
 
-          if (data.snapshot) {
+          if (params.entityKey) {
+            const nextChangedAt =
+              data.record?.diubah_pada ||
+              data.student?.diubah_pada ||
+              data.class?.diubah_pada ||
+              data.session?.diubah_pada ||
+              data.violationType?.diubah_pada ||
+              data.violation?.diubah_pada ||
+              data.settings?.diubah_pada ||
+              data.request?.diubah_pada;
+            if (nextChangedAt) {
+              latestModifiedByEntityKeyRef.current[params.entityKey] = String(nextChangedAt);
+            }
+          }
+
+          const isLastQueuedWrite = pendingWriteCountRef.current <= 1;
+
+          if (data.snapshot && isLastQueuedWrite) {
             applyDatabaseSnapshot(data.snapshot, data.serverTime, data.rev);
             broadcastSyncEvent('DATA_SNAPSHOT', {
               snapshot: data.snapshot,
               serverTime: data.serverTime,
               rev: data.rev,
             });
-          } else {
+          } else if (!data.snapshot) {
             if (params.url === '/api/settings' && data.settings) {
               setSettings((prev) => ({ ...prev, ...data.settings }));
             } else if (params.url === '/api/notifications' && data.settings) {
               setNotificationSettings((prev) => ({ ...prev, ...data.settings }));
             }
-            broadcastSyncEvent('DATA_MUTATED');
+            if (isLastQueuedWrite) {
+              broadcastSyncEvent('DATA_MUTATED');
+            }
           }
 
-          setSavedState('Tersimpan');
+          if (isLastQueuedWrite) {
+            setSavedState('Tersimpan');
+          }
           if (params.onSuccess) params.onSuccess(data);
           if (params.successMessage && !params.silentToast) {
             showToast(params.successMessage, 'success');
           }
-          if (!data.snapshot) {
+          if (!data.snapshot && isLastQueuedWrite) {
             await refreshFromSheets(true, { afterWrite: true, forceFull: true });
           }
           return { ok: true, data };
         } catch (err: any) {
           rollbackOptimistic?.();
+          soundEffects.playErrorBeep();
           const errMsg = err?.message || 'Gagal terhubung ke Apps Script.';
           setSaveErrorState(errMsg);
-          if (!params.silentToast) showToast(errMsg, 'error');
+          if (!params.silentToast || shouldReturnOptimistic) showToast(errMsg, 'error');
           return { ok: false, error: errMsg };
         }
       };
 
-      return execute(false);
+      if (shouldReturnOptimistic) {
+        pendingWriteCountRef.current += 1;
+        writeQueueRef.current = writeQueueRef.current
+          .catch(() => {})
+          .then(async () => {
+            await execute(false);
+          })
+          .finally(() => {
+            pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1);
+            if (pendingWriteCountRef.current === 0 && pendingRefreshAfterWriteRef.current) {
+              pendingRefreshAfterWriteRef.current = false;
+              void refreshFromSheets(true, { forceFull: true });
+            }
+          });
+        return { ok: true, optimistic: true, data: params.optimisticData };
+      }
+
+      pendingWriteCountRef.current += 1;
+      try {
+        return await execute(false);
+      } finally {
+        pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1);
+      }
     },
     [
       applyDatabaseSnapshot,
@@ -2020,6 +2200,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const res = await runWriteRequest({
       url: '/api/attendance',
       method: 'PUT',
+      entityKey: `att_${id}`,
       body: {
         id,
         updates,
@@ -2066,6 +2247,63 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     type: 'BAK' | 'BAB' | 'Keperluan Lain',
     durationMinutes: number
   ) => {
+    const targetStudent = students.find((s) => s.nis === studentId);
+    if (!targetStudent) {
+      soundEffects.playErrorBeep();
+      return { success: false, error: 'Siswa tidak ditemukan.' };
+    }
+
+    const activeList = outOfClass.filter((r) => r.status === 'active' || r.status === 'overdue');
+    if (activeList.some((r) => r.student_id === studentId)) {
+      soundEffects.playErrorBeep();
+      return { success: false, error: 'Siswa ini sedang memiliki izin keluar yang masih aktif.' };
+    }
+
+    const cls = classes.find((c) => c.id === targetStudent.class_id);
+    const maxPerClass = (cls && cls.quota_limit) || settings.out_of_class_max_per_class || 2;
+    const classActiveCount = activeList.filter((r) => r.class_id === targetStudent.class_id).length;
+    if (classActiveCount >= maxPerClass) {
+      soundEffects.playErrorBeep();
+      return {
+        success: false,
+        error: `Kuota izin keluar untuk kelas ${targetStudent.class_id} penuh (${classActiveCount}/${maxPerClass} siswa sedang di luar).`,
+      };
+    }
+
+    const now = getServerNow();
+    const todayStr = now.toISOString().split('T')[0];
+    const dailyCount = outOfClass.filter((r) => {
+      if (r.student_id !== studentId) return false;
+      return String(r.started_at || '').startsWith(todayStr);
+    }).length;
+    const maxDaily = settings.out_of_class_max_per_student_daily || 3;
+    if (dailyCount >= maxDaily) {
+      soundEffects.playErrorBeep();
+      return {
+        success: false,
+        error: `Batas harian izin keluar siswa (${maxDaily}x/hari) telah tercapai.`,
+      };
+    }
+
+    const nowIso = now.toISOString();
+    const dueIso = new Date(now.getTime() + durationMinutes * 60000).toISOString();
+    const optimisticRecord: OutOfClassRecord = {
+      id: `opt_ooc_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      student_id: targetStudent.nis,
+      class_id: targetStudent.class_id,
+      type,
+      duration_minutes: durationMinutes,
+      started_at: nowIso,
+      due_at: dueIso,
+      late_return_minutes: 0,
+      status: 'active',
+      idempotency_key: `ooc_${Date.now()}_${Math.random()}`,
+      version: 1,
+      created_at: nowIso,
+      updated_at: nowIso,
+      diubah_pada: nowIso,
+    };
+
     const res = await runWriteRequest({
       url: '/api/out-of-class',
       method: 'POST',
@@ -2073,8 +2311,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         studentId,
         type,
         durationMinutes,
-        idempotencyKey: `ooc_${Date.now()}_${Math.random()}`,
+        idempotencyKey: optimisticRecord.idempotency_key,
       },
+      applyOptimistic: () => {
+        const snapshot = outOfClass;
+        setOutOfClass((prev) => [optimisticRecord, ...prev]);
+        return () => setOutOfClass(snapshot);
+      },
+      onOptimisticBroadcast: () => {
+        broadcastSyncEvent('DATA_OPTIMISTIC_OUT_OF_CLASS', { record: optimisticRecord });
+      },
+      optimisticData: { record: optimisticRecord, student: targetStudent },
       silentToast: true,
     });
     if (!res.ok) {
@@ -2082,7 +2329,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: false, error: res.error };
     }
     soundEffects.playSuccessBeep();
-    return { success: true, record: res.data?.record, student: res.data?.student };
+    return {
+      success: true,
+      record: res.data?.record || optimisticRecord,
+      student: res.data?.student || targetStudent,
+    };
   };
 
   const confirmOutOfClassReturn = async (
@@ -2092,9 +2343,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     auditReason?: string
   ) => {
     const existing = outOfClass.find((o) => o.id === id);
+    const nowRet = getServerNow();
+    const nowRetIso = nowRet.toISOString();
+    const actualMinutes = existing
+      ? Math.max(1, Math.round((nowRet.getTime() - new Date(existing.started_at).getTime()) / 60000))
+      : 1;
+    const lateReturnMinutes = existing
+      ? Math.max(0, Math.round((nowRet.getTime() - new Date(existing.due_at).getTime()) / 60000))
+      : 0;
+    const optimisticUpdatedRecord: OutOfClassRecord | undefined = existing
+      ? {
+          ...existing,
+          status: 'returned',
+          returned_at: nowRetIso,
+          actual_minutes: actualMinutes,
+          late_return_minutes: lateReturnMinutes,
+          return_method: returnMethod,
+          return_notes: notes,
+          updated_at: nowRetIso,
+          diubah_pada: nowRetIso,
+        }
+      : undefined;
+
     const res = await runWriteRequest({
       url: '/api/out-of-class',
       method: 'PUT',
+      entityKey: `ooc_${id}`,
       body: {
         id,
         returnMethod,
@@ -2106,13 +2380,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       applyOptimistic: existing
         ? () => {
             const snapshot = outOfClass;
-            const returnedAt = getServerNow().toISOString();
             setOutOfClass((prev) =>
-              prev.map((o) => (o.id === id ? { ...o, status: 'returned', returned_at: returnedAt } : o))
+              prev.map((o) => (o.id === id && optimisticUpdatedRecord ? optimisticUpdatedRecord : o))
             );
             return () => setOutOfClass(snapshot);
           }
         : undefined,
+      optimisticData: { record: optimisticUpdatedRecord },
       silentToast: true,
     });
     if (!res.ok) {
@@ -2120,7 +2394,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: false, error: res.error };
     }
     soundEffects.playSuccessBeep();
-    return { success: true, record: res.data?.record };
+    return { success: true, record: res.data?.record || optimisticUpdatedRecord };
   };
 
   const recordViolation = async (params: {
@@ -2132,10 +2406,55 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     evidenceBase64?: string;
     evidenceFileName?: string;
   }) => {
+    const targetStudent = students.find((s) => s.nis === params.studentId);
+    if (!targetStudent) {
+      soundEffects.playErrorBeep();
+      return { success: false, error: 'Siswa tidak ditemukan.' };
+    }
+    const vt = violationTypes.find((t) => t.id === params.violationTypeId);
+    if (!vt) {
+      soundEffects.playErrorBeep();
+      return { success: false, error: 'Jenis pelanggaran tidak valid.' };
+    }
+
+    const nowIso = getServerNow().toISOString();
+    const pts = params.customPoints !== undefined ? Number(params.customPoints) : vt.default_points;
+    const optimisticViolation: ViolationRecord = {
+      id: `opt_vio_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      student_id: targetStudent.nis,
+      class_id: targetStudent.class_id,
+      violation_type_id: vt.id,
+      type_name: vt.name,
+      category: vt.category,
+      points: pts,
+      notes: params.notes || '',
+      location: params.location || '',
+      evidence_photo_url: params.evidenceBase64 || '',
+      recorded_by: sessionRef.current?.name || 'Petugas',
+      recorded_at: nowIso,
+      version: 1,
+      created_at: nowIso,
+      updated_at: nowIso,
+      diubah_pada: nowIso,
+    };
+
+    const studentTotalPoints = [optimisticViolation, ...violations]
+      .filter((v) => v.student_id === targetStudent.nis)
+      .reduce((acc, cur) => acc + (cur.category === 'prestasi' ? -cur.points : cur.points), 0);
+
     const res = await runWriteRequest({
       url: '/api/violations',
       method: 'POST',
       body: params,
+      applyOptimistic: () => {
+        const snapshot = violations;
+        setViolations((prev) => [optimisticViolation, ...prev]);
+        return () => setViolations(snapshot);
+      },
+      onOptimisticBroadcast: () => {
+        broadcastSyncEvent('DATA_OPTIMISTIC_VIOLATION', { violation: optimisticViolation });
+      },
+      optimisticData: { violation: optimisticViolation, studentTotalPoints },
       silentToast: true,
     });
     if (!res.ok) {
@@ -2145,8 +2464,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     soundEffects.playSuccessBeep();
     return {
       success: true,
-      violation: res.data?.violation,
-      studentTotalPoints: res.data?.studentTotalPoints,
+      violation: res.data?.violation || optimisticViolation,
+      studentTotalPoints: res.data?.studentTotalPoints ?? studentTotalPoints,
     };
   };
 
@@ -2177,6 +2496,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const res = await runWriteRequest({
       url: '/api/students',
       method: 'POST',
+      entityKey: `stu_${student.nis}`,
       body: {
         ...student,
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
@@ -2269,103 +2589,170 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: false, added: 0, updated: 0, classesCreated: 0, error: 'Tidak ada data siswa untuk diimpor.' };
     }
 
+    // Optimistic class & student computation (<1ms)
+    const prevStudentsSnapshot = students;
+    const prevClassesSnapshot = classes;
+    const nowBatch = getServerNow().toISOString();
+
+    const activeClsMap = new Map<string, string>();
+    classes.forEach((c) => {
+      if (c.id) activeClsMap.set(String(c.id).trim().toLowerCase(), String(c.id).trim());
+    });
+    const newClassesList: SchoolClass[] = [];
+    newStudents.forEach((s) => {
+      const cid = String(s.class_id || '').trim();
+      if (!cid) return;
+      const norm = cid.toLowerCase();
+      if (!activeClsMap.has(norm)) {
+        const gMatch = cid.match(/^(10|11|12)/i) || cid.match(/^(X|XI|XII)\b/i);
+        let grade = '10';
+        if (gMatch) {
+          const gUp = String(gMatch[1]).toUpperCase();
+          grade = gUp === 'X' ? '10' : gUp === 'XI' ? '11' : gUp === 'XII' ? '12' : gUp;
+        }
+        const majorParts = cid.split('-');
+        const major = majorParts.length > 1 ? String(majorParts[1]).trim() : 'Umum';
+        const clsRec: SchoolClass = {
+          id: cid,
+          name: cid,
+          grade,
+          major: major || 'Umum',
+          homeroom_teacher_name: `Wali Kelas ${cid}`,
+          homeroom_teacher_email: `${cid.toLowerCase().replace(/[^a-z0-9]/g, '.')}@sekolah.sch.id`,
+          quota_limit: 2,
+          created_at: nowBatch,
+          updated_at: nowBatch,
+        };
+        activeClsMap.set(norm, cid);
+        newClassesList.push(clsRec);
+      }
+    });
+
+    const studentMap = new Map<string, Student>();
+    students.forEach((s) => studentMap.set(s.nis, s));
+    let expectedAdded = 0;
+    let expectedUpdated = 0;
+
+    newStudents.forEach((s) => {
+      if (!s.nis || !s.name || !s.class_id) return;
+      const nis = String(s.nis).trim();
+      const resolvedClass = activeClsMap.get(String(s.class_id).trim().toLowerCase()) || String(s.class_id).trim();
+      const ex = studentMap.get(nis);
+      const merged: Student = {
+        ...s,
+        nis,
+        class_id: resolvedClass,
+        photo_url: String(s.photo_url || '').trim() || ex?.photo_url || '',
+        created_at: ex?.created_at || s.created_at || nowBatch,
+        updated_at: nowBatch,
+      };
+      if (ex) expectedUpdated++;
+      else expectedAdded++;
+      studentMap.set(nis, merged);
+    });
+
+    if (newClassesList.length > 0) {
+      setClasses([...classes, ...newClassesList]);
+    }
+    setStudents(Array.from(studentMap.values()));
+
     setSavingState();
     latestMutationSeqRef.current += 1;
+    pendingWriteCountRef.current += 1;
 
-    const CHUNK_SIZE = 80;
-    let totalAdded = 0;
-    let totalUpdated = 0;
-    let totalClassesCreated = 0;
-    let lastSnapshot: any = null;
-    let lastServerTime: string | undefined;
-    let lastRev: string | undefined;
+    writeQueueRef.current = writeQueueRef.current
+      .catch(() => {})
+      .then(async () => {
+        const CHUNK_SIZE = 250;
+        let lastSnapshot: any = null;
+        let lastServerTime: string | undefined;
+        let lastRev: string | undefined;
 
-    try {
-      for (let i = 0; i < newStudents.length; i += CHUNK_SIZE) {
-        const chunk = newStudents.slice(i, i + CHUNK_SIZE);
+        try {
+          for (let i = 0; i < newStudents.length; i += CHUNK_SIZE) {
+            const chunk = newStudents.slice(i, i + CHUNK_SIZE);
+            const skipSnapshot = i + CHUNK_SIZE < newStudents.length;
 
-        const sendChunk = async (tokOverride?: string) => {
-          const res = await apiFetch('/api/students?action=batch_import', {
-            method: 'POST',
-            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, tokOverride),
-            body: JSON.stringify({ students: chunk }),
-          });
-          const data = await res.json().catch(() => ({}));
-          return { res, data };
-        };
+            const sendChunk = async (tokOverride?: string) => {
+              const res = await apiFetch('/api/students?action=batch_import', {
+                method: 'POST',
+                headers: buildApiHeaders({ 'Content-Type': 'application/json' }, tokOverride),
+                body: JSON.stringify({ students: chunk, skipSnapshot }),
+              });
+              const data = await res.json().catch(() => ({}));
+              return { res, data };
+            };
 
-        let { res, data } = await sendChunk();
-        if (handleAppsScriptUnauthorized(res.status, data)) {
-          const msg = data.error || 'Token rahasia Apps Script ditolak.';
-          setSaveErrorState(msg);
-          return {
-            success: false,
-            added: totalAdded,
-            updated: totalUpdated,
-            classesCreated: totalClassesCreated,
-            error: msg,
-          };
-        }
+            let { res, data } = await sendChunk();
+            if (handleAppsScriptUnauthorized(res.status, data)) {
+              setStudents(prevStudentsSnapshot);
+              setClasses(prevClassesSnapshot);
+              const msg = data.error || 'Token rahasia Apps Script ditolak.';
+              setSaveErrorState(msg);
+              return;
+            }
 
-        if (res.status === 401 && sessionRef.current?.token) {
-          const refreshedTok = await refreshAuthSessionIfNeeded(true);
-          if (refreshedTok) {
-            const retried = await sendChunk(refreshedTok);
-            res = retried.res;
-            data = retried.data;
+            if (res.status === 401 && sessionRef.current?.token) {
+              const refreshedTok = await refreshAuthSessionIfNeeded(true);
+              if (refreshedTok) {
+                const retried = await sendChunk(refreshedTok);
+                res = retried.res;
+                data = retried.data;
+              }
+            }
+
+            if (!res.ok || data?.success === false) {
+              setStudents(prevStudentsSnapshot);
+              setClasses(prevClassesSnapshot);
+              soundEffects.playErrorBeep();
+              const errMsg = data?.error || `Gagal mengimpor data siswa (HTTP ${res.status}).`;
+              setSaveErrorState(errMsg);
+              showToast(errMsg, 'error');
+              return;
+            }
+
+            if (data.snapshot) lastSnapshot = data.snapshot;
+            if (data.serverTime) lastServerTime = data.serverTime;
+            if (data.rev) lastRev = String(data.rev);
           }
-        }
 
-        if (!res.ok || data?.success === false) {
-          const errMsg = data?.error || `Gagal mengimpor data siswa (HTTP ${res.status}).`;
+          if (pendingWriteCountRef.current <= 1) {
+            if (lastSnapshot) {
+              applyDatabaseSnapshot(lastSnapshot, lastServerTime, lastRev);
+              broadcastSyncEvent('DATA_SNAPSHOT', {
+                snapshot: lastSnapshot,
+                serverTime: lastServerTime,
+                rev: lastRev,
+              });
+            } else {
+              await refreshFromSheets(true, { afterWrite: true, forceFull: true });
+              broadcastSyncEvent('DATA_MUTATED');
+            }
+            setSavedState('Tersimpan');
+          }
+        } catch (err: any) {
+          setStudents(prevStudentsSnapshot);
+          setClasses(prevClassesSnapshot);
+          soundEffects.playErrorBeep();
+          const errMsg = err?.message || 'Gagal menghubungi server saat impor data siswa.';
           setSaveErrorState(errMsg);
-          return {
-            success: false,
-            added: totalAdded,
-            updated: totalUpdated,
-            classesCreated: totalClassesCreated,
-            error: errMsg,
-          };
+          showToast(errMsg, 'error');
         }
+      })
+      .finally(() => {
+        pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1);
+        if (pendingWriteCountRef.current === 0 && pendingRefreshAfterWriteRef.current) {
+          pendingRefreshAfterWriteRef.current = false;
+          void refreshFromSheets(true, { forceFull: true });
+        }
+      });
 
-        totalAdded += Number(data.inserted || 0);
-        totalUpdated += Number(data.updated || 0);
-        totalClassesCreated += Number(data.classesCreated || 0);
-        if (data.snapshot) lastSnapshot = data.snapshot;
-        if (data.serverTime) lastServerTime = data.serverTime;
-        if (data.rev) lastRev = String(data.rev);
-      }
-
-      if (lastSnapshot) {
-        applyDatabaseSnapshot(lastSnapshot, lastServerTime, lastRev);
-        broadcastSyncEvent('DATA_SNAPSHOT', {
-          snapshot: lastSnapshot,
-          serverTime: lastServerTime,
-          rev: lastRev,
-        });
-      } else {
-        await refreshFromSheets(true, { afterWrite: true, forceFull: true });
-        broadcastSyncEvent('DATA_MUTATED');
-      }
-      setSavedState('Tersimpan');
-
-      return {
-        success: true,
-        added: totalAdded,
-        updated: totalUpdated,
-        classesCreated: totalClassesCreated,
-      };
-    } catch (err: any) {
-      const errMsg = err?.message || 'Gagal menghubungi server saat impor data siswa.';
-      setSaveErrorState(errMsg);
-      return {
-        success: false,
-        added: totalAdded,
-        updated: totalUpdated,
-        classesCreated: totalClassesCreated,
-        error: errMsg,
-      };
-    }
+    return {
+      success: true,
+      added: expectedAdded,
+      updated: expectedUpdated,
+      classesCreated: newClassesList.length,
+    };
   };
 
   const saveClass = async (cls: SchoolClass) => {
@@ -2373,6 +2760,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const res = await runWriteRequest({
       url: '/api/classes',
       method: 'POST',
+      entityKey: `cls_${cls.id}`,
       body: {
         ...cls,
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
@@ -2418,6 +2806,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const res = await runWriteRequest({
       url: '/api/sessions',
       method: 'POST',
+      entityKey: `sess_${sess.id}`,
       body: {
         ...sess,
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
@@ -2463,6 +2852,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const res = await runWriteRequest({
       url: '/api/violation-types',
       method: 'POST',
+      entityKey: `vt_${vt.id}`,
       body: {
         ...vt,
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
@@ -2508,6 +2898,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const res = await runWriteRequest({
         url: '/api/settings',
         method: 'POST',
+        entityKey: 'app_settings',
         body: updates,
         applyOptimistic: () => {
           const snapshot = settings;
@@ -2527,6 +2918,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const res = await runWriteRequest({
         url: '/api/notifications',
         method: 'POST',
+        entityKey: 'notification_settings',
         body: updates,
         applyOptimistic: () => {
           const snapshot = notificationSettings;
@@ -2647,6 +3039,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const res = await runWriteRequest({
       url: '/api/leave-requests',
       method: 'PUT',
+      entityKey: `lr_${id}`,
       body: {
         id,
         status,

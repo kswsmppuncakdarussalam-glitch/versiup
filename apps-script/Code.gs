@@ -108,6 +108,7 @@ SHEET_HEADERS[SHEET_TABS.LOG] = [
 // ============================================================================
 
 function setupAppsScript() {
+  resetExecCaches_();
   var missing = getMissingConfigKeys_();
   var ssId = getSpreadsheetId_();
   if (!ssId) {
@@ -119,8 +120,7 @@ function setupAppsScript() {
   var ss;
   try {
     ss = getSpreadsheet_();
-    ensureSheetsAndHeaders_(ss);
-    ensureSeedData_(ss);
+    ensureInitializedOnce_(ss, true);
   } finally {
     lock.releaseLock();
   }
@@ -234,7 +234,99 @@ function verifySecretToken_(incomingSecret) {
   return { ok: true };
 }
 
+var EXEC_PROPS_CACHE_ = null;
+var EXEC_SS_CACHE_ = null;
+var EXEC_TAB_CACHE_ = {};
+var EXEC_SCHEMA_READY_ = false;
+var TAB_CACHE_PREFIX_ = 'dkb_tc_v1_';
+var SCHEMA_READY_PROP_ = 'dkb_schema_ready_v2';
+
+function resetExecCaches_() {
+  EXEC_PROPS_CACHE_ = null;
+  EXEC_SS_CACHE_ = null;
+  EXEC_TAB_CACHE_ = {};
+  EXEC_SCHEMA_READY_ = false;
+}
+
+function getTabCacheTtl_(tabName) {
+  if (
+    tabName === SHEET_TABS.USERS ||
+    tabName === SHEET_TABS.KELAS ||
+    tabName === SHEET_TABS.SESI_PRESENSI ||
+    tabName === SHEET_TABS.JENIS_PELANGGARAN ||
+    tabName === SHEET_TABS.PENGATURAN
+  ) {
+    return 1800;
+  }
+  return 300;
+}
+
+function loadTabFromScriptCache_(tabName) {
+  try {
+    var cache = CacheService.getScriptCache();
+    var metaKey = TAB_CACHE_PREFIX_ + tabName + '_m';
+    var metaRaw = cache.get(metaKey);
+    if (!metaRaw) return null;
+    var count = Number(metaRaw);
+    if (!count || isNaN(count) || count < 1 || count > 8) return null;
+    if (count === 1) {
+      var single = cache.get(TAB_CACHE_PREFIX_ + tabName + '_0');
+      return single ? JSON.parse(single) : null;
+    }
+    var keys = [];
+    for (var i = 0; i < count; i++) {
+      keys.push(TAB_CACHE_PREFIX_ + tabName + '_' + i);
+    }
+    var map = cache.getAll(keys);
+    var joined = '';
+    for (var j = 0; j < count; j++) {
+      var part = map[keys[j]];
+      if (part === undefined || part === null) return null;
+      joined += part;
+    }
+    return JSON.parse(joined);
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveTabToScriptCache_(tabName, rows) {
+  try {
+    var json = JSON.stringify(rows || []);
+    var chunkSize = 85000;
+    var count = Math.ceil(json.length / chunkSize) || 1;
+    if (count > 8) {
+      invalidateTabScriptCache_(tabName);
+      return;
+    }
+    var payload = {};
+    payload[TAB_CACHE_PREFIX_ + tabName + '_m'] = String(count);
+    for (var i = 0; i < count; i++) {
+      payload[TAB_CACHE_PREFIX_ + tabName + '_' + i] = json.substring(i * chunkSize, (i + 1) * chunkSize);
+    }
+    CacheService.getScriptCache().putAll(payload, getTabCacheTtl_(tabName));
+  } catch (e) {}
+}
+
+function invalidateTabScriptCache_(tabName) {
+  try {
+    var keys = [TAB_CACHE_PREFIX_ + tabName + '_m'];
+    for (var i = 0; i < 8; i++) {
+      keys.push(TAB_CACHE_PREFIX_ + tabName + '_' + i);
+    }
+    CacheService.getScriptCache().removeAll(keys);
+  } catch (e) {}
+}
+
+function invalidateTabCache_(tabName) {
+  if (EXEC_TAB_CACHE_ && Object.prototype.hasOwnProperty.call(EXEC_TAB_CACHE_, tabName)) {
+    delete EXEC_TAB_CACHE_[tabName];
+  }
+  invalidateTabScriptCache_(tabName);
+}
+
 function doGet(e) {
+  resetExecCaches_();
   var params = (e && e.parameter) || {};
   var incomingSecret =
     params.secretToken ||
@@ -265,6 +357,7 @@ function doGet(e) {
 }
 
 function doPost(e) {
+  resetExecCaches_();
   var payload = {};
   try {
     if (e && e.postData && e.postData.contents) {
@@ -325,12 +418,23 @@ function makeResp_(status, data) {
 }
 
 // ============================================================================
-// CONFIG & HELPERS (Script Properties ONLY)
+// CONFIG & HELPERS (Script Properties ONLY, cached per execution)
 // ============================================================================
+
+function getAllPropsCached_() {
+  if (EXEC_PROPS_CACHE_) return EXEC_PROPS_CACHE_;
+  try {
+    EXEC_PROPS_CACHE_ = PropertiesService.getScriptProperties().getProperties() || {};
+  } catch (e) {
+    EXEC_PROPS_CACHE_ = {};
+  }
+  return EXEC_PROPS_CACHE_;
+}
 
 function getProp_(key, fallback) {
   try {
-    var val = PropertiesService.getScriptProperties().getProperty(key);
+    var props = getAllPropsCached_();
+    var val = props[key];
     if (val && String(val).trim()) return String(val).trim();
   } catch (e) {}
   return fallback !== undefined ? fallback : '';
@@ -380,6 +484,7 @@ function bumpDataRevision_() {
   } catch (e) {}
   try {
     PropertiesService.getScriptProperties().setProperty(DATA_REV_KEY, nextRev);
+    if (EXEC_PROPS_CACHE_) EXEC_PROPS_CACHE_[DATA_REV_KEY] = nextRev;
   } catch (e2) {}
   return nextRev;
 }
@@ -390,7 +495,7 @@ function getDataRevision_() {
     if (cVal && String(cVal).trim()) return String(cVal).trim();
   } catch (e) {}
   try {
-    var pVal = PropertiesService.getScriptProperties().getProperty(DATA_REV_KEY);
+    var pVal = getProp_(DATA_REV_KEY, '');
     if (pVal && String(pVal).trim()) {
       var cleanP = String(pVal).trim();
       try {
@@ -403,9 +508,11 @@ function getDataRevision_() {
 }
 
 function getSpreadsheet_() {
+  if (EXEC_SS_CACHE_) return EXEC_SS_CACHE_;
   var id = getSpreadsheetId_();
   if (!id) throw new Error('SPREADSHEET_ID belum diisi di Script Properties Google Apps Script.');
-  return SpreadsheetApp.openById(id);
+  EXEC_SS_CACHE_ = SpreadsheetApp.openById(id);
+  return EXEC_SS_CACHE_;
 }
 
 function getActiveSenderEmail_() {
@@ -551,7 +658,7 @@ function verifyJwt_(token) {
 function validateTokenAgainstSheet_(tok) {
   var sess = verifyJwt_(tok);
   if (!sess) return { valid: false, reason: 'Sesi tidak valid atau telah berakhir.' };
-  var dbUsers = getFullDatabase_().users;
+  var dbUsers = getUsersFast_(getSpreadsheet_());
   var matched = dbUsers.filter(function (u) { return u.id === sess.userId; })[0];
   if (!matched && sess.role) {
     if (sess.role === 'homeroom' && sess.lockedMenuClassId) {
@@ -928,6 +1035,34 @@ function verifyBcrypt_(password, hash) {
 // GOOGLE SHEETS LOW-LEVEL ENGINE (13 Tabs, Partial Update, Soft Delete, Log)
 // ============================================================================
 
+function ensureInitializedOnce_(ss, forceCheck) {
+  if (!forceCheck && EXEC_SCHEMA_READY_) return;
+  var ssId = getSpreadsheetId_();
+  if (!forceCheck && ssId) {
+    try {
+      if (CacheService.getScriptCache().get('dkb_schema_v2_' + ssId) === '1') {
+        EXEC_SCHEMA_READY_ = true;
+        return;
+      }
+    } catch (e) {}
+    if (getProp_(SCHEMA_READY_PROP_, '') === ssId) {
+      EXEC_SCHEMA_READY_ = true;
+      try { CacheService.getScriptCache().put('dkb_schema_v2_' + ssId, '1', 21600); } catch (ec) {}
+      return;
+    }
+  }
+  ensureSheetsAndHeaders_(ss);
+  ensureSeedData_(ss);
+  EXEC_SCHEMA_READY_ = true;
+  if (ssId) {
+    try { CacheService.getScriptCache().put('dkb_schema_v2_' + ssId, '1', 21600); } catch (e2) {}
+    try {
+      PropertiesService.getScriptProperties().setProperty(SCHEMA_READY_PROP_, ssId);
+      if (EXEC_PROPS_CACHE_) EXEC_PROPS_CACHE_[SCHEMA_READY_PROP_] = ssId;
+    } catch (e3) {}
+  }
+}
+
 function ensureSheetsAndHeaders_(ss) {
   var allTabs = [];
   for (var k in SHEET_TABS) {
@@ -962,7 +1097,18 @@ function ensureSheetsAndHeaders_(ss) {
   }
 }
 
-function readTabWithRowNumbers_(ss, tabName) {
+function readTabWithRowNumbers_(ss, tabName, bypassScriptCache) {
+  if (!bypassScriptCache && EXEC_TAB_CACHE_[tabName]) {
+    return EXEC_TAB_CACHE_[tabName];
+  }
+  if (!bypassScriptCache) {
+    var cachedRows = loadTabFromScriptCache_(tabName);
+    if (cachedRows !== null) {
+      EXEC_TAB_CACHE_[tabName] = cachedRows;
+      return cachedRows;
+    }
+  }
+
   var headers = SHEET_HEADERS[tabName];
   var sheet = ss.getSheetByName(tabName);
   if (!sheet) {
@@ -970,7 +1116,11 @@ function readTabWithRowNumbers_(ss, tabName) {
     sheet = ss.getSheetByName(tabName);
   }
   var lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return [];
+  if (lastRow <= 1) {
+    EXEC_TAB_CACHE_[tabName] = [];
+    saveTabToScriptCache_(tabName, []);
+    return [];
+  }
 
   var values = sheet.getRange(2, 1, lastRow - 1, headers.length).getDisplayValues();
   var results = [];
@@ -984,6 +1134,8 @@ function readTabWithRowNumbers_(ss, tabName) {
       results.push({ rowNumber: i + 2, data: obj });
     }
   }
+  EXEC_TAB_CACHE_[tabName] = results;
+  saveTabToScriptCache_(tabName, results);
   return results;
 }
 
@@ -1004,17 +1156,51 @@ function objToRowArray_(tabName, obj) {
   return arr;
 }
 
-function appendRows_(ss, tabName, rowObjects) {
+function rowToStringData_(tabName, obj) {
+  var headers = SHEET_HEADERS[tabName];
+  var out = {};
+  for (var i = 0; i < headers.length; i++) {
+    var h = headers[i];
+    var v = obj[h];
+    if (v === undefined || v === null) {
+      out[h] = '';
+    } else if (Array.isArray(v) || typeof v === 'object') {
+      out[h] = JSON.stringify(v);
+    } else {
+      out[h] = String(v);
+    }
+  }
+  return out;
+}
+
+function appendRows_(ss, tabName, rowObjects, opts) {
   if (!rowObjects || rowObjects.length === 0) return;
+  var headers = SHEET_HEADERS[tabName];
   var sheet = ss.getSheetByName(tabName);
   if (!sheet) {
     ensureSheetsAndHeaders_(ss);
     sheet = ss.getSheetByName(tabName);
   }
+  var matrix = [];
   for (var i = 0; i < rowObjects.length; i++) {
-    sheet.appendRow(objToRowArray_(tabName, rowObjects[i]));
+    matrix.push(objToRowArray_(tabName, rowObjects[i]));
   }
-  if (tabName !== SHEET_TABS.LOG && tabName !== SHEET_TABS.REKAP_PER_SESI) {
+  var startRow = Math.max(2, sheet.getLastRow() + 1);
+  sheet.getRange(startRow, 1, matrix.length, headers.length).setValues(matrix);
+
+  if (EXEC_TAB_CACHE_[tabName]) {
+    for (var j = 0; j < rowObjects.length; j++) {
+      EXEC_TAB_CACHE_[tabName].push({
+        rowNumber: startRow + j,
+        data: rowToStringData_(tabName, rowObjects[j]),
+      });
+    }
+    saveTabToScriptCache_(tabName, EXEC_TAB_CACHE_[tabName]);
+  } else {
+    invalidateTabScriptCache_(tabName);
+  }
+
+  if (!(opts && opts.skipBump) && tabName !== SHEET_TABS.LOG && tabName !== SHEET_TABS.REKAP_PER_SESI) {
     bumpDataRevision_();
   }
 }
@@ -1033,7 +1219,7 @@ function appendLog_(ss, entry) {
     reason: entry.reason || '',
     status: 'aktif',
     diubah_pada: nowIso,
-  }]);
+  }], { skipBump: true });
 }
 
 function updateRowPartial_(ss, opts) {
@@ -1045,6 +1231,7 @@ function updateRowPartial_(ss, opts) {
   var actorName = opts.actorName || 'Sistem';
   var reason = opts.reason || '';
   var skipLog = Boolean(opts.skipLog);
+  var skipBump = Boolean(opts.skipBump);
 
   var headers = SHEET_HEADERS[tabName];
   var sheet = ss.getSheetByName(tabName);
@@ -1085,7 +1272,8 @@ function updateRowPartial_(ss, opts) {
 
   var oldDiff = {};
   var newDiff = {};
-  var changedAny = false;
+  var changedIndices = [];
+  var rowValues = [];
 
   for (var c = 0; c < headers.length; c++) {
     var col = headers[c];
@@ -1096,12 +1284,13 @@ function updateRowPartial_(ss, opts) {
       : (Array.isArray(rawNew) || typeof rawNew === 'object')
       ? JSON.stringify(rawNew)
       : String(rawNew);
+    var cellVal = (Array.isArray(rawNew) || typeof rawNew === 'object')
+      ? newValStr
+      : (rawNew === undefined || rawNew === null ? '' : rawNew);
+    rowValues.push(cellVal);
 
     if (oldValStr !== newValStr) {
-      sheet.getRange(match.rowNumber, c + 1).setValue(
-        (Array.isArray(rawNew) || typeof rawNew === 'object') ? newValStr : (rawNew === undefined || rawNew === null ? '' : rawNew)
-      );
-      changedAny = true;
+      changedIndices.push({ index: c, value: cellVal });
       if (col !== 'diubah_pada' && col !== 'updated_at') {
         oldDiff[col] = oldValStr;
         newDiff[col] = newValStr;
@@ -1109,8 +1298,18 @@ function updateRowPartial_(ss, opts) {
     }
   }
 
+  var changedAny = changedIndices.length > 0;
   if (changedAny) {
-    bumpDataRevision_();
+    if (changedIndices.length === 1) {
+      sheet.getRange(match.rowNumber, changedIndices[0].index + 1).setValue(changedIndices[0].value);
+    } else {
+      sheet.getRange(match.rowNumber, 1, 1, headers.length).setValues([rowValues]);
+    }
+    match.data = rowToStringData_(tabName, target);
+    saveTabToScriptCache_(tabName, rows);
+    if (!skipBump && tabName !== SHEET_TABS.LOG && tabName !== SHEET_TABS.REKAP_PER_SESI) {
+      bumpDataRevision_();
+    }
   }
 
   if (changedAny && !skipLog && Object.keys(newDiff).length > 0) {
@@ -1126,7 +1325,24 @@ function updateRowPartial_(ss, opts) {
     });
   }
 
-  return { updated: true, oldObj: existing };
+  return { updated: true, oldObj: existing, newObj: match.data };
+}
+
+function writeContiguousRowUpdates_(sheet, headers, rowUpdates) {
+  if (!rowUpdates || rowUpdates.length === 0) return;
+  rowUpdates.sort(function (a, b) { return a.rowNumber - b.rowNumber; });
+  var i = 0;
+  while (i < rowUpdates.length) {
+    var startRow = rowUpdates[i].rowNumber;
+    var matrix = [rowUpdates[i].values];
+    var j = i + 1;
+    while (j < rowUpdates.length && rowUpdates[j].rowNumber === rowUpdates[j - 1].rowNumber + 1) {
+      matrix.push(rowUpdates[j].values);
+      j++;
+    }
+    sheet.getRange(startRow, 1, matrix.length, headers.length).setValues(matrix);
+    i = j;
+  }
 }
 
 function softDeleteRow_(ss, opts) {
@@ -1134,6 +1350,8 @@ function softDeleteRow_(ss, opts) {
   var id = opts.id;
   var actorName = opts.actorName || 'Petugas';
   var reason = opts.reason || 'Soft delete';
+  var skipBump = Boolean(opts.skipBump);
+  var skipLog = Boolean(opts.skipLog);
 
   var headers = SHEET_HEADERS[tabName];
   var sheet = ss.getSheetByName(tabName);
@@ -1149,29 +1367,85 @@ function softDeleteRow_(ss, opts) {
   }
   if (!match) return false;
 
+  var oldSnapshot = {};
+  for (var ok in match.data) {
+    if (Object.prototype.hasOwnProperty.call(match.data, ok)) oldSnapshot[ok] = match.data[ok];
+  }
+
   var nowIso = new Date().toISOString();
-  var statusIdx = headers.indexOf('status');
-  var changedIdx = headers.indexOf('diubah_pada');
-  var updatedIdx = headers.indexOf('updated_at');
+  match.data.status = 'dihapus';
+  if (headers.indexOf('diubah_pada') >= 0) match.data.diubah_pada = nowIso;
+  if (headers.indexOf('updated_at') >= 0) match.data.updated_at = nowIso;
 
-  if (statusIdx >= 0) sheet.getRange(match.rowNumber, statusIdx + 1).setValue('dihapus');
-  if (changedIdx >= 0) sheet.getRange(match.rowNumber, changedIdx + 1).setValue(nowIso);
-  if (updatedIdx >= 0) sheet.getRange(match.rowNumber, updatedIdx + 1).setValue(nowIso);
+  sheet.getRange(match.rowNumber, 1, 1, headers.length).setValues([objToRowArray_(tabName, match.data)]);
+  saveTabToScriptCache_(tabName, rows);
 
+  if (!skipBump && tabName !== SHEET_TABS.LOG && tabName !== SHEET_TABS.REKAP_PER_SESI) {
+    bumpDataRevision_();
+  }
+
+  if (!skipLog) {
+    appendLog_(ss, {
+      waktu: nowIso,
+      pengguna: actorName,
+      id_data: id,
+      tabel: tabName,
+      aksi: 'hapus',
+      nilai_lama: JSON.stringify(oldSnapshot),
+      nilai_baru: JSON.stringify({ status: 'dihapus' }),
+      reason: reason,
+    });
+  }
+
+  return true;
+}
+
+function softDeleteRowsBatch_(ss, opts) {
+  var tabName = opts.tabName;
+  var idSet = opts.idSet || null; // null means delete all active
+  var actorName = opts.actorName || 'Admin';
+  var reason = opts.reason || 'Hapus massal';
+
+  var headers = SHEET_HEADERS[tabName];
+  var sheet = ss.getSheetByName(tabName);
+  if (!sheet) return 0;
+
+  var rows = readTabWithRowNumbers_(ss, tabName);
+  var nowIso = new Date().toISOString();
+  var hasChangedCol = headers.indexOf('diubah_pada') >= 0;
+  var hasUpdatedCol = headers.indexOf('updated_at') >= 0;
+  var rowUpdates = [];
+  var deletedIds = [];
+
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    if (r.data.status === 'dihapus') continue;
+    if (idSet && !idSet[r.data.id]) continue;
+    deletedIds.push(r.data.id);
+    r.data.status = 'dihapus';
+    if (hasChangedCol) r.data.diubah_pada = nowIso;
+    if (hasUpdatedCol) r.data.updated_at = nowIso;
+    rowUpdates.push({ rowNumber: r.rowNumber, values: objToRowArray_(tabName, r.data) });
+  }
+
+  if (rowUpdates.length === 0) return 0;
+
+  writeContiguousRowUpdates_(sheet, headers, rowUpdates);
+  saveTabToScriptCache_(tabName, rows);
   bumpDataRevision_();
 
   appendLog_(ss, {
     waktu: nowIso,
     pengguna: actorName,
-    id_data: id,
+    id_data: 'batch_' + deletedIds.length,
     tabel: tabName,
     aksi: 'hapus',
-    nilai_lama: JSON.stringify(match.data),
+    nilai_lama: JSON.stringify({ count: deletedIds.length, sampleIds: deletedIds.slice(0, 10) }),
     nilai_baru: JSON.stringify({ status: 'dihapus' }),
     reason: reason,
   });
 
-  return true;
+  return deletedIds.length;
 }
 
 // ============================================================================
@@ -1313,13 +1587,103 @@ function activeOnly_(rows) {
     .map(function (r) { return r.data; });
 }
 
-function getFullDatabase_() {
+function mapUserRow_(r, nowIso) {
+  return {
+    id: r.id,
+    role: r.role || 'duty',
+    name: r.name || '',
+    class_id: r.class_id || undefined,
+    email: r.email || undefined,
+    password_hash: r.password_hash || '',
+    label: r.label || '',
+    token_version: parseNum_(r.token_version, 1),
+    is_active: parseBool_(r.is_active, true),
+    created_at: r.created_at || nowIso,
+    updated_at: r.updated_at || r.diubah_pada || nowIso,
+    diubah_pada: r.diubah_pada || r.updated_at || nowIso,
+  };
+}
+
+function mapClassRow_(r, nowIso) {
+  return {
+    id: r.id,
+    name: r.name || r.id,
+    grade: r.grade || '10',
+    major: r.major || '',
+    homeroom_teacher_name: r.homeroom_teacher_name || '',
+    homeroom_teacher_email: r.homeroom_teacher_email || '',
+    quota_limit: parseNum_(r.quota_limit, 2),
+    created_at: r.created_at || nowIso,
+    updated_at: r.updated_at || r.diubah_pada || nowIso,
+    diubah_pada: r.diubah_pada || r.updated_at || nowIso,
+  };
+}
+
+function getUsersFast_(ss) {
+  ensureInitializedOnce_(ss, false);
+  var nowIso = new Date().toISOString();
+  return activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.USERS)).map(function (r) {
+    return mapUserRow_(r, nowIso);
+  });
+}
+
+function getClassesFast_(ss) {
+  ensureInitializedOnce_(ss, false);
+  var nowIso = new Date().toISOString();
+  return activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.KELAS)).map(function (r) {
+    return mapClassRow_(r, nowIso);
+  });
+}
+
+function getSettingsFast_(ss) {
+  ensureInitializedOnce_(ss, false);
+  var nowIso = new Date().toISOString();
+  var settingsRows = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.PENGATURAN));
+  var settings = defaultSettings_(nowIso);
+  var notifSettings = defaultNotificationSettings_(nowIso);
+  settingsRows.forEach(function (r) {
+    if (r.id === 'app_settings' && r.json_data) {
+      try {
+        var parsedApp = JSON.parse(r.json_data);
+        for (var ak in parsedApp) settings[ak] = parsedApp[ak];
+        if (r.diubah_pada) { settings.updated_at = r.diubah_pada; settings.diubah_pada = r.diubah_pada; }
+      } catch (e) {}
+    } else if (r.id === 'notification_settings' && r.json_data) {
+      try {
+        var parsedNotif = JSON.parse(r.json_data);
+        for (var nk in parsedNotif) notifSettings[nk] = parsedNotif[nk];
+        if (r.diubah_pada) { notifSettings.updated_at = r.diubah_pada; notifSettings.diubah_pada = r.diubah_pada; }
+      } catch (e) {}
+    }
+  });
+  return { settings: settings, notification_settings: notifSettings };
+}
+
+function upgradeLegacyBcryptHash_(ss, userRec, plainPassword) {
+  try {
+    if (!userRec || !userRec.id || !userRec.password_hash) return;
+    var h = String(userRec.password_hash).trim();
+    if (h.indexOf('$2a$') !== 0 && h.indexOf('$2b$') !== 0 && h.indexOf('$2y$') !== 0) return;
+    var fastHash = hashPassword_(String(plainPassword));
+    updateRowPartial_(ss, {
+      tabName: SHEET_TABS.USERS,
+      id: userRec.id,
+      newRowObj: { password_hash: fastHash },
+      forceOverwrite: true,
+      skipLog: true,
+      skipBump: true,
+    });
+    userRec.password_hash = fastHash;
+  } catch (e) {}
+}
+
+function getFullDatabase_(bypassScriptCache) {
   var ss = getSpreadsheet_();
-  ensureSheetsAndHeaders_(ss);
-  ensureSeedData_(ss);
+  ensureInitializedOnce_(ss, false);
+  var bypass = Boolean(bypassScriptCache);
   var nowIso = new Date().toISOString();
 
-  var students = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.SISWA)).map(function (r) {
+  var students = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.SISWA, bypass)).map(function (r) {
     return {
       nis: r.nis || r.id,
       nisn: r.nisn || '',
@@ -1337,22 +1701,11 @@ function getFullDatabase_() {
     };
   });
 
-  var classes = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.KELAS)).map(function (r) {
-    return {
-      id: r.id,
-      name: r.name || r.id,
-      grade: r.grade || '10',
-      major: r.major || '',
-      homeroom_teacher_name: r.homeroom_teacher_name || '',
-      homeroom_teacher_email: r.homeroom_teacher_email || '',
-      quota_limit: parseNum_(r.quota_limit, 2),
-      created_at: r.created_at || nowIso,
-      updated_at: r.updated_at || r.diubah_pada || nowIso,
-      diubah_pada: r.diubah_pada || r.updated_at || nowIso,
-    };
+  var classes = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.KELAS, bypass)).map(function (r) {
+    return mapClassRow_(r, nowIso);
   });
 
-  var sessions = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.SESI_PRESENSI)).map(function (r) {
+  var sessions = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.SESI_PRESENSI, bypass)).map(function (r) {
     return {
       id: r.id,
       name: r.name || r.id,
@@ -1369,7 +1722,7 @@ function getFullDatabase_() {
     };
   });
 
-  var attendance = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.PRESENSI)).map(function (r) {
+  var attendance = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.PRESENSI, bypass)).map(function (r) {
     return {
       id: r.id,
       student_id: r.student_id,
@@ -1391,7 +1744,7 @@ function getFullDatabase_() {
     };
   });
 
-  var out_of_class = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.IZIN_KELUAR)).map(function (r) {
+  var out_of_class = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.IZIN_KELUAR, bypass)).map(function (r) {
     return {
       id: r.id,
       student_id: r.student_id,
@@ -1416,7 +1769,7 @@ function getFullDatabase_() {
     };
   });
 
-  var violations = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.PELANGGARAN)).map(function (r) {
+  var violations = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.PELANGGARAN, bypass)).map(function (r) {
     return {
       id: r.id,
       student_id: r.student_id,
@@ -1437,7 +1790,7 @@ function getFullDatabase_() {
     };
   });
 
-  var violation_types = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.JENIS_PELANGGARAN)).map(function (r) {
+  var violation_types = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.JENIS_PELANGGARAN, bypass)).map(function (r) {
     return {
       id: r.id,
       code: r.code || '',
@@ -1452,7 +1805,7 @@ function getFullDatabase_() {
     };
   });
 
-  var leave_requests = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.IZIN_TIDAK_MASUK)).map(function (r) {
+  var leave_requests = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.IZIN_TIDAK_MASUK, bypass)).map(function (r) {
     return {
       id: r.id,
       student_id: r.student_id,
@@ -1472,24 +1825,11 @@ function getFullDatabase_() {
     };
   });
 
-  var users = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.USERS)).map(function (r) {
-    return {
-      id: r.id,
-      role: r.role || 'duty',
-      name: r.name || '',
-      class_id: r.class_id || undefined,
-      email: r.email || undefined,
-      password_hash: r.password_hash || '',
-      label: r.label || '',
-      token_version: parseNum_(r.token_version, 1),
-      is_active: parseBool_(r.is_active, true),
-      created_at: r.created_at || nowIso,
-      updated_at: r.updated_at || r.diubah_pada || nowIso,
-      diubah_pada: r.diubah_pada || r.updated_at || nowIso,
-    };
+  var users = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.USERS, bypass)).map(function (r) {
+    return mapUserRow_(r, nowIso);
   });
 
-  var settingsRows = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.PENGATURAN));
+  var settingsRows = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.PENGATURAN, bypass));
   var settings = defaultSettings_(nowIso);
   var notifSettings = defaultNotificationSettings_(nowIso);
 
@@ -1509,7 +1849,7 @@ function getFullDatabase_() {
     }
   });
 
-  var notification_logs = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.NOTIFIKASI_LOG)).map(function (r) {
+  var notification_logs = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.NOTIFIKASI_LOG, bypass)).map(function (r) {
     return {
       id: r.id,
       timestamp: r.timestamp || nowIso,
@@ -1525,7 +1865,7 @@ function getFullDatabase_() {
     return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
   });
 
-  var audit_logs = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.LOG)).map(function (r) {
+  var audit_logs = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.LOG, bypass)).map(function (r) {
     return {
       id: r.id,
       timestamp: r.waktu || r.diubah_pada || nowIso,
@@ -1560,8 +1900,7 @@ function getFullDatabase_() {
 }
 
 function getNotificationSettings_() {
-  var db = getFullDatabase_();
-  return db.notification_settings;
+  return getSettingsFast_(getSpreadsheet_()).notification_settings;
 }
 
 // ============================================================================
@@ -1646,11 +1985,9 @@ function resolveSessionSchedule_(sessions, now, autoSwitchEnabled, manualOverrid
   return { activeSession: smartFallback, liveWindowSession: null };
 }
 
-function syncSessionRecapSheet_(ss, targetDate) {
-  var db = getFullDatabase_();
+function syncSessionRecapSheet_(ss, targetDate, dbOpt) {
+  var db = dbOpt || getFullDatabase_();
   var dateStr = targetDate || toDateYmd_(new Date());
-  var studentMap = {};
-  db.students.forEach(function (s) { studentMap[s.nis] = s; });
   var totalStudents = db.students.length;
   var dayAtt = db.attendance.filter(function (a) { return a.date === dateStr; });
 
@@ -1658,8 +1995,11 @@ function syncSessionRecapSheet_(ss, targetDate) {
   var existingById = {};
   existingRows.forEach(function (r) { existingById[r.data.id] = r; });
 
+  var headers = SHEET_HEADERS[SHEET_TABS.REKAP_PER_SESI];
+  var sheet = ss.getSheetByName(SHEET_TABS.REKAP_PER_SESI);
   var nowIso = new Date().toISOString();
   var toAppend = [];
+  var rowUpdates = [];
 
   db.sessions.forEach(function (sess) {
     var sessAtt = dayAtt.filter(function (a) { return a.session_id === sess.id; });
@@ -1692,20 +2032,22 @@ function syncSessionRecapSheet_(ss, targetDate) {
       status: 'aktif',
       diubah_pada: nowIso,
     };
-    if (existingById[id]) {
-      updateRowPartial_(ss, {
-        tabName: SHEET_TABS.REKAP_PER_SESI,
-        id: id,
-        newRowObj: rowObj,
-        forceOverwrite: true,
-        skipLog: true,
-      });
+    var existingEntry = existingById[id];
+    if (existingEntry) {
+      rowUpdates.push({ rowNumber: existingEntry.rowNumber, values: objToRowArray_(SHEET_TABS.REKAP_PER_SESI, rowObj) });
+      existingEntry.data = rowToStringData_(SHEET_TABS.REKAP_PER_SESI, rowObj);
     } else {
       toAppend.push(rowObj);
     }
   });
 
-  if (toAppend.length > 0) appendRows_(ss, SHEET_TABS.REKAP_PER_SESI, toAppend);
+  if (rowUpdates.length > 0 && sheet) {
+    writeContiguousRowUpdates_(sheet, headers, rowUpdates);
+    saveTabToScriptCache_(SHEET_TABS.REKAP_PER_SESI, existingRows);
+  }
+  if (toAppend.length > 0) {
+    appendRows_(ss, SHEET_TABS.REKAP_PER_SESI, toAppend, { skipBump: true });
+  }
 }
 
 // ============================================================================
@@ -1815,11 +2157,11 @@ function logNotification_(ss, log) {
   }]);
 }
 
-function notifyParent_(payload) {
+function notifyParent_(payload, dbOpt) {
   var ss = getSpreadsheet_();
-  var db = getFullDatabase_();
-  var settings = db.settings;
-  var notifSettings = db.notification_settings;
+  var cfg = dbOpt || getSettingsFast_(ss);
+  var settings = cfg.settings;
+  var notifSettings = cfg.notification_settings;
 
   if (!settings.toggle_email_notifications || !notifSettings.email_enabled) {
     return { sent: false, reason: 'Fitur notifikasi email nonaktif.' };
@@ -2156,13 +2498,13 @@ function saveUser_(ss, user, actorName) {
 
 function updateSettings_(patch, actorName) {
   var ss = getSpreadsheet_();
-  var db = getFullDatabase_();
+  var curCfg = getSettingsFast_(ss);
   var nowIso = new Date().toISOString();
   var expectedUpdatedAt = patch.expected_updated_at;
   var forceOverwrite = patch.forceOverwrite !== false;
   var merged = {};
   var k;
-  for (k in db.settings) merged[k] = db.settings[k];
+  for (k in curCfg.settings) merged[k] = curCfg.settings[k];
   for (k in patch) {
     if (k !== 'expected_updated_at' && k !== 'forceOverwrite') merged[k] = patch[k];
   }
@@ -2189,13 +2531,13 @@ function updateSettings_(patch, actorName) {
 
 function updateNotificationSettings_(patch, actorName) {
   var ss = getSpreadsheet_();
-  var db = getFullDatabase_();
+  var curCfg = getSettingsFast_(ss);
   var nowIso = new Date().toISOString();
   var expectedUpdatedAt = patch.expected_updated_at;
   var forceOverwrite = patch.forceOverwrite !== false;
   var merged = {};
   var k;
-  for (k in db.notification_settings) merged[k] = db.notification_settings[k];
+  for (k in curCfg.notification_settings) merged[k] = curCfg.notification_settings[k];
   for (k in patch) {
     if (k !== 'expected_updated_at' && k !== 'forceOverwrite') merged[k] = patch[k];
   }
@@ -2220,7 +2562,7 @@ function updateNotificationSettings_(patch, actorName) {
   return { settings: merged };
 }
 
-function appendAttendanceBatch_(ss, records, actorName) {
+function appendAttendanceBatch_(ss, records, actorName, dbOpt) {
   if (!records || records.length === 0) return { saved: [], rejectedDuplicates: [] };
 
   var existingRows = readTabWithRowNumbers_(ss, SHEET_TABS.PRESENSI);
@@ -2233,8 +2575,10 @@ function appendAttendanceBatch_(ss, records, actorName) {
     dayKeys[r.student_id + '::' + r.date] = true;
   });
 
-  var db = getFullDatabase_();
-  var multiSession = db.sessions.filter(function (s) { return s.is_active; }).length > 1;
+  var sessionsList = (dbOpt && dbOpt.sessions) || activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.SESI_PRESENSI)).map(function (r) {
+    return { id: r.id, is_active: parseBool_(r.is_active, true) };
+  });
+  var multiSession = sessionsList.filter(function (s) { return s.is_active; }).length > 1;
 
   var toInsert = [];
   var rejected = [];
@@ -2279,30 +2623,43 @@ function appendAttendanceBatch_(ss, records, actorName) {
         status: 'aktif',
         diubah_pada: r.diubah_pada || r.updated_at,
       };
-    }));
+    }), { skipBump: true });
 
-    toInsert.forEach(function (r) {
-      appendLog_(ss, {
+    var logBatch = toInsert.map(function (r) {
+      return {
+        id: randomId_('log'),
         waktu: r.created_at,
         pengguna: actorName || 'Sistem Presensi',
         id_data: r.id,
         tabel: SHEET_TABS.PRESENSI,
         aksi: 'tambah',
+        nilai_lama: '',
         nilai_baru: JSON.stringify({ student_id: r.student_id, session_id: r.session_id, date: r.date, status: r.status }),
-      });
+        reason: '',
+        status: 'aktif',
+        diubah_pada: r.created_at,
+      };
     });
+    appendRows_(ss, SHEET_TABS.LOG, logBatch, { skipBump: true });
+    bumpDataRevision_();
 
-    try { syncSessionRecapSheet_(ss, toInsert[0].date); } catch (e) {}
+    try {
+      var recapDb = dbOpt
+        ? { students: dbOpt.students, sessions: dbOpt.sessions, attendance: (dbOpt.attendance || []).concat(toInsert) }
+        : null;
+      syncSessionRecapSheet_(ss, toInsert[0].date, recapDb);
+    } catch (e) {}
   }
 
   return { saved: toInsert, rejectedDuplicates: rejected };
 }
 
 function autoCloseOverdueOutOfClass_(ss) {
-  var db = getFullDatabase_();
+  var rows = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.IZIN_KELUAR));
   var nowMs = Date.now();
-  db.out_of_class.forEach(function (rec) {
-    if (rec.status === 'active' || rec.status === 'overdue') {
+  rows.forEach(function (rec) {
+    var st = rec.status_izin || 'active';
+    if (st === 'active' || st === 'overdue') {
       var dueMs = new Date(rec.due_at).getTime();
       if (nowMs - dueMs > 2 * 60 * 60 * 1000) {
         var nowIso = new Date().toISOString();
@@ -2325,28 +2682,38 @@ function autoCloseOverdueOutOfClass_(ss) {
   });
 }
 
-function startOutOfClass_(ss, record, actorName) {
-  var db = getFullDatabase_();
-  var active = db.out_of_class.filter(function (r) { return r.status === 'active' || r.status === 'overdue'; });
+function startOutOfClass_(ss, record, actorName, dbOpt) {
+  var outList = (dbOpt && dbOpt.out_of_class) || activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.IZIN_KELUAR)).map(function (r) {
+    return {
+      student_id: r.student_id,
+      class_id: r.class_id,
+      started_at: r.started_at,
+      status: r.status_izin || 'active',
+    };
+  });
+  var classesList = (dbOpt && dbOpt.classes) || getClassesFast_(ss);
+  var appSettings = (dbOpt && dbOpt.settings) || getSettingsFast_(ss).settings;
+
+  var active = outList.filter(function (r) { return r.status === 'active' || r.status === 'overdue'; });
 
   if (active.some(function (r) { return r.student_id === record.student_id; })) {
     return { success: false, error: 'Siswa ini sedang memiliki izin keluar yang masih aktif.' };
   }
 
-  var cls = db.classes.filter(function (c) { return c.id === record.class_id; })[0];
-  var maxPerClass = (cls && cls.quota_limit) || db.settings.out_of_class_max_per_class || 2;
+  var cls = classesList.filter(function (c) { return c.id === record.class_id; })[0];
+  var maxPerClass = (cls && cls.quota_limit) || appSettings.out_of_class_max_per_class || 2;
   var classActiveCount = active.filter(function (r) { return r.class_id === record.class_id; }).length;
   if (classActiveCount >= maxPerClass) {
     return { success: false, error: 'Kuota izin keluar untuk kelas ' + record.class_id + ' penuh (' + classActiveCount + '/' + maxPerClass + ' siswa sedang di luar).' };
   }
 
   var todayStr = toDateYmd_(new Date());
-  var dailyCount = db.out_of_class.filter(function (r) {
+  var dailyCount = outList.filter(function (r) {
     if (r.student_id !== record.student_id) return false;
     var startedDate = toDateYmd_(new Date(r.started_at));
     return startedDate === todayStr || String(r.started_at).indexOf(todayStr) === 0;
   }).length;
-  var maxDaily = db.settings.out_of_class_max_per_student_daily || 3;
+  var maxDaily = appSettings.out_of_class_max_per_student_daily || 3;
   if (dailyCount >= maxDaily) {
     return { success: false, error: 'Batas harian izin keluar siswa (' + maxDaily + 'x/hari) telah tercapai.' };
   }
@@ -2510,8 +2877,7 @@ function dispatchRoute_(req) {
       var ss;
       try {
         ss = getSpreadsheet_();
-        ensureSheetsAndHeaders_(ss);
-        ensureSeedData_(ss);
+        ensureInitializedOnce_(ss, true);
         var incomingScriptUrl = String((body && body.appsScriptUrl) || (query && query.appsScriptUrl) || '').trim();
         if (incomingScriptUrl && incomingScriptUrl.indexOf('https://script.google') === 0) {
           try {
@@ -2588,6 +2954,7 @@ function dispatchRoute_(req) {
       }
       var clientRev = String(query.rev || body.rev || '').trim();
       var forceFull = parseBool_(query.full || body.full, false);
+      var bypassCacheSync = parseBool_(query.fresh || body.fresh, false);
       var currentRev = getDataRevision_();
 
       if (clientRev && clientRev === currentRev && !forceFull) {
@@ -2610,7 +2977,7 @@ function dispatchRoute_(req) {
         });
       }
 
-      var dbSync = getFullDatabase_();
+      var dbSync = getFullDatabase_(bypassCacheSync);
       var driveOkSync = false;
       var folderIdSync = getDriveFolderId_();
       if (folderIdSync) {
@@ -2643,8 +3010,7 @@ function dispatchRoute_(req) {
     if (pathname === '/api/auth') {
       var action = query.action || body.action;
       var ssAuth = getSpreadsheet_();
-      ensureSheetsAndHeaders_(ssAuth);
-      ensureSeedData_(ssAuth);
+      ensureInitializedOnce_(ssAuth, false);
 
       var validateTokenFn = validateTokenAgainstSheet_;
 
@@ -2670,7 +3036,7 @@ function dispatchRoute_(req) {
         }
 
         if (!body.password) return makeResp_(400, { error: 'Password wajib diisi.' });
-        var usersD = getFullDatabase_().users;
+        var usersD = getUsersFast_(ssAuth);
         var dutyUsers = usersD.filter(function (u) { return u.role === 'duty' && u.is_active; });
         var matchedD = dutyUsers.filter(function (u) { return verifyPassword_(body.password, u.password_hash); })[0];
         if (!matchedD) {
@@ -2695,6 +3061,7 @@ function dispatchRoute_(req) {
           });
         }
 
+        upgradeLegacyBcryptHash_(ssAuth, matchedD, body.password);
         cache.remove(lockKey);
         var tokD = signJwt_({
           userId: matchedD.id, role: matchedD.role, name: matchedD.name,
@@ -2705,11 +3072,11 @@ function dispatchRoute_(req) {
 
       if (action === 'unlock_homeroom') {
         if (!body.name || !body.password) return makeResp_(400, { error: 'Nama dan password wali kelas wajib diisi.' });
-        var curSess = token ? verifyJwt_(token) : null;
         var cleanName = String(body.name).trim().toLowerCase();
-        var dbHr = getFullDatabase_();
-        var hrUsers = dbHr.users.filter(function (u) { return u.role === 'homeroom' && u.is_active; });
-        var adminHr = dbHr.users.filter(function (u) { return u.role === 'admin' && u.is_active; })[0];
+        var fastUsersHr = getUsersFast_(ssAuth);
+        var fastClassesHr = getClassesFast_(ssAuth);
+        var hrUsers = fastUsersHr.filter(function (u) { return u.role === 'homeroom' && u.is_active; });
+        var adminHr = fastUsersHr.filter(function (u) { return u.role === 'admin' && u.is_active; })[0];
 
         var matchedHr = hrUsers.filter(function (u) {
           var un = u.name.toLowerCase().trim();
@@ -2721,7 +3088,7 @@ function dispatchRoute_(req) {
 
         var targetClassId = body.classId;
         if (!matchedHr) {
-          var matchedClass = dbHr.classes.filter(function (c) {
+          var matchedClass = fastClassesHr.filter(function (c) {
             var tn = String(c.homeroom_teacher_name || '').toLowerCase().trim();
             return tn === cleanName || (tn && (tn.indexOf(cleanName) >= 0 || cleanName.indexOf(tn) >= 0)) ||
               c.name.toLowerCase().trim() === cleanName || c.id.toLowerCase().trim() === cleanName ||
@@ -2729,10 +3096,12 @@ function dispatchRoute_(req) {
           })[0];
           if (matchedClass) {
             targetClassId = matchedClass.id;
-            var masterHr = dbHr.users.filter(function (u) { return u.id === 'user_homeroom_master'; })[0] || hrUsers[0];
-            var pwOk = (masterHr && verifyPassword_(body.password, masterHr.password_hash)) ||
-              (adminHr && verifyPassword_(body.password, adminHr.password_hash));
-            if (!pwOk) return makeResp_(400, { error: 'Password wali kelas salah.' });
+            var masterHr = fastUsersHr.filter(function (u) { return u.id === 'user_homeroom_master'; })[0] || hrUsers[0];
+            var masterMatched = Boolean(masterHr && verifyPassword_(body.password, masterHr.password_hash));
+            var adminMatchedHr = Boolean(!masterMatched && adminHr && verifyPassword_(body.password, adminHr.password_hash));
+            if (!masterMatched && !adminMatchedHr) return makeResp_(400, { error: 'Password wali kelas salah.' });
+            if (masterMatched) upgradeLegacyBcryptHash_(ssAuth, masterHr, body.password);
+            if (adminMatchedHr) upgradeLegacyBcryptHash_(ssAuth, adminHr, body.password);
             var newHr = {
               id: 'user_homeroom_' + matchedClass.id.toLowerCase().replace(/[^a-z0-9]/g, '_'),
               role: 'homeroom',
@@ -2750,9 +3119,11 @@ function dispatchRoute_(req) {
         }
         if (!matchedHr) return makeResp_(400, { error: 'Akun atau kelas untuk "' + body.name + '" tidak ditemukan.' });
 
-        var hrPwValid = verifyPassword_(body.password, matchedHr.password_hash) ||
-          (adminHr && verifyPassword_(body.password, adminHr.password_hash));
-        if (!hrPwValid) return makeResp_(400, { error: 'Password wali kelas salah.' });
+        var matchedHrPw = verifyPassword_(body.password, matchedHr.password_hash);
+        var matchedAdminPw = Boolean(!matchedHrPw && adminHr && verifyPassword_(body.password, adminHr.password_hash));
+        if (!matchedHrPw && !matchedAdminPw) return makeResp_(400, { error: 'Password wali kelas salah.' });
+        if (matchedHrPw) upgradeLegacyBcryptHash_(ssAuth, matchedHr, body.password);
+        if (matchedAdminPw) upgradeLegacyBcryptHash_(ssAuth, adminHr, body.password);
 
         targetClassId = matchedHr.class_id || targetClassId || '10-RPL-1';
         var tokHr = signJwt_({
@@ -2764,13 +3135,14 @@ function dispatchRoute_(req) {
 
       if (action === 'unlock_student_affairs') {
         if (!body.password) return makeResp_(400, { error: 'Password wajib diisi.' });
-        var usersSA = getFullDatabase_().users;
+        var usersSA = getUsersFast_(ssAuth);
         var saUser = usersSA.filter(function (u) { return u.role === 'student_affairs' && u.is_active; })[0];
         var adminSA = usersSA.filter(function (u) { return u.role === 'admin' && u.is_active; })[0];
-        var okSA = (saUser && verifyPassword_(body.password, saUser.password_hash)) ||
-                   (adminSA && verifyPassword_(body.password, adminSA.password_hash));
-        if (!okSA) return makeResp_(400, { error: 'Password kesiswaan salah.' });
-        var actSA = saUser || adminSA;
+        var okSaUser = Boolean(saUser && verifyPassword_(body.password, saUser.password_hash));
+        var okSaAdmin = Boolean(!okSaUser && adminSA && verifyPassword_(body.password, adminSA.password_hash));
+        if (!okSaUser && !okSaAdmin) return makeResp_(400, { error: 'Password kesiswaan salah.' });
+        var actSA = okSaUser ? saUser : adminSA;
+        upgradeLegacyBcryptHash_(ssAuth, actSA, body.password);
         var tokSA = signJwt_({
           userId: actSA.id, role: actSA.role, name: actSA.name, label: actSA.label,
           tokenVersion: actSA.token_version, lockedMenuRole: 'student_affairs'
@@ -2780,11 +3152,12 @@ function dispatchRoute_(req) {
 
       if (action === 'unlock_admin') {
         if (!body.password) return makeResp_(400, { error: 'Password admin wajib diisi.' });
-        var usersA = getFullDatabase_().users;
+        var usersA = getUsersFast_(ssAuth);
         var adminA = usersA.filter(function (u) { return u.role === 'admin' && u.is_active; })[0];
         if (!adminA || !verifyPassword_(body.password, adminA.password_hash)) {
           return makeResp_(400, { error: 'Password admin salah.' });
         }
+        upgradeLegacyBcryptHash_(ssAuth, adminA, body.password);
         var tokA = signJwt_({
           userId: adminA.id, role: 'admin', name: adminA.name, label: adminA.label,
           tokenVersion: adminA.token_version, lockedMenuRole: 'admin'
@@ -2820,7 +3193,7 @@ function dispatchRoute_(req) {
         if (!vMA.valid) return makeResp_(401, { error: vMA.reason || 'Sesi tidak valid atau telah berakhir.', sessionInvalidated: Boolean(vMA.invalidated) });
 
         if (method === 'GET') {
-          var listU = getFullDatabase_().users.map(function (u) {
+          var listU = getUsersFast_(ssAuth).map(function (u) {
             return {
               id: u.id, role: u.role, name: u.name, class_id: u.class_id,
               label: u.label, token_version: u.token_version, is_active: u.is_active, created_at: u.created_at
@@ -2833,8 +3206,8 @@ function dispatchRoute_(req) {
           var lockAuth = LockService.getScriptLock();
           lockAuth.waitLock(15000);
           try {
-            var dbMA = getFullDatabase_();
-            var usersMA = dbMA.users;
+            var usersMA = getUsersFast_(ssAuth);
+            var dbMA = { users: usersMA, classes: getClassesFast_(ssAuth) };
             var targetRole = body.targetRole;
             var newPassword = body.newPassword;
             var targetUserId = body.targetUserId;
@@ -3079,7 +3452,7 @@ function dispatchRoute_(req) {
             sessByRec[recId] = activeSess;
           });
 
-          var batchRes = appendAttendanceBatch_(ssAtt, prepared, actorNameAtt);
+          var batchRes = appendAttendanceBatch_(ssAtt, prepared, actorNameAtt, dbAtt);
           batchRes.saved.forEach(function (rec) {
             if (rec.status === 'Terlambat' || rec.status === 'Alpha') {
               var st = stuByRec[rec.id];
@@ -3088,7 +3461,7 @@ function dispatchRoute_(req) {
                   student: st,
                   triggerType: rec.status === 'Terlambat' ? 'terlambat' : 'alpha',
                   status: rec.status + ' (' + rec.late_minutes + ' menit)',
-                });
+                }, dbAtt);
               }
             }
           });
@@ -3231,7 +3604,7 @@ function dispatchRoute_(req) {
             created_at: nowOoc.toISOString(),
             updated_at: nowOoc.toISOString(),
           };
-          var oocRes = startOutOfClass_(ssOoc, newOoc, (sessOoc && sessOoc.name) || 'Petugas Piket');
+          var oocRes = startOutOfClass_(ssOoc, newOoc, (sessOoc && sessOoc.name) || 'Petugas Piket', dbOoc);
           if (!oocRes.success) return makeResp_(400, { error: oocRes.error });
           return makeResp_(200, { success: true, record: oocRes.record, student: stuOoc, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
@@ -3296,7 +3669,7 @@ function dispatchRoute_(req) {
                 triggerType: 'melebihi_waktu',
                 status: 'Melebihi Waktu Izin Keluar (+' + lateRetMin + ' menit)',
                 lateReturnMinutes: lateRetMin,
-              });
+              }, dbPutOoc);
             }
           }
 
@@ -3368,7 +3741,7 @@ function dispatchRoute_(req) {
             status: 'Pelanggaran: ' + vt.name,
             violationName: vt.name,
             points: vioRec.points,
-          });
+          }, dbVioPost);
 
           var threshold = (dbVioPost.notification_settings && dbVioPost.notification_settings.warning_threshold_points) || 25;
           if (totalPoints >= threshold && vt.category !== 'prestasi') {
@@ -3378,7 +3751,7 @@ function dispatchRoute_(req) {
               status: 'Poin Pelanggaran Mencapai Ambang Batas SP (' + totalPoints + ' poin)',
               violationName: vt.name,
               points: totalPoints,
-            });
+            }, dbVioPost);
           }
 
           return makeResp_(200, { success: true, violation: vioRec, studentTotalPoints: totalPoints, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
@@ -3525,10 +3898,10 @@ function dispatchRoute_(req) {
               }
             });
             if (newClassesArr.length > 0) {
-              appendRows_(ssStu, SHEET_TABS.KELAS, newClassesArr);
+              appendRows_(ssStu, SHEET_TABS.KELAS, newClassesArr, { skipBump: true });
             }
 
-            // 2. Read Siswa tab ONCE and batch updates/appends without per-row re-reads
+            // 2. Read Siswa tab ONCE and batch updates/appends with single-range RPCs
             var existingStu = readTabWithRowNumbers_(ssStu, SHEET_TABS.SISWA);
             var existingMap = {};
             existingStu.forEach(function (r) { existingMap[r.data.id] = r; });
@@ -3536,6 +3909,7 @@ function dispatchRoute_(req) {
             var stuHeaders = SHEET_HEADERS[SHEET_TABS.SISWA];
             var stuSheet = ssStu.getSheetByName(SHEET_TABS.SISWA);
             var toAppendStu = [];
+            var rowUpdatesStu = [];
             var updatedStu = 0;
 
             listIn.forEach(function (s) {
@@ -3565,39 +3939,36 @@ function dispatchRoute_(req) {
                 diubah_pada: nowBatch,
               };
 
-              if (hasActiveExisting) {
+              if (hasActiveExisting && existingEntry.rowNumber > 1) {
                 var oldData = existingEntry.data;
-                var changedCols = [];
+                var hasAnyDiff = false;
                 for (var hi = 0; hi < stuHeaders.length; hi++) {
                   var colName = stuHeaders[hi];
                   if (colName === 'updated_at' || colName === 'diubah_pada') continue;
                   var oldVal = oldData[colName] !== undefined ? String(oldData[colName]) : '';
                   var newVal = rec[colName] !== undefined && rec[colName] !== null ? String(rec[colName]) : '';
                   if (oldVal !== newVal) {
-                    changedCols.push({ index: hi + 1, value: rec[colName] });
+                    hasAnyDiff = true;
+                    break;
                   }
                 }
-                if (changedCols.length > 0 && stuSheet) {
-                  for (var ci = 0; ci < changedCols.length; ci++) {
-                    stuSheet.getRange(existingEntry.rowNumber, changedCols[ci].index).setValue(
-                      changedCols[ci].value === undefined || changedCols[ci].value === null ? '' : changedCols[ci].value
-                    );
-                  }
-                  var updColIdx = stuHeaders.indexOf('updated_at');
-                  var chgColIdx = stuHeaders.indexOf('diubah_pada');
-                  if (updColIdx >= 0) stuSheet.getRange(existingEntry.rowNumber, updColIdx + 1).setValue(nowBatch);
-                  if (chgColIdx >= 0) stuSheet.getRange(existingEntry.rowNumber, chgColIdx + 1).setValue(nowBatch);
-                  existingEntry.data = rec;
+                if (hasAnyDiff) {
+                  rowUpdatesStu.push({ rowNumber: existingEntry.rowNumber, values: objToRowArray_(SHEET_TABS.SISWA, rec) });
+                  existingEntry.data = rowToStringData_(SHEET_TABS.SISWA, rec);
                   updatedStu++;
                 }
               } else {
                 toAppendStu.push(rec);
-                existingMap[nis] = { rowNumber: -1, data: rec };
+                existingMap[nis] = { rowNumber: -1, data: rowToStringData_(SHEET_TABS.SISWA, rec) };
               }
             });
 
+            if (rowUpdatesStu.length > 0 && stuSheet) {
+              writeContiguousRowUpdates_(stuSheet, stuHeaders, rowUpdatesStu);
+              saveTabToScriptCache_(SHEET_TABS.SISWA, existingStu);
+            }
             if (toAppendStu.length > 0) {
-              appendRows_(ssStu, SHEET_TABS.SISWA, toAppendStu);
+              appendRows_(ssStu, SHEET_TABS.SISWA, toAppendStu, { skipBump: true });
             }
             if (toAppendStu.length > 0 || updatedStu > 0 || newClassesArr.length > 0) {
               bumpDataRevision_();
@@ -3611,15 +3982,19 @@ function dispatchRoute_(req) {
                 reason: 'Impor Excel/CSV batch',
               });
             }
-            return makeResp_(200, {
+            var skipSnapshotFlag = parseBool_(body.skipSnapshot, false);
+            var batchRespPayload = {
               success: true,
               rev: getDataRevision_(),
               inserted: toAppendStu.length,
               updated: updatedStu,
               classesCreated: newClassesArr.length,
               serverTime: new Date().toISOString(),
-              snapshot: buildDatabasePayload_(),
-            });
+            };
+            if (!skipSnapshotFlag) {
+              batchRespPayload.snapshot = buildDatabasePayload_();
+            }
+            return makeResp_(200, batchRespPayload);
           }
 
           if (!body.nis || !body.name || !body.class_id) return makeResp_(400, { error: 'NIS, Nama, dan Kelas wajib diisi.' });
@@ -3662,16 +4037,21 @@ function dispatchRoute_(req) {
         lockStuDel.waitLock(15000);
         try {
           if (body.action === 'clear_all') {
-            var activeRows = readTabWithRowNumbers_(ssStu, SHEET_TABS.SISWA).filter(function (r) { return r.data.status !== 'dihapus'; });
-            activeRows.forEach(function (r) {
-              softDeleteRow_(ssStu, { tabName: SHEET_TABS.SISWA, id: r.data.id, actorName: actorStu, reason: 'Kosongkan data siswa' });
+            var clearedCount = softDeleteRowsBatch_(ssStu, {
+              tabName: SHEET_TABS.SISWA,
+              actorName: actorStu,
+              reason: 'Kosongkan data siswa',
             });
-            return makeResp_(200, { success: true, count: activeRows.length, message: activeRows.length + ' data siswa berhasil dihapus.', serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+            return makeResp_(200, { success: true, count: clearedCount, message: clearedCount + ' data siswa berhasil dihapus.', serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
           }
           if (Array.isArray(body.nisses) && body.nisses.length > 0) {
-            var cDel = 0;
-            body.nisses.forEach(function (n) {
-              if (softDeleteRow_(ssStu, { tabName: SHEET_TABS.SISWA, id: n, actorName: actorStu, reason: 'Hapus siswa' })) cDel++;
+            var nissSet = {};
+            body.nisses.forEach(function (n) { nissSet[String(n).trim()] = true; });
+            var cDel = softDeleteRowsBatch_(ssStu, {
+              tabName: SHEET_TABS.SISWA,
+              idSet: nissSet,
+              actorName: actorStu,
+              reason: 'Hapus siswa',
             });
             return makeResp_(200, { success: true, count: cDel, message: cDel + ' siswa berhasil dihapus.', serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
           }
@@ -3723,7 +4103,7 @@ function dispatchRoute_(req) {
           }
 
           // Sync homeroom user record if present
-          var hrU = getFullDatabase_().users.filter(function (u) { return u.role === 'homeroom' && u.class_id === cleanCls.id; })[0];
+          var hrU = getUsersFast_(ssCls).filter(function (u) { return u.role === 'homeroom' && u.class_id === cleanCls.id; })[0];
           if (hrU) {
             var changedHr = false;
             if (cleanCls.homeroom_teacher_name && hrU.name !== cleanCls.homeroom_teacher_name) { hrU.name = cleanCls.homeroom_teacher_name; changedHr = true; }
@@ -3928,7 +4308,7 @@ function dispatchRoute_(req) {
               notifyParent_({
                 student: stuLr, triggerType: 'izin_sakit',
                 status: 'Izin / Sakit Disetujui (' + exLr.type + ': ' + exLr.start_date + ' s/d ' + exLr.end_date + ')',
-              });
+              }, dbLr);
             }
           }
           return makeResp_(200, { success: true, request: updLr.oldObj, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });

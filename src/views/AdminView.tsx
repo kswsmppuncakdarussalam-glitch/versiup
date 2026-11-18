@@ -4269,7 +4269,6 @@ export const AdminView: React.FC = () => {
                   };
                   await saveClass(classToSave);
                   setEditingClass(null);
-                  showToast(`Kelas ${classToSave.name} dan email wali kelas berhasil disimpan.`, 'success');
                 }}
                 className="px-4 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold hover:bg-slate-800"
               >
