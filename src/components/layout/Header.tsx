@@ -167,7 +167,7 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
           onClick={() => setActiveTab('system_check')}
           title={
             isBackendConfigured
-              ? `Terhubung langsung ke Google Apps Script Web App${envStatus.senderEmail ? ` (${envStatus.senderEmail})` : ''} (auto-reload 15 detik). Klik untuk membuka Cek Sistem.`
+              ? `Terhubung langsung ke Google Apps Script Web App${envStatus.senderEmail ? ` (${envStatus.senderEmail})` : ''} (sinkron otomatis real-time). Klik untuk membuka Cek Sistem.`
               : 'Klik untuk membuka Cek Sistem dan melihat bagian konfigurasi yang belum lengkap.'
           }
           className={`hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border transition-colors ${

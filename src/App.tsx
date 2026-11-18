@@ -75,6 +75,7 @@ const MainAppContent: React.FC = () => {
     logout,
     toasts,
     dismissToast,
+    isInitialLoading,
     configError,
     appsScriptUrl,
     appsScriptSecretConfigured,
@@ -85,19 +86,7 @@ const MainAppContent: React.FC = () => {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
   if (!session) {
-    return (
-      <>
-        {configError && (
-          <div className="bg-amber-600 text-white px-4 py-2.5 text-xs flex items-center justify-center gap-2 text-center">
-            <AlertTriangle className="w-4 h-4 shrink-0" />
-            <span>
-              <strong>Konfigurasi Apps Script:</strong> {configError}
-            </span>
-          </div>
-        )}
-        <DutyLoginScreen />
-      </>
-    );
+    return <DutyLoginScreen />;
   }
 
   return (
@@ -109,7 +98,7 @@ const MainAppContent: React.FC = () => {
       <div className="flex-1 flex flex-col min-w-0 lg:pl-64">
         <Header onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)} />
 
-        {(configError || !appsScriptUrl || !appsScriptSecretConfigured) && (
+        {!isInitialLoading && (configError || !appsScriptUrl || !appsScriptSecretConfigured) && (
           <div className="bg-rose-600 text-white px-4 py-2.5 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 border-b border-rose-700">
             <div className="flex items-center gap-2">
               <AlertTriangle className="w-4 h-4 shrink-0" />
@@ -118,7 +107,7 @@ const MainAppContent: React.FC = () => {
                 {configError || 'URL Web App atau SECRET_TOKEN belum diatur di perangkat ini.'}
               </span>
             </div>
-            {activeTab !== 'system_check' && (
+            {session?.lockedMenuRole === 'admin' && activeTab !== 'system_check' && (
               <button
                 type="button"
                 onClick={() => setActiveTab('system_check')}

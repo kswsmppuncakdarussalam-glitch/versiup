@@ -193,12 +193,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
                 </>
               )}
             </div>
-            <span className="text-[9px] font-mono text-slate-400 shrink-0">15d</span>
+            <span className="text-[9px] font-mono text-emerald-600 dark:text-emerald-400 font-semibold shrink-0">Live (ms)</span>
           </div>
 
           <div className="text-[10px] text-slate-400 text-center">
             {lastSyncTime
-              ? `Pembaruan otomatis: ${lastSyncTime.toLocaleTimeString('id-ID')}`
+              ? `Sinkron real-time: ${lastSyncTime.toLocaleTimeString('id-ID')}`
               : 'Menghubungkan ke Sheets...'}
           </div>
 

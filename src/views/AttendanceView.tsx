@@ -108,10 +108,10 @@ export const AttendanceView: React.FC = () => {
   const handleScanSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const code = scanInput.trim();
-    if (!code || isProcessing) return;
+    if (!code) return;
 
-    setIsProcessing(true);
     setScanInput(''); // clear immediately for next scan in queue
+    setIsProcessing(true);
 
     const res = await recordAttendance({
       code,

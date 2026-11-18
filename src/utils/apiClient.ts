@@ -3,11 +3,164 @@
  * - Mengirim POST dengan Content-Type: text/plain;charset=utf-8 berisi JSON envelope
  *   { secretToken, token, route, method, query, body }.
  * - Mendukung doGet (via query string) dan doPost (via text/plain JSON) serta validasi SECRET_TOKEN wajib.
+ * - Menyimpan URL & SECRET_TOKEN lintas-sesi (Vite Env, Server /api/apps-script-config,
+ *   localStorage, sessionStorage, Cookie 1 tahun, dan IndexedDB) agar tidak perlu input ulang di Vercel.
  */
+
+declare const __DKB_ENV_APPS_SCRIPT_URL__: string | undefined;
+declare const __DKB_ENV_APPS_SCRIPT_SECRET__: string | undefined;
 
 const APPS_SCRIPT_URL_KEY = 'dkb_apps_script_url';
 const APPS_SCRIPT_SECRET_KEY = 'dkb_apps_script_secret';
+const APPS_SCRIPT_LOCK_KEY = 'dkb_apps_script_locked';
+const COOKIE_URL_KEY = 'dkb_as_url';
+const COOKIE_SECRET_KEY = 'dkb_as_sec';
+const COOKIE_LOCK_KEY = 'dkb_as_lock';
+const IDB_NAME = 'dkb_config_db';
+const IDB_STORE = 'kv';
 const SESSION_STORAGE_KEY = 'dkb_session';
+
+let memoryAppsScriptUrl = '';
+let memoryAppsScriptSecret = '';
+let memoryConfigLocked = false;
+
+function getBuildEnvAppsScriptUrl(): string {
+  try {
+    if (typeof __DKB_ENV_APPS_SCRIPT_URL__ === 'string' && __DKB_ENV_APPS_SCRIPT_URL__.trim()) {
+      return __DKB_ENV_APPS_SCRIPT_URL__.trim();
+    }
+  } catch {}
+  try {
+    const v = String((import.meta as any)?.env?.VITE_APPS_SCRIPT_URL || '').trim();
+    if (v) return v;
+  } catch {}
+  return '';
+}
+
+function getBuildEnvAppsScriptSecret(): string {
+  try {
+    if (typeof __DKB_ENV_APPS_SCRIPT_SECRET__ === 'string' && __DKB_ENV_APPS_SCRIPT_SECRET__.trim()) {
+      return __DKB_ENV_APPS_SCRIPT_SECRET__.trim();
+    }
+  } catch {}
+  try {
+    const v = String((import.meta as any)?.env?.VITE_APPS_SCRIPT_SECRET_TOKEN || '').trim();
+    if (v) return v;
+  } catch {}
+  return '';
+}
+
+function readCookie(name: string): string {
+  try {
+    if (typeof document === 'undefined' || !document.cookie) return '';
+    const prefix = `${name}=`;
+    const parts = document.cookie.split(';');
+    for (const part of parts) {
+      const trimmed = part.trim();
+      if (trimmed.startsWith(prefix)) {
+        return decodeURIComponent(trimmed.slice(prefix.length));
+      }
+    }
+  } catch {}
+  return '';
+}
+
+function writeCookie(name: string, value: string, maxAgeSeconds = 31536000): void {
+  try {
+    if (typeof document === 'undefined') return;
+    const secure = typeof window !== 'undefined' && window.location?.protocol === 'https:' ? '; Secure' : '';
+    if (!value) {
+      document.cookie = `${name}=; Path=/; Max-Age=0; SameSite=Lax${secure}`;
+    } else {
+      document.cookie = `${name}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAgeSeconds}; SameSite=Lax${secure}`;
+    }
+  } catch {}
+}
+
+function openConfigDb(): Promise<IDBDatabase | null> {
+  return new Promise((resolve) => {
+    try {
+      if (typeof indexedDB === 'undefined') {
+        resolve(null);
+        return;
+      }
+      const req = indexedDB.open(IDB_NAME, 1);
+      const timer = setTimeout(() => resolve(null), 500);
+      req.onupgradeneeded = () => {
+        try {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(IDB_STORE)) {
+            db.createObjectStore(IDB_STORE);
+          }
+        } catch {}
+      };
+      req.onsuccess = () => {
+        clearTimeout(timer);
+        resolve(req.result);
+      };
+      req.onerror = () => {
+        clearTimeout(timer);
+        resolve(null);
+      };
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function idbGet(key: string): Promise<string> {
+  const db = await openConfigDb();
+  if (!db) return '';
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.get(key);
+      req.onsuccess = () => {
+        resolve(typeof req.result === 'string' ? req.result : '');
+        db.close();
+      };
+      req.onerror = () => {
+        resolve('');
+        db.close();
+      };
+    } catch {
+      resolve('');
+      try {
+        db.close();
+      } catch {}
+    }
+  });
+}
+
+async function idbSet(key: string, value: string): Promise<void> {
+  const db = await openConfigDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      if (value) {
+        store.put(value, key);
+      } else {
+        store.delete(key);
+      }
+      tx.oncomplete = () => {
+        resolve();
+        db.close();
+      };
+      tx.onerror = () => {
+        resolve();
+        db.close();
+      };
+    } catch {
+      resolve();
+      try {
+        db.close();
+      } catch {}
+    }
+  });
+}
 
 export function normalizeAppsScriptUrl(raw?: string | null): string {
   const trimmed = (raw || '').trim();
@@ -33,25 +186,47 @@ export function isValidAppsScriptUrl(raw?: string | null): boolean {
 }
 
 export function getAppsScriptUrl(): string {
+  if (memoryAppsScriptUrl && isValidAppsScriptUrl(memoryAppsScriptUrl) && !isAppsScriptDevUrl(memoryAppsScriptUrl)) {
+    return memoryAppsScriptUrl;
+  }
   try {
     const stored = normalizeAppsScriptUrl(localStorage.getItem(APPS_SCRIPT_URL_KEY));
-    if (stored && isValidAppsScriptUrl(stored) && !isAppsScriptDevUrl(stored)) return stored;
+    if (stored && isValidAppsScriptUrl(stored) && !isAppsScriptDevUrl(stored)) {
+      memoryAppsScriptUrl = stored;
+      return stored;
+    }
   } catch {}
   try {
     const sessionStored = normalizeAppsScriptUrl(sessionStorage.getItem(APPS_SCRIPT_URL_KEY));
     if (sessionStored && isValidAppsScriptUrl(sessionStored) && !isAppsScriptDevUrl(sessionStored)) {
+      memoryAppsScriptUrl = sessionStored;
       try {
         localStorage.setItem(APPS_SCRIPT_URL_KEY, sessionStored);
       } catch {}
+      writeCookie(COOKIE_URL_KEY, sessionStored);
       return sessionStored;
     }
   } catch {}
-  const envUrl = normalizeAppsScriptUrl((import.meta as any)?.env?.VITE_APPS_SCRIPT_URL);
-  return isValidAppsScriptUrl(envUrl) && !isAppsScriptDevUrl(envUrl) ? envUrl : '';
+  const cookieStored = normalizeAppsScriptUrl(readCookie(COOKIE_URL_KEY));
+  if (cookieStored && isValidAppsScriptUrl(cookieStored) && !isAppsScriptDevUrl(cookieStored)) {
+    memoryAppsScriptUrl = cookieStored;
+    try {
+      localStorage.setItem(APPS_SCRIPT_URL_KEY, cookieStored);
+      sessionStorage.setItem(APPS_SCRIPT_URL_KEY, cookieStored);
+    } catch {}
+    return cookieStored;
+  }
+  const envUrl = normalizeAppsScriptUrl(getBuildEnvAppsScriptUrl());
+  if (isValidAppsScriptUrl(envUrl) && !isAppsScriptDevUrl(envUrl)) {
+    memoryAppsScriptUrl = envUrl;
+    return envUrl;
+  }
+  return '';
 }
 
 export function setAppsScriptUrl(url: string): string {
   const normalized = normalizeAppsScriptUrl(url);
+  memoryAppsScriptUrl = normalized;
   try {
     if (normalized) {
       localStorage.setItem(APPS_SCRIPT_URL_KEY, normalized);
@@ -66,38 +241,62 @@ export function setAppsScriptUrl(url: string): string {
       sessionStorage.removeItem(APPS_SCRIPT_URL_KEY);
     }
   } catch {}
+  writeCookie(COOKIE_URL_KEY, normalized);
+  void idbSet(APPS_SCRIPT_URL_KEY, normalized);
   return normalized;
 }
 
 export function clearAppsScriptUrl(): void {
+  memoryAppsScriptUrl = '';
   try {
     localStorage.removeItem(APPS_SCRIPT_URL_KEY);
   } catch {}
   try {
     sessionStorage.removeItem(APPS_SCRIPT_URL_KEY);
   } catch {}
+  writeCookie(COOKIE_URL_KEY, '');
+  void idbSet(APPS_SCRIPT_URL_KEY, '');
 }
 
 export function getAppsScriptSecretToken(): string {
+  if (memoryAppsScriptSecret) return memoryAppsScriptSecret;
   try {
     const stored = (localStorage.getItem(APPS_SCRIPT_SECRET_KEY) || '').trim();
-    if (stored) return stored;
+    if (stored) {
+      memoryAppsScriptSecret = stored;
+      return stored;
+    }
   } catch {}
   try {
     const sessionStored = (sessionStorage.getItem(APPS_SCRIPT_SECRET_KEY) || '').trim();
     if (sessionStored) {
+      memoryAppsScriptSecret = sessionStored;
       try {
         localStorage.setItem(APPS_SCRIPT_SECRET_KEY, sessionStored);
       } catch {}
+      writeCookie(COOKIE_SECRET_KEY, sessionStored);
       return sessionStored;
     }
   } catch {}
-  const envSecret = String((import.meta as any)?.env?.VITE_APPS_SCRIPT_SECRET_TOKEN || '').trim();
+  const cookieSecret = readCookie(COOKIE_SECRET_KEY).trim();
+  if (cookieSecret) {
+    memoryAppsScriptSecret = cookieSecret;
+    try {
+      localStorage.setItem(APPS_SCRIPT_SECRET_KEY, cookieSecret);
+      sessionStorage.setItem(APPS_SCRIPT_SECRET_KEY, cookieSecret);
+    } catch {}
+    return cookieSecret;
+  }
+  const envSecret = getBuildEnvAppsScriptSecret();
+  if (envSecret) {
+    memoryAppsScriptSecret = envSecret;
+  }
   return envSecret;
 }
 
 export function setAppsScriptSecretToken(secretToken: string): string {
   const clean = (secretToken || '').trim();
+  memoryAppsScriptSecret = clean;
   try {
     if (clean) {
       localStorage.setItem(APPS_SCRIPT_SECRET_KEY, clean);
@@ -112,16 +311,76 @@ export function setAppsScriptSecretToken(secretToken: string): string {
       sessionStorage.removeItem(APPS_SCRIPT_SECRET_KEY);
     }
   } catch {}
+  writeCookie(COOKIE_SECRET_KEY, clean);
+  void idbSet(APPS_SCRIPT_SECRET_KEY, clean);
   return clean;
 }
 
 export function clearAppsScriptSecretToken(): void {
+  memoryAppsScriptSecret = '';
   try {
     localStorage.removeItem(APPS_SCRIPT_SECRET_KEY);
   } catch {}
   try {
     sessionStorage.removeItem(APPS_SCRIPT_SECRET_KEY);
   } catch {}
+  writeCookie(COOKIE_SECRET_KEY, '');
+  void idbSet(APPS_SCRIPT_SECRET_KEY, '');
+}
+
+export function setAppsScriptConfigLocked(locked: boolean): boolean {
+  memoryConfigLocked = Boolean(locked);
+  const val = locked ? '1' : '';
+  try {
+    if (locked) {
+      localStorage.setItem(APPS_SCRIPT_LOCK_KEY, '1');
+    } else {
+      localStorage.removeItem(APPS_SCRIPT_LOCK_KEY);
+    }
+  } catch {}
+  try {
+    if (locked) {
+      sessionStorage.setItem(APPS_SCRIPT_LOCK_KEY, '1');
+    } else {
+      sessionStorage.removeItem(APPS_SCRIPT_LOCK_KEY);
+    }
+  } catch {}
+  writeCookie(COOKIE_LOCK_KEY, val);
+  void idbSet(APPS_SCRIPT_LOCK_KEY, val);
+  return memoryConfigLocked;
+}
+
+export function isAppsScriptConfigLocked(): boolean {
+  if (memoryConfigLocked) return true;
+  try {
+    if (localStorage.getItem(APPS_SCRIPT_LOCK_KEY) === '1') {
+      memoryConfigLocked = true;
+      return true;
+    }
+  } catch {}
+  try {
+    if (sessionStorage.getItem(APPS_SCRIPT_LOCK_KEY) === '1') {
+      memoryConfigLocked = true;
+      try {
+        localStorage.setItem(APPS_SCRIPT_LOCK_KEY, '1');
+      } catch {}
+      writeCookie(COOKIE_LOCK_KEY, '1');
+      return true;
+    }
+  } catch {}
+  if (readCookie(COOKIE_LOCK_KEY) === '1') {
+    memoryConfigLocked = true;
+    try {
+      localStorage.setItem(APPS_SCRIPT_LOCK_KEY, '1');
+      sessionStorage.setItem(APPS_SCRIPT_LOCK_KEY, '1');
+    } catch {}
+    return true;
+  }
+  if (hasCompleteAppsScriptConfig()) {
+    setAppsScriptConfigLocked(true);
+    return true;
+  }
+  return false;
 }
 
 export function hasAppsScriptSecretToken(): boolean {
@@ -152,41 +411,118 @@ function getStoredSessionToken(): string {
   }
 }
 
-export async function fetchServerAppsScriptUrl(): Promise<string> {
+export async function fetchServerAppsScriptConfig(): Promise<{
+  appsScriptUrl: string;
+  secretToken: string;
+  locked: boolean;
+}> {
   try {
     const res = await fetch('/api/apps-script-config', {
       method: 'GET',
+      credentials: 'same-origin',
+      cache: 'no-store',
       headers: { 'Cache-Control': 'no-cache' },
     });
-    if (!res.ok) return '';
+    if (!res.ok) return { appsScriptUrl: '', secretToken: '', locked: false };
     const data = await res.json().catch(() => ({}));
-    const url = normalizeAppsScriptUrl(data?.appsScriptUrl);
-    return isValidAppsScriptUrl(url) && !isAppsScriptDevUrl(url) ? url : '';
+    const rawUrl = normalizeAppsScriptUrl(data?.appsScriptUrl);
+    const validUrl = isValidAppsScriptUrl(rawUrl) && !isAppsScriptDevUrl(rawUrl) ? rawUrl : '';
+    const secretToken = typeof data?.secretToken === 'string' ? data.secretToken.trim() : '';
+    const locked = Boolean(data?.locked || (validUrl && secretToken));
+    return { appsScriptUrl: validUrl, secretToken, locked };
   } catch {
-    return '';
+    return { appsScriptUrl: '', secretToken: '', locked: false };
+  }
+}
+
+export async function fetchServerAppsScriptUrl(): Promise<string> {
+  const cfg = await fetchServerAppsScriptConfig();
+  return cfg.appsScriptUrl;
+}
+
+export async function persistServerAppsScriptConfig(url: string, secretToken?: string): Promise<void> {
+  try {
+    await fetch('/api/apps-script-config', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        appsScriptUrl: url,
+        ...(secretToken !== undefined ? { secretToken } : {}),
+      }),
+    });
+  } catch {
+    // Non-fatal: penyimpanan browser (localStorage, cookie, IndexedDB) tetap aktif
   }
 }
 
 export async function persistServerAppsScriptUrl(url: string): Promise<void> {
-  try {
-    await fetch('/api/apps-script-config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ appsScriptUrl: url }),
-    });
-  } catch {
-    // Non-fatal: localStorage tetap menyimpan URL secara permanen di browser
-  }
+  await persistServerAppsScriptConfig(url);
 }
 
 export async function clearServerAppsScriptUrl(): Promise<void> {
   try {
     await fetch('/api/apps-script-config', {
       method: 'DELETE',
+      credentials: 'same-origin',
     });
   } catch {
     // Non-fatal
   }
+}
+
+export async function hydrateAppsScriptConfig(): Promise<{
+  appsScriptUrl: string;
+  secretToken: string;
+  locked: boolean;
+}> {
+  let currentUrl = getAppsScriptUrl();
+  let currentSecret = getAppsScriptSecretToken();
+
+  if (!currentUrl || !currentSecret) {
+    const [idbUrlRaw, idbSecRaw, serverCfg] = await Promise.all([
+      !currentUrl ? idbGet(APPS_SCRIPT_URL_KEY) : Promise.resolve(''),
+      !currentSecret ? idbGet(APPS_SCRIPT_SECRET_KEY) : Promise.resolve(''),
+      fetchServerAppsScriptConfig(),
+    ]);
+
+    const idbUrl = normalizeAppsScriptUrl(idbUrlRaw);
+    const validIdbUrl = isValidAppsScriptUrl(idbUrl) && !isAppsScriptDevUrl(idbUrl) ? idbUrl : '';
+    const resolvedUrl = currentUrl || serverCfg.appsScriptUrl || validIdbUrl;
+    const resolvedSecret = currentSecret || serverCfg.secretToken || idbSecRaw.trim();
+
+    if (resolvedUrl && resolvedUrl !== currentUrl) {
+      currentUrl = setAppsScriptUrl(resolvedUrl);
+    } else if (currentUrl) {
+      setAppsScriptUrl(currentUrl);
+    }
+
+    if (resolvedSecret && resolvedSecret !== currentSecret) {
+      currentSecret = setAppsScriptSecretToken(resolvedSecret);
+    } else if (currentSecret) {
+      setAppsScriptSecretToken(currentSecret);
+    }
+
+    if (currentUrl && currentSecret) {
+      setAppsScriptConfigLocked(true);
+      // Jika client sudah punya config namun server /api belum punya (misal cold-start instance baru), sinkronkan diam-diam
+      if (!serverCfg.appsScriptUrl || !serverCfg.secretToken) {
+        void persistServerAppsScriptConfig(currentUrl, currentSecret);
+      }
+    }
+  } else {
+    // Pastikan 4 lapis + kunci permanen tetap sinkron
+    setAppsScriptUrl(currentUrl);
+    setAppsScriptSecretToken(currentSecret);
+    setAppsScriptConfigLocked(true);
+    void persistServerAppsScriptConfig(currentUrl, currentSecret);
+  }
+
+  return {
+    appsScriptUrl: currentUrl,
+    secretToken: currentSecret,
+    locked: Boolean(currentUrl && currentSecret) || isAppsScriptConfigLocked(),
+  };
 }
 
 export interface ApiFetchOptions {

@@ -330,7 +330,7 @@ export const AdminView: React.FC = () => {
       if (typeof document === 'undefined' || document.visibilityState === 'visible') {
         void fetchUsers();
       }
-    }, 15000);
+    }, 1500);
     return () => window.clearInterval(timer);
   }, [activeSection, session?.token, configError, appsScriptUrl, appsScriptSecretConfigured]);
 
@@ -785,7 +785,7 @@ export const AdminView: React.FC = () => {
                 </>
               ) : (
                 <>
-                  <strong>Tersimpan • Google Apps Script Web App Aktif:</strong> Semua perubahan ditulis langsung ke Spreadsheet &amp; Drive melalui Apps Script, dimuat ulang otomatis tiap 15 detik dan saat tab aktif.
+                  <strong>Tersimpan • Google Apps Script Web App Aktif:</strong> Semua perubahan ditulis langsung ke Spreadsheet &amp; Drive melalui Apps Script dan tersinkron otomatis real-time (permili detik) ke seluruh tab aktif.
                   {lastSyncTime ? ` (Pembaruan terakhir: ${lastSyncTime.toLocaleTimeString('id-ID')})` : ''}
                 </>
               )}
@@ -1423,7 +1423,7 @@ export const AdminView: React.FC = () => {
 
             <div className="flex items-center gap-2">
               <span className="text-[11px] text-slate-500">
-                {loadingUsers ? 'Memuat akun...' : 'Auto-refresh 15d'}
+                {loadingUsers ? 'Memuat akun...' : 'Sinkron Real-Time'}
               </span>
               <button
                 type="button"
@@ -3400,9 +3400,9 @@ export const AdminView: React.FC = () => {
 
             <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
               <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50">
-                <span className="text-slate-500 block text-[10px]">Pembaruan Otomatis:</span>
+                <span className="text-slate-500 block text-[10px]">Sinkronisasi Otomatis:</span>
                 <span className="text-xs font-bold text-slate-900 dark:text-white">
-                  Setiap 15d &amp; Saat Tab Aktif
+                  Real-Time (ms) &amp; Saat Tab Aktif
                 </span>
               </div>
 

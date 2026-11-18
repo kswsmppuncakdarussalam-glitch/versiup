@@ -31,13 +31,15 @@ import {
   setAppsScriptSecretToken,
   clearAppsScriptSecretToken,
   hasAppsScriptSecretToken,
+  isAppsScriptConfigLocked,
+  setAppsScriptConfigLocked,
   getMissingClientConfig,
   hasCompleteAppsScriptConfig,
   isValidAppsScriptUrl,
   testAppsScriptConnection,
-  fetchServerAppsScriptUrl,
-  persistServerAppsScriptUrl,
+  persistServerAppsScriptConfig,
   clearServerAppsScriptUrl,
+  hydrateAppsScriptConfig,
   runAppsScriptSystemCheck,
   type SystemCheckResult,
 } from '../utils/apiClient.js';
@@ -64,7 +66,8 @@ export interface OfflineAttendanceScan {
 
 const OFFLINE_SCANS_KEY = 'dkb_offline_attendance_scans';
 const SYNC_BROADCAST_CHANNEL = 'dkb_sync_channel';
-const AUTO_REFRESH_INTERVAL_MS = 15000;
+const REALTIME_SYNC_COOLDOWN_MS = 350;
+const FULL_RECONCILE_INTERVAL_MS = 15000;
 const SCAN_BATCH_WINDOW_MS = 3000;
 
 export interface EnvConfigStatus {
@@ -103,6 +106,7 @@ interface AppContextType {
   envStatus: EnvConfigStatus;
   appsScriptUrl: string;
   appsScriptSecretConfigured: boolean;
+  isAppsScriptLocked: boolean;
   isConnectingAppsScript: boolean;
   connectAppsScript: (url: string, secretToken?: string) => Promise<{ ok: boolean; message: string }>;
   disconnectAppsScript: () => Promise<void>;
@@ -329,7 +333,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const savedSession: AuthSession | null = savedSessionRaw ? JSON.parse(savedSessionRaw) : null;
       if (
         savedTab &&
-        ['dashboard', 'attendance', 'out_of_class', 'violations', 'system_check', 'homeroom', 'student_affairs', 'admin'].includes(savedTab)
+        savedTab !== 'system_check' &&
+        ['dashboard', 'attendance', 'out_of_class', 'violations', 'homeroom', 'student_affairs', 'admin'].includes(savedTab)
       ) {
         if (['homeroom', 'student_affairs', 'admin'].includes(savedTab) && savedSession?.lockedMenuRole !== savedTab) {
           return 'attendance';
@@ -372,6 +377,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [appsScriptUrl, setAppsScriptUrlState] = useState<string>(() => getAppsScriptUrl());
   const [appsScriptSecretConfigured, setAppsScriptSecretConfigured] = useState<boolean>(() =>
     hasAppsScriptSecretToken()
+  );
+  const [isAppsScriptLocked, setIsAppsScriptLockedState] = useState<boolean>(() =>
+    isAppsScriptConfigLocked()
   );
   const [isConnectingAppsScript, setIsConnectingAppsScript] = useState<boolean>(false);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
@@ -416,25 +424,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const isFetchingRef = useRef<boolean>(false);
   const latestMutationSeqRef = useRef<number>(0);
   const pendingRefreshAfterWriteRef = useRef<boolean>(false);
-  const hasCheckedServerAppsScriptRef = useRef<boolean>(false);
+  const hasHydratedConfigRef = useRef<boolean>(false);
+  const lastKnownRevRef = useRef<string>('');
+  const lastFullSyncAtRef = useRef<number>(0);
+  const consecutiveSyncErrorsRef = useRef<number>(0);
+  const inFlightOptimisticIdsRef = useRef<Set<string>>(new Set());
   const syncChannelRef = useRef<BroadcastChannel | null>(null);
   const sessionRef = useRef<AuthSession | null>(session);
   sessionRef.current = session;
   const tokenRefreshPromiseRef = useRef<Promise<string | null> | null>(null);
 
-  const broadcastSyncEvent = useCallback((type: 'DATA_MUTATED' | 'APPS_SCRIPT_CHANGED', payload?: any) => {
-    try {
-      syncChannelRef.current?.postMessage({ type, payload, at: Date.now() });
-    } catch {}
-    try {
-      localStorage.setItem('dkb_last_sync_event', JSON.stringify({ type, at: Date.now() }));
-    } catch {}
-  }, []);
+  const broadcastSyncEvent = useCallback(
+    (
+      type:
+        | 'DATA_MUTATED'
+        | 'DATA_SNAPSHOT'
+        | 'DATA_OPTIMISTIC_ATTENDANCE'
+        | 'APPS_SCRIPT_CHANGED',
+      payload?: any
+    ) => {
+      try {
+        syncChannelRef.current?.postMessage({ type, payload, at: Date.now() });
+      } catch {}
+      try {
+        if (type === 'DATA_MUTATED' || type === 'APPS_SCRIPT_CHANGED' || type === 'DATA_SNAPSHOT') {
+          localStorage.setItem('dkb_last_sync_event', JSON.stringify({ type, at: Date.now() }));
+        }
+      } catch {}
+    },
+    []
+  );
 
   // 3-second batch scan collector for consecutive scans
   interface BatchItem {
     params: OfflineAttendanceScan;
-    resolve: (res: any) => void;
+    optimisticId?: string;
+    targetStudent?: Student;
+    resolve?: (res: any) => void;
   }
   const scanBatchQueueRef = useRef<BatchItem[]>([]);
   const scanBatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -520,7 +546,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (status === 401 && (data?.unauthorizedToken || data?.googleDeploymentUnauthorized)) {
         const msg =
           data.error ||
-          'Token rahasia (SECRET_TOKEN) atau deployment Google Apps Script ditolak (401). Periksa pengaturan di halaman Cek Sistem.';
+          'Token rahasia (SECRET_TOKEN) atau deployment Google Apps Script ditolak (401).';
         setConfigError(msg);
         if (Array.isArray(data?.missingConfig)) {
           setMissingEnv(data.missingConfig);
@@ -547,16 +573,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const applyDatabaseSnapshot = useCallback((d: any, serverTime?: string) => {
+  const applyDatabaseSnapshot = useCallback((d: any, serverTime?: string, rev?: string) => {
     if (serverTime) {
       setServerClockOffset(serverTime);
       setCurrentServerTime(getServerNow());
+    }
+    if (rev) {
+      lastKnownRevRef.current = String(rev);
     }
     if (!d || typeof d !== 'object') return;
     if (Array.isArray(d.students)) setStudents(d.students);
     if (Array.isArray(d.classes)) setClasses(d.classes);
     if (Array.isArray(d.sessions)) setSessions(d.sessions);
-    if (Array.isArray(d.attendance)) setAttendance(d.attendance);
+    if (Array.isArray(d.attendance)) {
+      const pendingOptIds = new Set<string>();
+      scanBatchQueueRef.current.forEach((b) => {
+        if (b.optimisticId) pendingOptIds.add(b.optimisticId);
+      });
+      inFlightOptimisticIdsRef.current.forEach((oid) => pendingOptIds.add(oid));
+
+      if (pendingOptIds.size === 0) {
+        setAttendance(d.attendance);
+      } else {
+        setAttendance((prev) => {
+          const preserved = prev.filter((item) => {
+            if (!pendingOptIds.has(item.id)) return false;
+            const alreadySaved = d.attendance.some(
+              (srv: AttendanceRecord) =>
+                srv.student_id === item.student_id &&
+                srv.session_id === item.session_id &&
+                srv.date === item.date
+            );
+            return !alreadySaved;
+          });
+          return [...preserved, ...d.attendance];
+        });
+      }
+    }
     if (Array.isArray(d.out_of_class)) setOutOfClass(d.out_of_class);
     if (Array.isArray(d.violations)) setViolations(d.violations);
     if (Array.isArray(d.violation_types)) setViolationTypes(d.violation_types);
@@ -733,13 +786,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, []);
 
   /**
-   * Direct read from Google Sheets via /api/sync
-   */
-  /**
    * Memuat data langsung dari Google Sheets melalui Google Apps Script Web App
+   * Memakai fast-revision check (`rev`) untuk respons permili detik saat belum ada perubahan,
+   * dan full snapshot otomatis bila terjadi mutasi atau setiap 15 detik / saat tab aktif.
    */
   const refreshFromSheets = useCallback(
-    async (silent = false, options?: { afterWrite?: boolean }) => {
+    async (silent = false, options?: { afterWrite?: boolean; forceFull?: boolean }) => {
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         setSyncStatus('offline');
         return;
@@ -766,18 +818,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const fetchStartMutationSeq = latestMutationSeqRef.current;
 
       try {
-        // Ambil URL Web App tersimpan di server sekali jika belum ada di perangkat ini
-        if (!getAppsScriptUrl() && !hasCheckedServerAppsScriptRef.current) {
-          hasCheckedServerAppsScriptRef.current = true;
-          const serverUrl = await fetchServerAppsScriptUrl();
-          if (serverUrl) {
-            const saved = setAppsScriptUrl(serverUrl);
-            setAppsScriptUrlState(saved);
-          }
+        // Hidrasi otomatis URL & SECRET_TOKEN dari 4 lapis browser + Vercel Env + /api/apps-script-config
+        if (!hasHydratedConfigRef.current || !hasCompleteAppsScriptConfig()) {
+          hasHydratedConfigRef.current = true;
+          const hydrated = await hydrateAppsScriptConfig();
+          setAppsScriptUrlState(hydrated.appsScriptUrl);
+          setAppsScriptSecretConfigured(Boolean(hydrated.secretToken));
+          setIsAppsScriptLockedState(hydrated.locked);
+        } else {
+          const curUrl = getAppsScriptUrl();
+          if (curUrl) setAppsScriptUrlState(curUrl);
+          setAppsScriptSecretConfigured(hasAppsScriptSecretToken());
+          setIsAppsScriptLockedState(isAppsScriptConfigLocked());
         }
 
         const clientMissing = getMissingClientConfig();
         setAppsScriptSecretConfigured(hasAppsScriptSecretToken());
+        setIsAppsScriptLockedState(isAppsScriptConfigLocked());
         if (clientMissing.length > 0) {
           setConfigError(
             `Konfigurasi Google Apps Script belum lengkap (${clientMissing.join(', ')} masih kosong).`
@@ -799,7 +856,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           return;
         }
 
-        const res = await apiFetch('/api/sync', {
+        const nowMs = Date.now();
+        const needsFullReconcile =
+          Boolean(options?.forceFull) ||
+          Boolean(options?.afterWrite) ||
+          !lastKnownRevRef.current ||
+          nowMs - lastFullSyncAtRef.current >= FULL_RECONCILE_INTERVAL_MS;
+
+        const syncParams = new URLSearchParams();
+        if (!needsFullReconcile && lastKnownRevRef.current) {
+          syncParams.set('rev', lastKnownRevRef.current);
+        } else {
+          syncParams.set('full', '1');
+        }
+        const syncEndpoint = `/api/sync?${syncParams.toString()}`;
+
+        const res = await apiFetch(syncEndpoint, {
           headers: buildApiHeaders({ 'Cache-Control': 'no-cache' }),
         });
         const data = await res.json().catch(() => ({}));
@@ -811,6 +883,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         if (handleAppsScriptUnauthorized(res.status, data)) {
+          consecutiveSyncErrorsRef.current += 1;
           setSyncStatus('error');
           return;
         }
@@ -820,6 +893,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         if (res.status === 503) {
+          consecutiveSyncErrorsRef.current += 1;
           const missing = Array.isArray(data.missingConfig)
             ? data.missingConfig
             : Array.isArray(data.missingEnv)
@@ -846,10 +920,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         if (!res.ok) {
+          consecutiveSyncErrorsRef.current += 1;
           setInitialLoadError(data.error || 'Gagal membaca data dari Google Sheets.');
           setSyncStatus('error');
           return;
         }
+
+        consecutiveSyncErrorsRef.current = 0;
 
         const missingList = Array.isArray(data.missingConfig)
           ? data.missingConfig
@@ -859,6 +936,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setConfigError(null);
         setInitialLoadError(null);
         setMissingEnv(missingList);
+
+        if (data.rev) {
+          lastKnownRevRef.current = String(data.rev);
+        }
+
+        if (data.unchanged) {
+          if (data.serverTime) {
+            setServerClockOffset(data.serverTime);
+            setCurrentServerTime(getServerNow());
+          }
+          setLastSyncTime(new Date());
+          setSyncStatus('synced');
+          return;
+        }
+
+        lastFullSyncAtRef.current = nowMs;
+
         setEnvStatus({
           configured: Boolean(data.configured),
           sheetsConfigured: Boolean(data.sheetsConfigured),
@@ -873,7 +967,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
 
         if (data.data) {
-          applyDatabaseSnapshot(data.data, data.serverTime);
+          applyDatabaseSnapshot(data.data, data.serverTime, data.rev);
+          broadcastSyncEvent('DATA_SNAPSHOT', {
+            snapshot: data.data,
+            serverTime: data.serverTime,
+            rev: data.rev,
+          });
         } else {
           if (data.serverTime) {
             setServerClockOffset(data.serverTime);
@@ -883,6 +982,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           setSyncStatus('synced');
         }
       } catch (err: any) {
+        consecutiveSyncErrorsRef.current += 1;
         setSyncStatus(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'error');
         if (!silent) {
           setInitialLoadError(err?.message || 'Koneksi ke Google Apps Script bermasalah.');
@@ -892,11 +992,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setIsInitialLoading(false);
         if (pendingRefreshAfterWriteRef.current) {
           pendingRefreshAfterWriteRef.current = false;
-          void refreshFromSheets(true);
+          void refreshFromSheets(true, { forceFull: true });
         }
       }
     },
-    [applyDatabaseSnapshot, buildApiHeaders, handleAppsScriptUnauthorized, refreshAuthSessionIfNeeded]
+    [
+      applyDatabaseSnapshot,
+      broadcastSyncEvent,
+      buildApiHeaders,
+      handleAppsScriptUnauthorized,
+      refreshAuthSessionIfNeeded,
+    ]
   );
 
   const connectAppsScript = useCallback(
@@ -911,8 +1017,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
         const saved = setAppsScriptUrl(rawUrl);
         setAppsScriptSecretToken(resolvedSecret);
+        setAppsScriptConfigLocked(true);
         setAppsScriptUrlState(saved);
         setAppsScriptSecretConfigured(true);
+        setIsAppsScriptLockedState(true);
         setConfigError(null);
         setInitialLoadError(null);
 
@@ -920,7 +1028,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setMissingEnv(missingList);
 
         if (result.data?.data) {
-          applyDatabaseSnapshot(result.data.data, result.data.serverTime);
+          applyDatabaseSnapshot(result.data.data, result.data.serverTime, result.data.rev);
+          lastFullSyncAtRef.current = Date.now();
           setEnvStatus({
             configured: Boolean(result.data.configured ?? true),
             sheetsConfigured: Boolean(result.data.sheetsConfigured ?? true),
@@ -935,7 +1044,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           });
         }
 
-        await persistServerAppsScriptUrl(saved);
+        await persistServerAppsScriptConfig(saved, resolvedSecret);
         broadcastSyncEvent('APPS_SCRIPT_CHANGED', { appsScriptUrl: saved });
 
         let activeAppToken = sessionRef.current?.token || '';
@@ -954,7 +1063,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
         showToast(result.message, 'success');
         if (!result.data?.data) {
-          await refreshFromSheets(false, { afterWrite: true });
+          await refreshFromSheets(false, { afterWrite: true, forceFull: true });
         }
         return { ok: true, message: result.message };
       } finally {
@@ -974,11 +1083,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const disconnectAppsScript = useCallback(async () => {
     clearAppsScriptUrl();
     clearAppsScriptSecretToken();
+    setAppsScriptConfigLocked(false);
     setAppsScriptUrlState('');
     setAppsScriptSecretConfigured(false);
+    setIsAppsScriptLockedState(false);
     await clearServerAppsScriptUrl();
     broadcastSyncEvent('APPS_SCRIPT_CHANGED', { appsScriptUrl: '' });
-    showToast('Koneksi backend Google Apps Script diputuskan.', 'info');
+    showToast('Koneksi backend Google Apps Script dibuka kunci & diputuskan.', 'info');
     await refreshFromSheets(false, { afterWrite: true });
   }, [broadcastSyncEvent, refreshFromSheets, showToast]);
 
@@ -1038,11 +1149,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           showToast(`${queued.length} data presensi offline berhasil disinkronkan ke Google Sheets.`, 'success');
         }
         if (data.snapshot) {
-          applyDatabaseSnapshot(data.snapshot, data.serverTime);
+          applyDatabaseSnapshot(data.snapshot, data.serverTime, data.rev);
+          broadcastSyncEvent('DATA_SNAPSHOT', {
+            snapshot: data.snapshot,
+            serverTime: data.serverTime,
+            rev: data.rev,
+          });
         } else {
-          await refreshFromSheets(true, { afterWrite: true });
+          await refreshFromSheets(true, { afterWrite: true, forceFull: true });
+          broadcastSyncEvent('DATA_MUTATED');
         }
-        broadcastSyncEvent('DATA_MUTATED');
       } else if (res.status < 500 && res.status !== 429 && res.status !== 401) {
         writeOfflineScans([]);
         setPendingOfflineScansCount(0);
@@ -1064,13 +1180,41 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     showToast,
   ]);
 
-  // Muat awal + verifikasi sesi + auto-reload tiap 15 detik & saat tab aktif kembali
+  // Muat awal + verifikasi sesi + sinkronisasi otomatis real-time (cooldown 350ms + lintas-tab <1ms + saat tab aktif)
   useEffect(() => {
-    refreshFromSheets(false);
-    flushOfflineAttendanceScans();
-    if (sessionRef.current?.token) {
-      void refreshAuthSessionIfNeeded(false);
-    }
+    let cancelled = false;
+    let syncLoopTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const scheduleNextSync = () => {
+      if (cancelled) return;
+      if (syncLoopTimer) clearTimeout(syncLoopTimer);
+      const errCount = consecutiveSyncErrorsRef.current;
+      const delay =
+        errCount === 0
+          ? REALTIME_SYNC_COOLDOWN_MS
+          : Math.min(8000, 1500 * Math.pow(2, errCount - 1));
+
+      syncLoopTimer = setTimeout(async () => {
+        if (cancelled) return;
+        const isVisible = typeof document === 'undefined' || document.visibilityState === 'visible';
+        const isOnline = typeof navigator === 'undefined' || navigator.onLine;
+        if (isVisible && isOnline && hasCompleteAppsScriptConfig() && !isFetchingRef.current) {
+          await refreshFromSheets(true);
+          void flushOfflineAttendanceScans();
+        }
+        scheduleNextSync();
+      }, delay);
+    };
+
+    const bootSync = async () => {
+      await refreshFromSheets(false, { forceFull: true });
+      await flushOfflineAttendanceScans();
+      if (sessionRef.current?.token) {
+        void refreshAuthSessionIfNeeded(false);
+      }
+      scheduleNextSync();
+    };
+    void bootSync();
 
     let bc: BroadcastChannel | null = null;
     try {
@@ -1083,42 +1227,45 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (msg.type === 'APPS_SCRIPT_CHANGED') {
             setAppsScriptUrlState(getAppsScriptUrl());
             setAppsScriptSecretConfigured(hasAppsScriptSecretToken());
-            void refreshFromSheets(true, { afterWrite: true });
+            setIsAppsScriptLockedState(isAppsScriptConfigLocked());
+            void refreshFromSheets(true, { afterWrite: true, forceFull: true });
+          } else if (msg.type === 'DATA_SNAPSHOT' && msg.payload?.snapshot) {
+            applyDatabaseSnapshot(msg.payload.snapshot, msg.payload.serverTime, msg.payload.rev);
+          } else if (msg.type === 'DATA_OPTIMISTIC_ATTENDANCE' && msg.payload?.record) {
+            const optRec = msg.payload.record as AttendanceRecord;
+            setAttendance((prev) =>
+              prev.some((a) => a.id === optRec.id) ? prev : [optRec, ...prev]
+            );
           } else if (msg.type === 'DATA_MUTATED') {
-            void refreshFromSheets(true, { afterWrite: true });
+            void refreshFromSheets(true, { afterWrite: true, forceFull: true });
           }
         };
       }
     } catch {}
 
     const handleStorageEvent = (e: StorageEvent) => {
-      if (e.key === 'dkb_apps_script_url' || e.key === 'dkb_apps_script_secret') {
+      if (e.key === 'dkb_apps_script_url' || e.key === 'dkb_apps_script_secret' || e.key === 'dkb_apps_script_locked') {
         setAppsScriptUrlState(getAppsScriptUrl());
         setAppsScriptSecretConfigured(hasAppsScriptSecretToken());
-        void refreshFromSheets(true, { afterWrite: true });
+        setIsAppsScriptLockedState(isAppsScriptConfigLocked());
+        void refreshFromSheets(true, { afterWrite: true, forceFull: true });
       } else if (e.key === 'dkb_last_sync_event') {
         void refreshFromSheets(true, { afterWrite: true });
       }
     };
 
-    const interval = setInterval(() => {
-      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
-        refreshFromSheets(true);
-        flushOfflineAttendanceScans();
-      }
-    }, AUTO_REFRESH_INTERVAL_MS);
-
     const handleVisibilityOrFocus = () => {
       if (document.visibilityState === 'visible') {
-        refreshFromSheets(true);
-        flushOfflineAttendanceScans();
+        void refreshFromSheets(true, { forceFull: true });
+        void flushOfflineAttendanceScans();
       }
     };
 
     const handleOnline = () => {
+      consecutiveSyncErrorsRef.current = 0;
       setSyncStatus('syncing');
-      flushOfflineAttendanceScans();
-      refreshFromSheets(true, { afterWrite: true });
+      void flushOfflineAttendanceScans();
+      void refreshFromSheets(true, { afterWrite: true, forceFull: true });
     };
 
     const handleOffline = () => {
@@ -1146,7 +1293,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     window.addEventListener('dkb-app-token-refreshed', handleAppTokenRefreshedEvent);
 
     return () => {
-      clearInterval(interval);
+      cancelled = true;
+      if (syncLoopTimer) clearTimeout(syncLoopTimer);
       document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
       window.removeEventListener('focus', handleVisibilityOrFocus);
       window.removeEventListener('online', handleOnline);
@@ -1159,7 +1307,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       } catch {}
       syncChannelRef.current = null;
     };
-  }, [refreshFromSheets, flushOfflineAttendanceScans, handleAppsScriptUnauthorized, refreshAuthSessionIfNeeded]);
+  }, [
+    applyDatabaseSnapshot,
+    refreshFromSheets,
+    flushOfflineAttendanceScans,
+    handleAppsScriptUnauthorized,
+    refreshAuthSessionIfNeeded,
+  ]);
 
   // Flush the 3-second batch of scans to POST /api/attendance
   const flushScanBatch = useCallback(async () => {
@@ -1170,6 +1324,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const items = scanBatchQueueRef.current.splice(0, scanBatchQueueRef.current.length);
     if (items.length === 0) return;
+
+    const batchOptimisticIds = items.map((it) => it.optimisticId).filter(Boolean) as string[];
+    batchOptimisticIds.forEach((oid) => inFlightOptimisticIdsRef.current.add(oid));
+
+    const clearInFlightOptimistic = () => {
+      batchOptimisticIds.forEach((oid) => inFlightOptimisticIdsRef.current.delete(oid));
+    };
 
     setSavingState();
 
@@ -1189,8 +1350,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       let { res, data } = await sendBatch();
       if (handleAppsScriptUnauthorized(res.status, data)) {
         const msg = data.error || 'Token rahasia Apps Script ditolak.';
+        clearInFlightOptimistic();
+        if (batchOptimisticIds.length > 0) {
+          setAttendance((prev) => prev.filter((a) => !batchOptimisticIds.includes(a.id)));
+        }
         setSaveErrorState(msg);
-        items.forEach((it) => it.resolve({ success: false, error: msg }));
+        items.forEach((it) => it.resolve?.({ success: false, error: msg }));
         return;
       }
 
@@ -1209,20 +1374,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       if (!res.ok) {
         if (res.status >= 500 || res.status === 429) {
+          clearInFlightOptimistic();
           const existingOffline = readOfflineScans();
           const newOffline = [...existingOffline, ...items.map((i) => i.params)];
           writeOfflineScans(newOffline);
           setPendingOfflineScansCount(newOffline.length);
           const msg = data.error || 'Server/kuota sibuk, scan disimpan sementara di perangkat.';
           setSaveErrorState(msg);
-          items.forEach((it) => it.resolve({ success: false, error: msg, offlineQueued: true }));
+          items.forEach((it) => it.resolve?.({ success: false, error: msg, offlineQueued: true }));
           return;
+        }
+        clearInFlightOptimistic();
+        if (batchOptimisticIds.length > 0) {
+          setAttendance((prev) => prev.filter((a) => !batchOptimisticIds.includes(a.id)));
         }
         soundEffects.playErrorBeep();
         const errMsg = data.error || 'Presensi gagal disimpan.';
         setSaveErrorState(errMsg);
+        showToast(errMsg, 'error');
         items.forEach((it) =>
-          it.resolve({
+          it.resolve?.({
             success: false,
             error: errMsg,
             isDuplicate: data.isDuplicate,
@@ -1235,27 +1406,62 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const savedResults: any[] = Array.isArray(data.results) ? data.results : [];
       const rejectedList: any[] = Array.isArray(data.rejectedDuplicates) ? data.rejectedDuplicates : [];
 
+      clearInFlightOptimistic();
+
       if (savedResults.length > 0) {
-        soundEffects.playSuccessBeep();
+        // Jika ada item yang sudah ter-resolusi optimistik, jangan bunyikan beep ganda jika semua sukses
+        const hadNonOptimistic = items.some((it) => Boolean(it.resolve));
+        if (hadNonOptimistic) {
+          soundEffects.playSuccessBeep();
+        }
         setAttendance((prev) => [
           ...savedResults.map((r) => r.record),
-          ...prev.filter((p) => !savedResults.some((sr) => sr.record.id === p.id)),
+          ...prev.filter(
+            (p) =>
+              !batchOptimisticIds.includes(p.id) &&
+              !savedResults.some((sr) => sr.record.id === p.id)
+          ),
         ]);
         setSavedState('Tersimpan');
       } else {
+        if (batchOptimisticIds.length > 0) {
+          setAttendance((prev) => prev.filter((a) => !batchOptimisticIds.includes(a.id)));
+        }
         soundEffects.playErrorBeep();
-        setSaveErrorState(rejectedList[0]?.message || 'Presensi ditolak.');
+        const rejMsg = rejectedList[0]?.message || 'Presensi ditolak.';
+        setSaveErrorState(rejMsg);
+        if (items.some((it) => !it.resolve)) {
+          showToast(rejMsg, 'error');
+        }
+      }
+
+      if (rejectedList.length > 0 && savedResults.length > 0) {
+        const hasOptimisticRejected = items.some(
+          (it) =>
+            !it.resolve &&
+            rejectedList.some(
+              (r) =>
+                (it.targetStudent && r.studentId === it.targetStudent.nis) ||
+                (it.params.studentId && r.studentId === it.params.studentId)
+            )
+        );
+        if (hasOptimisticRejected) {
+          showToast(rejectedList[0]?.message || 'Sebagian scan ditolak server.', 'error');
+        }
       }
 
       items.forEach((it) => {
-        const targetStudent = students.find(
-          (s) =>
-            (it.params.studentId && s.nis === it.params.studentId) ||
-            (it.params.code &&
-              (s.nis.toLowerCase() === it.params.code.trim().toLowerCase() ||
-                s.rfid_uid.toLowerCase() === it.params.code.trim().toLowerCase() ||
-                s.card_code.toLowerCase() === it.params.code.trim().toLowerCase()))
-        );
+        if (!it.resolve) return;
+        const targetStudent =
+          it.targetStudent ||
+          students.find(
+            (s) =>
+              (it.params.studentId && s.nis === it.params.studentId) ||
+              (it.params.code &&
+                (s.nis.toLowerCase() === it.params.code.trim().toLowerCase() ||
+                  s.rfid_uid.toLowerCase() === it.params.code.trim().toLowerCase() ||
+                  s.card_code.toLowerCase() === it.params.code.trim().toLowerCase()))
+          );
 
         const matchSaved = savedResults.find(
           (r) =>
@@ -1289,12 +1495,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
 
       if (data.snapshot) {
-        applyDatabaseSnapshot(data.snapshot, data.serverTime);
+        applyDatabaseSnapshot(data.snapshot, data.serverTime, data.rev);
+        broadcastSyncEvent('DATA_SNAPSHOT', {
+          snapshot: data.snapshot,
+          serverTime: data.serverTime,
+          rev: data.rev,
+        });
       } else {
-        await refreshFromSheets(true, { afterWrite: true });
+        await refreshFromSheets(true, { afterWrite: true, forceFull: true });
+        broadcastSyncEvent('DATA_MUTATED');
       }
-      broadcastSyncEvent('DATA_MUTATED');
     } catch {
+      clearInFlightOptimistic();
       const existingOffline = readOfflineScans();
       const newOffline = [...existingOffline, ...items.map((i) => i.params)];
       writeOfflineScans(newOffline);
@@ -1302,7 +1514,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setSyncStatus('offline');
       setSaveErrorState('Offline: scan tersimpan sementara di perangkat.');
       items.forEach((it) =>
-        it.resolve({
+        it.resolve?.({
           success: false,
           error: 'Tidak ada koneksi internet. Scan disimpan di perangkat & dikirim otomatis saat online.',
           offlineQueued: true,
@@ -1320,11 +1532,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSavingState,
     setSavedState,
     setSaveErrorState,
+    showToast,
   ]);
 
   /**
-   * Helper to run direct write fetch with 'Menyimpan...' -> 'Tersimpan' status,
-   * automatic 401 token refresh + retry, immediate snapshot sync, and 409 Conflict UI
+   * Helper to run direct write fetch with <1ms optimistic state + rollback,
+   * 'Menyimpan...' -> 'Tersimpan' status, automatic 401 token refresh + retry,
+   * immediate snapshot sync across tabs, and 409 Conflict UI.
    */
   const runWriteRequest = useCallback(
     async (params: {
@@ -1332,6 +1546,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       method: 'POST' | 'PUT' | 'DELETE';
       body: any;
       conflictTitle?: string;
+      applyOptimistic?: () => () => void;
       onSuccess?: (data: any) => void;
       successMessage?: string;
       silentToast?: boolean;
@@ -1343,6 +1558,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return { ok: false, error: offlineMsg };
       }
 
+      const rollbackOptimistic = params.applyOptimistic ? params.applyOptimistic() : undefined;
       setSavingState();
       latestMutationSeqRef.current += 1;
 
@@ -1361,6 +1577,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           const data = await res.json().catch(() => ({}));
 
           if (handleAppsScriptUnauthorized(res.status, data)) {
+            rollbackOptimistic?.();
             const msg = data.error || 'Token rahasia Apps Script ditolak.';
             setSaveErrorState(msg);
             return { ok: false, error: msg };
@@ -1371,12 +1588,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             if (refreshedTok) {
               return execute(forceOverwrite, true, refreshedTok);
             }
+            rollbackOptimistic?.();
             const authErr = data.error || 'Sesi login telah berakhir. Silakan masuk kembali.';
             setSaveErrorState(authErr);
             return { ok: false, error: authErr, data };
           }
 
           if (res.status === 409 && data.conflict) {
+            rollbackOptimistic?.();
             const msg = data.error || 'Data sudah diubah oleh pengguna lain sebelum Anda menyimpan.';
             setSaveErrorState('Konflik edit terdeteksi');
             return await new Promise((resolve) => {
@@ -1386,7 +1605,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 currentData: data.current,
                 onReloadLatest: async () => {
                   setConflictPrompt(null);
-                  await refreshFromSheets(true, { afterWrite: true });
+                  await refreshFromSheets(true, { afterWrite: true, forceFull: true });
                   resolve({ ok: false, error: msg });
                 },
                 onForceOverwrite: async () => {
@@ -1400,6 +1619,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }
 
           if (!res.ok) {
+            rollbackOptimistic?.();
             const errMsg = data.error || `Gagal menyimpan data (${res.status})`;
             setSaveErrorState(errMsg);
             if (!params.silentToast) showToast(errMsg, 'error');
@@ -1407,13 +1627,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }
 
           if (data.snapshot) {
-            applyDatabaseSnapshot(data.snapshot, data.serverTime);
+            applyDatabaseSnapshot(data.snapshot, data.serverTime, data.rev);
+            broadcastSyncEvent('DATA_SNAPSHOT', {
+              snapshot: data.snapshot,
+              serverTime: data.serverTime,
+              rev: data.rev,
+            });
           } else {
             if (params.url === '/api/settings' && data.settings) {
               setSettings((prev) => ({ ...prev, ...data.settings }));
             } else if (params.url === '/api/notifications' && data.settings) {
               setNotificationSettings((prev) => ({ ...prev, ...data.settings }));
             }
+            broadcastSyncEvent('DATA_MUTATED');
           }
 
           setSavedState('Tersimpan');
@@ -1421,12 +1647,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (params.successMessage && !params.silentToast) {
             showToast(params.successMessage, 'success');
           }
-          broadcastSyncEvent('DATA_MUTATED');
           if (!data.snapshot) {
-            await refreshFromSheets(true, { afterWrite: true });
+            await refreshFromSheets(true, { afterWrite: true, forceFull: true });
           }
           return { ok: true, data };
         } catch (err: any) {
+          rollbackOptimistic?.();
           const errMsg = err?.message || 'Gagal terhubung ke Apps Script.';
           setSaveErrorState(errMsg);
           if (!params.silentToast) showToast(errMsg, 'error');
@@ -1626,10 +1852,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const manualOverride = Boolean(
       manualSessionOverrideId || (params.sessionId && params.sessionId !== activeSession?.id)
     );
-    const targetSessionId = params.sessionId || activeSession?.id;
-    const todayStr = getServerNow().toISOString().split('T')[0];
+    const targetSessionObj =
+      (params.sessionId && sessions.find((s) => s.id === params.sessionId)) ||
+      activeSession ||
+      sessions.find((s) => s.is_active) ||
+      sessions[0];
+    const targetSessionId = targetSessionObj?.id || params.sessionId;
+    const serverNow = getServerNow();
+    const todayStr = serverNow.toISOString().split('T')[0];
 
-    // Quick duplicate & card validation against current state before queueing 3s batch
+    // Quick duplicate & card validation against current state (<1ms) before queueing 3s batch
     const targetStudent = students.find(
       (s) =>
         (params.studentId && s.nis === params.studentId) ||
@@ -1656,6 +1888,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const alreadyInBatch = scanBatchQueueRef.current.some(
         (b) =>
           (b.params.studentId && b.params.studentId === targetStudent.nis) ||
+          (b.targetStudent && b.targetStudent.nis === targetStudent.nis) ||
           (params.code && b.params.code && b.params.code.trim().toLowerCase() === params.code.trim().toLowerCase())
       );
       if (alreadyInBatch) {
@@ -1664,6 +1897,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           success: false,
           error: `Presensi ganda dalam antrean 3 detik untuk ${targetStudent.name}.`,
           isDuplicate: true,
+          student: targetStudent,
+        };
+      }
+
+      const activeLeave = leaveRequests.find(
+        (l) =>
+          l.student_id === targetStudent.nis &&
+          l.status === 'approved' &&
+          todayStr >= l.start_date &&
+          todayStr <= l.end_date
+      );
+      if (activeLeave && !params.status) {
+        soundEffects.playErrorBeep();
+        return {
+          success: false,
+          error: `Siswa ${targetStudent.name} berstatus ${activeLeave.type.toUpperCase()} hari ini: ${activeLeave.reason}`,
           student: targetStudent,
         };
       }
@@ -1693,13 +1942,74 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       };
     }
 
-    // Collect scans in frontend for 3 seconds, then send in one batch request
+    // Jika siswa & sesi ditemukan di state lokal, tampilkan & sinkronkan optimistik permili detik (0ms),
+    // sembari tetap mengumpulkan batch scan selama 3 detik di latar belakang ke Apps Script!
+    if (targetStudent && targetSessionObj) {
+      let optStatus = (params.status || 'Hadir') as AttendanceRecord['status'];
+      let optLateMinutes = 0;
+      if (!params.status && targetSessionObj.on_time_limit) {
+        const parts = String(targetSessionObj.on_time_limit).split(':');
+        const limitMin = (Number(parts[0]) || 0) * 60 + (Number(parts[1]) || 0);
+        const curMin = serverNow.getHours() * 60 + serverNow.getMinutes();
+        const diffMin = curMin - limitMin;
+        if (diffMin > 0) {
+          optLateMinutes = diffMin;
+          optStatus = 'Terlambat';
+        }
+      }
+
+      const nowIso = serverNow.toISOString();
+      const optimisticRecord: AttendanceRecord = {
+        id: `opt_${scanObj.localId}`,
+        student_id: targetStudent.nis,
+        session_id: targetSessionObj.id,
+        date: todayStr,
+        timestamp: nowIso,
+        status: optStatus,
+        late_minutes: optLateMinutes,
+        method:
+          (params.method as AttendanceRecord['method']) ||
+          (String(params.code || '').startsWith('RFID-') ? 'rfid' : 'barcode'),
+        device_id: 'kiosk_main',
+        photo_id: '',
+        notes: params.notes || '',
+        version: 1,
+        created_at: nowIso,
+        updated_at: nowIso,
+        diubah_pada: nowIso,
+      };
+
+      setAttendance((prev) => [optimisticRecord, ...prev]);
+      soundEffects.playSuccessBeep();
+      setSavingState();
+      broadcastSyncEvent('DATA_OPTIMISTIC_ATTENDANCE', { record: optimisticRecord });
+
+      scanBatchQueueRef.current.push({
+        params: scanObj,
+        optimisticId: optimisticRecord.id,
+        targetStudent,
+      });
+      if (!scanBatchTimerRef.current) {
+        scanBatchTimerRef.current = setTimeout(() => {
+          void flushScanBatch();
+        }, SCAN_BATCH_WINDOW_MS);
+      }
+
+      return {
+        success: true,
+        record: optimisticRecord,
+        student: targetStudent,
+        session: targetSessionObj,
+      };
+    }
+
+    // Fallback (kartu tidak ditemukan di state lokal): tunggu verifikasi server lewat batch 3 detik
     return await new Promise<any>((resolve) => {
       setSavingState();
       scanBatchQueueRef.current.push({ params: scanObj, resolve });
       if (!scanBatchTimerRef.current) {
         scanBatchTimerRef.current = setTimeout(() => {
-          flushScanBatch();
+          void flushScanBatch();
         }, SCAN_BATCH_WINDOW_MS);
       }
     });
@@ -1717,6 +2027,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
       },
       conflictTitle: 'Konflik Edit Presensi',
+      applyOptimistic: existing
+        ? () => {
+            const snapshot = attendance;
+            setAttendance((prev) => prev.map((a) => (a.id === id ? { ...a, ...updates } : a)));
+            return () => setAttendance(snapshot);
+          }
+        : undefined,
       successMessage: 'Presensi berhasil diperbarui & disimpan ke Google Sheets.',
     });
     return res.ok;
@@ -1734,6 +2051,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       url: '/api/attendance',
       method: 'DELETE',
       body: { id, reason },
+      applyOptimistic: () => {
+        const snapshot = attendance;
+        setAttendance((prev) => prev.filter((a) => a.id !== id));
+        return () => setAttendance(snapshot);
+      },
       successMessage: 'Presensi berhasil ditandai dihapus (soft delete) di Google Sheets.',
     });
     return res.ok;
@@ -1781,6 +2103,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
       },
       conflictTitle: 'Konflik Konfirmasi Kepulangan',
+      applyOptimistic: existing
+        ? () => {
+            const snapshot = outOfClass;
+            const returnedAt = getServerNow().toISOString();
+            setOutOfClass((prev) =>
+              prev.map((o) => (o.id === id ? { ...o, status: 'returned', returned_at: returnedAt } : o))
+            );
+            return () => setOutOfClass(snapshot);
+          }
+        : undefined,
       silentToast: true,
     });
     if (!res.ok) {
@@ -1830,6 +2162,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       url: '/api/violations',
       method: 'DELETE',
       body: { id, reason },
+      applyOptimistic: () => {
+        const snapshot = violations;
+        setViolations((prev) => prev.filter((v) => v.id !== id));
+        return () => setViolations(snapshot);
+      },
       successMessage: 'Catatan pelanggaran ditandai dihapus (soft delete) di Google Sheets.',
     });
     return res.ok;
@@ -1845,6 +2182,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
       },
       conflictTitle: `Konflik Edit Siswa (${student.name})`,
+      applyOptimistic: () => {
+        const snapshot = students;
+        setStudents((prev) =>
+          existing
+            ? prev.map((s) => (s.nis === student.nis ? { ...s, ...student } : s))
+            : [student, ...prev]
+        );
+        return () => setStudents(snapshot);
+      },
       successMessage: `Data siswa ${student.name} tersimpan di Google Sheets.`,
     });
     return res.ok;
@@ -1863,6 +2209,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       url: '/api/students',
       method: 'DELETE',
       body: { nis },
+      applyOptimistic: () => {
+        const snapshot = students;
+        setStudents((prev) => prev.filter((s) => s.nis !== nis));
+        return () => setStudents(snapshot);
+      },
       successMessage: 'Siswa ditandai dihapus di Google Sheets.',
     });
     return res.ok;
@@ -1876,10 +2227,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
     if (!confirmed) return false;
 
+    const nisSet = new Set(nisses);
     const res = await runWriteRequest({
       url: '/api/students',
       method: 'DELETE',
       body: { nisses },
+      applyOptimistic: () => {
+        const snapshot = students;
+        setStudents((prev) => prev.filter((s) => !nisSet.has(s.nis)));
+        return () => setStudents(snapshot);
+      },
       successMessage: `${nisses.length} siswa ditandai dihapus di Google Sheets.`,
     });
     return res.ok;
@@ -1890,6 +2247,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       url: '/api/students',
       method: 'DELETE',
       body: { action: 'clear_all' },
+      applyOptimistic: () => {
+        const snapshot = students;
+        setStudents([]);
+        return () => setStudents(snapshot);
+      },
       successMessage: 'Seluruh data siswa ditandai dihapus di Google Sheets.',
     });
     return res.ok;
@@ -1916,6 +2278,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     let totalClassesCreated = 0;
     let lastSnapshot: any = null;
     let lastServerTime: string | undefined;
+    let lastRev: string | undefined;
 
     try {
       for (let i = 0; i < newStudents.length; i += CHUNK_SIZE) {
@@ -1970,15 +2333,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         totalClassesCreated += Number(data.classesCreated || 0);
         if (data.snapshot) lastSnapshot = data.snapshot;
         if (data.serverTime) lastServerTime = data.serverTime;
+        if (data.rev) lastRev = String(data.rev);
       }
 
       if (lastSnapshot) {
-        applyDatabaseSnapshot(lastSnapshot, lastServerTime);
+        applyDatabaseSnapshot(lastSnapshot, lastServerTime, lastRev);
+        broadcastSyncEvent('DATA_SNAPSHOT', {
+          snapshot: lastSnapshot,
+          serverTime: lastServerTime,
+          rev: lastRev,
+        });
       } else {
-        await refreshFromSheets(true, { afterWrite: true });
+        await refreshFromSheets(true, { afterWrite: true, forceFull: true });
+        broadcastSyncEvent('DATA_MUTATED');
       }
       setSavedState('Tersimpan');
-      broadcastSyncEvent('DATA_MUTATED');
 
       return {
         success: true,
@@ -2009,6 +2378,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
       },
       conflictTitle: `Konflik Edit Kelas (${cls.name})`,
+      applyOptimistic: () => {
+        const snapshot = classes;
+        setClasses((prev) =>
+          existing ? prev.map((c) => (c.id === cls.id ? { ...c, ...cls } : c)) : [cls, ...prev]
+        );
+        return () => setClasses(snapshot);
+      },
       successMessage: `Data kelas ${cls.name} tersimpan di Google Sheets.`,
     });
     return res.ok;
@@ -2027,6 +2403,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       url: '/api/classes',
       method: 'DELETE',
       body: { id },
+      applyOptimistic: () => {
+        const snapshot = classes;
+        setClasses((prev) => prev.filter((c) => c.id !== id));
+        return () => setClasses(snapshot);
+      },
       successMessage: 'Kelas berhasil dihapus (soft delete).',
     });
     return res.ok;
@@ -2042,6 +2423,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
       },
       conflictTitle: `Konflik Edit Sesi (${sess.name})`,
+      applyOptimistic: () => {
+        const snapshot = sessions;
+        setSessions((prev) =>
+          existing ? prev.map((s) => (s.id === sess.id ? { ...s, ...sess } : s)) : [sess, ...prev]
+        );
+        return () => setSessions(snapshot);
+      },
       successMessage: `Sesi ${sess.name} tersimpan di Google Sheets.`,
     });
     return res.ok;
@@ -2060,6 +2448,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       url: '/api/sessions',
       method: 'DELETE',
       body: { id },
+      applyOptimistic: () => {
+        const snapshot = sessions;
+        setSessions((prev) => prev.filter((s) => s.id !== id));
+        return () => setSessions(snapshot);
+      },
       successMessage: 'Sesi presensi berhasil dihapus (soft delete).',
     });
     return res.ok;
@@ -2075,6 +2468,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
       },
       conflictTitle: `Konflik Edit Jenis Pelanggaran (${vt.name})`,
+      applyOptimistic: () => {
+        const snapshot = violationTypes;
+        setViolationTypes((prev) =>
+          existing ? prev.map((v) => (v.id === vt.id ? { ...v, ...vt } : v)) : [vt, ...prev]
+        );
+        return () => setViolationTypes(snapshot);
+      },
       successMessage: `Jenis pelanggaran ${vt.name} tersimpan di Google Sheets.`,
     });
     return res.ok;
@@ -2093,6 +2493,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       url: '/api/violation-types',
       method: 'DELETE',
       body: { id },
+      applyOptimistic: () => {
+        const snapshot = violationTypes;
+        setViolationTypes((prev) => prev.filter((v) => v.id !== id));
+        return () => setViolationTypes(snapshot);
+      },
       successMessage: 'Jenis pelanggaran berhasil dihapus (soft delete).',
     });
     return res.ok;
@@ -2104,12 +2509,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         url: '/api/settings',
         method: 'POST',
         body: updates,
+        applyOptimistic: () => {
+          const snapshot = settings;
+          setSettings((prev) => ({ ...prev, ...updates }));
+          return () => setSettings(snapshot);
+        },
         successMessage: 'Pengaturan aplikasi berhasil disimpan ke Google Sheets.',
         silentToast: options?.silent,
       });
       return res.ok;
     },
-    [runWriteRequest]
+    [runWriteRequest, settings]
   );
 
   const updateNotificationSettings = useCallback(
@@ -2118,12 +2528,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         url: '/api/notifications',
         method: 'POST',
         body: updates,
+        applyOptimistic: () => {
+          const snapshot = notificationSettings;
+          setNotificationSettings((prev) => ({ ...prev, ...updates }));
+          return () => setNotificationSettings(snapshot);
+        },
         successMessage: 'Pengaturan notifikasi email tersimpan ke Google Sheets.',
         silentToast: options?.silent,
       });
       return res.ok;
     },
-    [runWriteRequest]
+    [runWriteRequest, notificationSettings]
   );
 
   const sendTestEmail = async (email: string) => {
@@ -2239,6 +2654,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
       },
       conflictTitle: 'Konflik Persetujuan Izin',
+      applyOptimistic: existing
+        ? () => {
+            const snapshot = leaveRequests;
+            setLeaveRequests((prev) =>
+              prev.map((l) =>
+                l.id === id ? { ...l, status, rejection_reason: rejectionReason } : l
+              )
+            );
+            return () => setLeaveRequests(snapshot);
+          }
+        : undefined,
       successMessage: status === 'approved' ? 'Pengajuan izin disetujui.' : 'Pengajuan izin ditolak.',
     });
     return res.ok;
@@ -2259,6 +2685,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         envStatus,
         appsScriptUrl,
         appsScriptSecretConfigured,
+        isAppsScriptLocked,
         isConnectingAppsScript,
         connectAppsScript,
         disconnectAppsScript,

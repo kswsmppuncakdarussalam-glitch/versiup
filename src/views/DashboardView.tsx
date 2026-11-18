@@ -394,7 +394,7 @@ export const DashboardView: React.FC = () => {
             <span>{initialLoadError}</span>
           </div>
           <span className="text-[11px] font-medium text-amber-700 dark:text-amber-300 shrink-0">
-            Pembaruan otomatis berjalan setiap 15 detik &amp; saat tab aktif.
+            Sinkronisasi otomatis berjalan real-time &amp; saat tab aktif.
           </span>
         </div>
       )}

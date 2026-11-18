@@ -366,6 +366,42 @@ function getJwtSecret_() {
   return getProp_('JWT_SECRET', 'disiplin-kita-bisa-secure-secret-key-2026');
 }
 
+var DATA_REV_KEY = 'dkb_data_rev';
+
+function bumpDataRevision_() {
+  try {
+    if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.flush) {
+      SpreadsheetApp.flush();
+    }
+  } catch (ef) {}
+  var nextRev = String(Date.now()) + '_' + Math.floor(Math.random() * 1000000);
+  try {
+    CacheService.getScriptCache().put(DATA_REV_KEY, nextRev, 21600);
+  } catch (e) {}
+  try {
+    PropertiesService.getScriptProperties().setProperty(DATA_REV_KEY, nextRev);
+  } catch (e2) {}
+  return nextRev;
+}
+
+function getDataRevision_() {
+  try {
+    var cVal = CacheService.getScriptCache().get(DATA_REV_KEY);
+    if (cVal && String(cVal).trim()) return String(cVal).trim();
+  } catch (e) {}
+  try {
+    var pVal = PropertiesService.getScriptProperties().getProperty(DATA_REV_KEY);
+    if (pVal && String(pVal).trim()) {
+      var cleanP = String(pVal).trim();
+      try {
+        CacheService.getScriptCache().put(DATA_REV_KEY, cleanP, 21600);
+      } catch (ec) {}
+      return cleanP;
+    }
+  } catch (e2) {}
+  return bumpDataRevision_();
+}
+
 function getSpreadsheet_() {
   var id = getSpreadsheetId_();
   if (!id) throw new Error('SPREADSHEET_ID belum diisi di Script Properties Google Apps Script.');
@@ -978,6 +1014,9 @@ function appendRows_(ss, tabName, rowObjects) {
   for (var i = 0; i < rowObjects.length; i++) {
     sheet.appendRow(objToRowArray_(tabName, rowObjects[i]));
   }
+  if (tabName !== SHEET_TABS.LOG && tabName !== SHEET_TABS.REKAP_PER_SESI) {
+    bumpDataRevision_();
+  }
 }
 
 function appendLog_(ss, entry) {
@@ -1070,6 +1109,10 @@ function updateRowPartial_(ss, opts) {
     }
   }
 
+  if (changedAny) {
+    bumpDataRevision_();
+  }
+
   if (changedAny && !skipLog && Object.keys(newDiff).length > 0) {
     appendLog_(ss, {
       waktu: nowIso,
@@ -1114,6 +1157,8 @@ function softDeleteRow_(ss, opts) {
   if (statusIdx >= 0) sheet.getRange(match.rowNumber, statusIdx + 1).setValue('dihapus');
   if (changedIdx >= 0) sheet.getRange(match.rowNumber, changedIdx + 1).setValue(nowIso);
   if (updatedIdx >= 0) sheet.getRange(match.rowNumber, updatedIdx + 1).setValue(nowIso);
+
+  bumpDataRevision_();
 
   appendLog_(ss, {
     waktu: nowIso,
@@ -2488,6 +2533,7 @@ function dispatchRoute_(req) {
       var senderEmail = getActiveSenderEmail_();
       return makeResp_(200, {
         success: true,
+        rev: getDataRevision_(),
         configured: missingSetup.length === 0 && driveOkSetup,
         sheetsConfigured: true,
         driveConfigured: driveOkSetup,
@@ -2540,6 +2586,30 @@ function dispatchRoute_(req) {
           missingEnv: missingSync,
         });
       }
+      var clientRev = String(query.rev || body.rev || '').trim();
+      var forceFull = parseBool_(query.full || body.full, false);
+      var currentRev = getDataRevision_();
+
+      if (clientRev && clientRev === currentRev && !forceFull) {
+        var folderIdFast = getDriveFolderId_();
+        return makeResp_(200, {
+          fullSnapshot: false,
+          unchanged: true,
+          rev: currentRev,
+          configured: missingSync.length === 0,
+          sheetsConfigured: true,
+          driveConfigured: Boolean(folderIdFast),
+          spreadsheetConfigured: true,
+          driveFolderConfigured: Boolean(folderIdFast),
+          authMode: 'apps_script',
+          emailConnected: true,
+          emailTransport: 'apps_script_gmail',
+          missingConfig: missingSync,
+          missingEnv: missingSync,
+          serverTime: new Date().toISOString(),
+        });
+      }
+
       var dbSync = getFullDatabase_();
       var driveOkSync = false;
       var folderIdSync = getDriveFolderId_();
@@ -2551,6 +2621,8 @@ function dispatchRoute_(req) {
       }
       return makeResp_(200, {
         fullSnapshot: true,
+        unchanged: false,
+        rev: currentRev,
         configured: missingSync.length === 0 && driveOkSync,
         sheetsConfigured: true,
         driveConfigured: driveOkSync,
@@ -3040,7 +3112,7 @@ function dispatchRoute_(req) {
               student: stuByRec[single.id],
               session: sessByRec[single.id],
               serverTime: serverNow.toISOString(),
-              snapshot: buildDatabasePayload_(),
+              rev: getDataRevision_(), snapshot: buildDatabasePayload_(),
             });
           }
 
@@ -3053,7 +3125,7 @@ function dispatchRoute_(req) {
             }),
             rejectedDuplicates: allRej,
             serverTime: serverNow.toISOString(),
-            snapshot: buildDatabasePayload_(),
+            rev: getDataRevision_(), snapshot: buildDatabasePayload_(),
           });
         } finally {
           lockAtt.releaseLock();
@@ -3090,7 +3162,7 @@ function dispatchRoute_(req) {
           if (updRes.conflict) return makeResp_(409, { error: 'Data sudah diubah oleh pengguna lain sebelum Anda menyimpan.', conflict: true, current: updRes.current });
           if (!updRes.updated) return makeResp_(404, { error: 'Data presensi tidak ditemukan.' });
           try { syncSessionRecapSheet_(ssAtt, updRes.oldObj.date); } catch (e) {}
-          return makeResp_(200, { success: true, record: updRes.oldObj, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, record: updRes.oldObj, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockPut.releaseLock();
         }
@@ -3109,7 +3181,7 @@ function dispatchRoute_(req) {
             actorName: sessDel.name || 'Petugas',
             reason: body.reason || 'Pembatalan presensi',
           });
-          return makeResp_(200, { success: okDel, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: okDel, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockAttDel.releaseLock();
         }
@@ -3161,7 +3233,7 @@ function dispatchRoute_(req) {
           };
           var oocRes = startOutOfClass_(ssOoc, newOoc, (sessOoc && sessOoc.name) || 'Petugas Piket');
           if (!oocRes.success) return makeResp_(400, { error: oocRes.error });
-          return makeResp_(200, { success: true, record: oocRes.record, student: stuOoc, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, record: oocRes.record, student: stuOoc, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockOoc.releaseLock();
         }
@@ -3228,7 +3300,7 @@ function dispatchRoute_(req) {
             }
           }
 
-          return makeResp_(200, { success: true, record: updatedOocRec, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, record: updatedOocRec, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockOocPut.releaseLock();
         }
@@ -3309,7 +3381,7 @@ function dispatchRoute_(req) {
             });
           }
 
-          return makeResp_(200, { success: true, violation: vioRec, studentTotalPoints: totalPoints, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, violation: vioRec, studentTotalPoints: totalPoints, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockVio.releaseLock();
         }
@@ -3327,7 +3399,7 @@ function dispatchRoute_(req) {
             actorName: sessVDel.name || 'Admin',
             reason: body.reason || 'Koreksi pelanggaran',
           });
-          return makeResp_(200, { success: okVDel, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: okVDel, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockVDel.releaseLock();
         }
@@ -3375,7 +3447,7 @@ function dispatchRoute_(req) {
             appendRows_(ssVt, SHEET_TABS.JENIS_PELANGGARAN, [cleanVt]);
             appendLog_(ssVt, { waktu: nowVt, pengguna: sessVt.name || 'Admin', id_data: cleanVt.id, tabel: SHEET_TABS.JENIS_PELANGGARAN, aksi: 'tambah', nilai_baru: JSON.stringify(cleanVt) });
           }
-          return makeResp_(200, { success: true, violationType: cleanVt, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, violationType: cleanVt, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockVt.releaseLock();
         }
@@ -3385,7 +3457,7 @@ function dispatchRoute_(req) {
         lockVtDel.waitLock(15000);
         try {
           softDeleteRow_(ssVt, { tabName: SHEET_TABS.JENIS_PELANGGARAN, id: body.id, actorName: sessVt.name || 'Admin', reason: 'Hapus jenis pelanggaran' });
-          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockVtDel.releaseLock();
         }
@@ -3528,6 +3600,7 @@ function dispatchRoute_(req) {
               appendRows_(ssStu, SHEET_TABS.SISWA, toAppendStu);
             }
             if (toAppendStu.length > 0 || updatedStu > 0 || newClassesArr.length > 0) {
+              bumpDataRevision_();
               appendLog_(ssStu, {
                 waktu: nowBatch,
                 pengguna: actorStu,
@@ -3540,6 +3613,7 @@ function dispatchRoute_(req) {
             }
             return makeResp_(200, {
               success: true,
+              rev: getDataRevision_(),
               inserted: toAppendStu.length,
               updated: updatedStu,
               classesCreated: newClassesArr.length,
@@ -3577,7 +3651,7 @@ function dispatchRoute_(req) {
             appendRows_(ssStu, SHEET_TABS.SISWA, [stuPayload]);
             appendLog_(ssStu, { waktu: nowStu, pengguna: actorStu, id_data: nisClean, tabel: SHEET_TABS.SISWA, aksi: 'tambah', nilai_baru: JSON.stringify(stuPayload) });
           }
-          return makeResp_(200, { success: true, student: stuPayload, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, student: stuPayload, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockStu.releaseLock();
         }
@@ -3592,18 +3666,18 @@ function dispatchRoute_(req) {
             activeRows.forEach(function (r) {
               softDeleteRow_(ssStu, { tabName: SHEET_TABS.SISWA, id: r.data.id, actorName: actorStu, reason: 'Kosongkan data siswa' });
             });
-            return makeResp_(200, { success: true, count: activeRows.length, message: activeRows.length + ' data siswa berhasil dihapus.', serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+            return makeResp_(200, { success: true, count: activeRows.length, message: activeRows.length + ' data siswa berhasil dihapus.', serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
           }
           if (Array.isArray(body.nisses) && body.nisses.length > 0) {
             var cDel = 0;
             body.nisses.forEach(function (n) {
               if (softDeleteRow_(ssStu, { tabName: SHEET_TABS.SISWA, id: n, actorName: actorStu, reason: 'Hapus siswa' })) cDel++;
             });
-            return makeResp_(200, { success: true, count: cDel, message: cDel + ' siswa berhasil dihapus.', serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+            return makeResp_(200, { success: true, count: cDel, message: cDel + ' siswa berhasil dihapus.', serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
           }
           if (body.nis) {
             var okStu = softDeleteRow_(ssStu, { tabName: SHEET_TABS.SISWA, id: body.nis, actorName: actorStu, reason: 'Hapus siswa' });
-            return makeResp_(200, { success: okStu, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+            return makeResp_(200, { success: okStu, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
           }
           return makeResp_(400, { error: 'Parameter nis, nisses, atau action diperlukan.' });
         } finally {
@@ -3656,7 +3730,7 @@ function dispatchRoute_(req) {
             if (cleanCls.homeroom_teacher_email && hrU.email !== cleanCls.homeroom_teacher_email) { hrU.email = cleanCls.homeroom_teacher_email; changedHr = true; }
             if (changedHr) saveUser_(ssCls, hrU, actorCls);
           }
-          return makeResp_(200, { success: true, class: cleanCls, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, class: cleanCls, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockCls.releaseLock();
         }
@@ -3667,7 +3741,7 @@ function dispatchRoute_(req) {
         lockClsDel.waitLock(15000);
         try {
           if (delId) softDeleteRow_(ssCls, { tabName: SHEET_TABS.KELAS, id: delId, actorName: actorCls, reason: 'Hapus kelas' });
-          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockClsDel.releaseLock();
         }
@@ -3712,7 +3786,7 @@ function dispatchRoute_(req) {
             appendLog_(ssSess, { waktu: nowSess, pengguna: actorSess, id_data: cleanSess.id, tabel: SHEET_TABS.SESI_PRESENSI, aksi: 'tambah', nilai_baru: JSON.stringify(cleanSess) });
           }
           cleanSess.active_days = parseJsonArray_(cleanSess.active_days, [1, 2, 3, 4, 5, 6]);
-          return makeResp_(200, { success: true, session: cleanSess, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, session: cleanSess, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockSess.releaseLock();
         }
@@ -3723,7 +3797,7 @@ function dispatchRoute_(req) {
         lockSessDel.waitLock(15000);
         try {
           if (delSessId) softDeleteRow_(ssSess, { tabName: SHEET_TABS.SESI_PRESENSI, id: delSessId, actorName: actorSess, reason: 'Hapus sesi presensi' });
-          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockSessDel.releaseLock();
         }
@@ -3747,7 +3821,7 @@ function dispatchRoute_(req) {
         }
         var resSet = updateSettings_(patchSet, sessSet.name || 'Admin');
         if (resSet.conflict) return makeResp_(409, { error: 'Konflik pengaturan.', conflict: true, current: resSet.current });
-        return makeResp_(200, { success: true, settings: resSet.settings, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        return makeResp_(200, { success: true, settings: resSet.settings, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
       } finally {
         lockSet.releaseLock();
       }
@@ -3786,7 +3860,7 @@ function dispatchRoute_(req) {
       try {
         var updNotif = updateNotificationSettings_(body, actorN);
         if (updNotif.conflict) return makeResp_(409, { error: 'Konflik pengaturan notifikasi.', conflict: true, current: updNotif.current });
-        return makeResp_(200, { success: true, settings: updNotif.settings, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        return makeResp_(200, { success: true, settings: updNotif.settings, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
       } finally {
         lockNotif.releaseLock();
       }
@@ -3818,7 +3892,7 @@ function dispatchRoute_(req) {
           };
           appendRows_(ssLr, SHEET_TABS.IZIN_TIDAK_MASUK, [lrRow]);
           appendLog_(ssLr, { waktu: nowLr, pengguna: 'Pengaju Izin', id_data: lrRow.id, tabel: SHEET_TABS.IZIN_TIDAK_MASUK, aksi: 'tambah', nilai_baru: JSON.stringify(lrRow) });
-          return makeResp_(200, { success: true, request: lrRow, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, request: lrRow, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockLrP.releaseLock();
         }
@@ -3857,7 +3931,7 @@ function dispatchRoute_(req) {
               });
             }
           }
-          return makeResp_(200, { success: true, request: updLr.oldObj, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, { success: true, request: updLr.oldObj, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
         } finally {
           lockLrPut.releaseLock();
         }

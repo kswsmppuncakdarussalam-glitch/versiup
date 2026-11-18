@@ -15,6 +15,8 @@ import {
   KeyRound,
   Eye,
   EyeOff,
+  Lock,
+  Unlock,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
 import appsScriptSource from '../../../apps-script/Code.gs?raw';
@@ -30,6 +32,7 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
   const {
     appsScriptUrl,
     appsScriptSecretConfigured,
+    isAppsScriptLocked,
     isConnectingAppsScript,
     connectAppsScript,
     disconnectAppsScript,
@@ -44,16 +47,19 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
   const [showSecret, setShowSecret] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showGuide, setShowGuide] = useState(!compact && !isConnected);
+  const [isEditUnlocked, setIsEditUnlocked] = useState(!isConnected);
   const [showUrlEditor, setShowUrlEditor] = useState(!isConnected);
   const [inlineError, setInlineError] = useState('');
 
   useEffect(() => {
     if (isConnected) {
       setShowUrlEditor(false);
+      setIsEditUnlocked(false);
       setShowGuide(false);
       setUrlInput('');
       setSecretInput('');
     } else {
+      setIsEditUnlocked(true);
       setShowUrlEditor(true);
     }
   }, [isConnected]);
@@ -86,6 +92,19 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
     }
   };
 
+  const handleUnlockConfig = async () => {
+    const confirmed = await requestConfirm({
+      title: 'Buka Kunci Konfigurasi?',
+      message:
+        'URL Web App dan Token Rahasia saat ini tersimpan dan terkunci permanen agar tidak perlu dimasukkan ulang. Buka kunci hanya jika ingin mengganti endpoint Apps Script.',
+      confirmLabel: 'Ya, Buka Kunci',
+      variant: 'warning',
+    });
+    if (!confirmed) return;
+    setIsEditUnlocked(true);
+    setShowUrlEditor(true);
+  };
+
   const handleConnect = async (e: React.FormEvent) => {
     e.preventDefault();
     setInlineError('');
@@ -95,6 +114,7 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
       setInlineError(res.message);
     } else {
       setShowUrlEditor(false);
+      setIsEditUnlocked(false);
       setUrlInput('');
       setSecretInput('');
     }
@@ -104,7 +124,7 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
     const confirmed = await requestConfirm({
       title: 'Putuskan Koneksi Apps Script?',
       message:
-        'URL Web App dan Token Rahasia akan dihapus dari browser ini. Data di Google Sheets tetap aman.',
+        'Kunci koneksi akan dibuka dan URL Web App serta Token Rahasia dihapus dari perangkat ini. Data di Google Sheets tetap aman.',
       confirmLabel: 'Ya, Putuskan',
       variant: 'warning',
     });
@@ -113,6 +133,7 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
     setUrlInput('');
     setSecretInput('');
     setInlineError('');
+    setIsEditUnlocked(true);
     setShowUrlEditor(true);
   };
 
@@ -142,41 +163,73 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
                 Backend Google Apps Script (.gs)
               </h3>
               <span
-                className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold ${
                   isConnected
                     ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-200'
                     : 'bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200'
                 }`}
               >
-                {isConnected ? 'Tersimpan & Terverifikasi' : 'Belum Lengkap'}
+                {isConnected ? (
+                  <>
+                    <Lock className="w-2.5 h-2.5" />
+                    <span>{isAppsScriptLocked ? 'Tersimpan & Terkunci Permanen' : 'Tersimpan & Terverifikasi'}</span>
+                  </>
+                ) : (
+                  'Belum Lengkap'
+                )}
               </span>
             </div>
             <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 leading-relaxed">
               {isConnected
-                ? `URL Web App & Token Rahasia tersimpan aman. Setiap perubahan langsung tersinkron ke Google Sheets, Drive privat, & GmailApp (${envStatus.senderEmail || 'Aktif'}).`
-                : 'Tempel URL Web App (/exec) dan Token Rahasia (SECRET_TOKEN) satu kali saja.'}
+                ? `URL Web App & Token Rahasia tersimpan & terkunci permanen lintas refresh, browser, & Vercel. Sinkronisasi multi-pengguna real-time aktif ke Sheets, Drive, & GmailApp (${envStatus.senderEmail || 'Aktif'}).`
+                : 'Tempel URL Web App (/exec) dan Token Rahasia (SECRET_TOKEN) satu kali saja — atau set APPS_SCRIPT_URL & SECRET_TOKEN di Environment Variables Vercel.'}
             </p>
           </div>
         </div>
 
         {isConnected && (
           <div className="flex flex-wrap items-center gap-1.5 shrink-0 self-start sm:self-center">
-            <button
-              type="button"
-              onClick={() => setShowUrlEditor((v) => !v)}
-              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-900 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 font-semibold text-[11px]"
-            >
-              <Edit3 className="w-3 h-3" />
-              <span>{showUrlEditor ? 'Tutup' : 'Ubah Koneksi'}</span>
-            </button>
-            <button
-              type="button"
-              onClick={handleDisconnect}
-              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-rose-200 dark:border-rose-800 bg-white dark:bg-slate-900 text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/40 font-semibold text-[11px]"
-            >
-              <Unplug className="w-3 h-3" />
-              <span>Putuskan</span>
-            </button>
+            {!isEditUnlocked ? (
+              <button
+                type="button"
+                onClick={() => void handleUnlockConfig()}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-900 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 font-semibold text-[11px]"
+              >
+                <Unlock className="w-3 h-3" />
+                <span>Buka Kunci (Admin)</span>
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowUrlEditor(false);
+                    setIsEditUnlocked(false);
+                    setInlineError('');
+                  }}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-900 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 font-semibold text-[11px]"
+                >
+                  <Lock className="w-3 h-3" />
+                  <span>Kunci Kembali</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowUrlEditor((v) => !v)}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 font-semibold text-[11px]"
+                >
+                  <Edit3 className="w-3 h-3" />
+                  <span>{showUrlEditor ? 'Tutup Form' : 'Ubah Koneksi'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDisconnect}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-rose-200 dark:border-rose-800 bg-white dark:bg-slate-900 text-rose-700 dark:text-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950/40 font-semibold text-[11px]"
+                >
+                  <Unplug className="w-3 h-3" />
+                  <span>Putuskan</span>
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -185,13 +238,13 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
       {isConnected && !showUrlEditor && (
         <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-white/80 dark:bg-slate-900/80 border border-emerald-200 dark:border-emerald-800/80 text-[11px]">
           <div className="flex items-center gap-2 min-w-0">
-            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+            <Lock className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
             <span className="font-semibold text-slate-700 dark:text-slate-300">
-              URL Web App &amp; SECRET_TOKEN Tersimpan Aman
+              URL Web App &amp; SECRET_TOKEN Terkunci (Nilai Disembunyikan)
             </span>
           </div>
           <span className="text-[10px] font-semibold text-emerald-700 dark:text-emerald-300 shrink-0">
-            Auto-Reload 15d
+            Sinkron Real-Time (ms)
           </span>
         </div>
       )}
@@ -242,7 +295,7 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
       {showGuide && (
         <div className="p-3.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/60 space-y-2 text-[11px] text-slate-700 dark:text-slate-300">
           <p className="font-bold text-slate-900 dark:text-white">
-            Panduan Deploy Google Apps Script (Tanpa Service Account &amp; Tanpa Google Cloud):
+            Panduan Deploy Google Apps Script &amp; Vercel (Tanpa Input Ulang):
           </p>
           <ol className="list-decimal pl-4 space-y-1.5 leading-relaxed">
             <li>
@@ -261,7 +314,7 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
               Klik <strong>Terapkan (Deploy) → Deployment baru → Jenis: Aplikasi Web</strong>. Atur <em>Jalankan sebagai</em> = <strong>Saya (Me)</strong> dan <em>Yang memiliki akses</em> = <strong>Siapa saja (Anyone)</strong>.
             </li>
             <li>
-              Salin URL berakhiran <code className="font-mono">/exec</code> dan masukkan bersama <code className="font-mono">SECRET_TOKEN</code> pada form di bawah ini.
+              <strong>Agar Permanen di Semua Perangkat Vercel:</strong> Tambahkan <code className="font-mono">APPS_SCRIPT_URL</code> dan <code className="font-mono">SECRET_TOKEN</code> (atau <code className="font-mono">VITE_APPS_SCRIPT_URL</code> &amp; <code className="font-mono">VITE_APPS_SCRIPT_SECRET_TOKEN</code>) pada <em>Environment Variables</em> proyek Vercel lalu Redeploy. Sekali disimpan di sini, browser juga menyimpannya otomatis di cookie, localStorage, sessionStorage, &amp; IndexedDB.
             </li>
           </ol>
         </div>
