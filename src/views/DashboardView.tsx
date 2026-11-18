@@ -47,7 +47,6 @@ export const DashboardView: React.FC = () => {
     currentServerTime,
     isInitialLoading,
     initialLoadError,
-    refreshFromSheets,
     showToast,
   } = useApp();
 
@@ -387,19 +386,16 @@ export const DashboardView: React.FC = () => {
 
   return (
     <div className="p-4 sm:p-6 space-y-6 max-w-7xl mx-auto">
-      {/* Network / Connection Error Banner with Safe Retry */}
+      {/* Network / Connection Error Banner */}
       {initialLoadError && classes.length === 0 && (
-        <div className="p-4 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 text-amber-800 dark:text-amber-200 flex items-center justify-between text-xs">
+        <div className="p-4 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 text-amber-800 dark:text-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
           <div className="flex items-center gap-2">
             <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
             <span>{initialLoadError}</span>
           </div>
-          <button
-            onClick={() => refreshFromSheets()}
-            className="px-3 py-1 rounded bg-amber-600 hover:bg-amber-700 text-white font-semibold transition-colors"
-          >
-            Muat Ulang
-          </button>
+          <span className="text-[11px] font-medium text-amber-700 dark:text-amber-300 shrink-0">
+            Pembaruan otomatis berjalan setiap 15 detik &amp; saat tab aktif.
+          </span>
         </div>
       )}
       {/* Top Header & Date Filter */}

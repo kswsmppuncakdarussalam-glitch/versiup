@@ -5,6 +5,7 @@
     "moduleResolution": "bundler",
     "skipLibCheck": true,
     "allowJs": true,
+    "types": ["node"],
     "paths": {
       "@/*": ["../*"]
     },

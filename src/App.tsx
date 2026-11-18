@@ -4,13 +4,13 @@ import { Sidebar } from './components/layout/Sidebar.js';
 import { Header } from './components/layout/Header.js';
 import { OfflineIndicatorBanner } from './components/pwa/OfflineIndicatorBanner.js';
 import { DutyLoginScreen } from './components/modals/AuthLoginModal.js';
-import { GoogleSignInButton } from './components/auth/GoogleSignInButton.js';
-import { CheckCircle2, AlertCircle, Info, X, Lock, AlertTriangle, RefreshCw, Trash2 } from 'lucide-react';
+import { CheckCircle2, AlertCircle, Info, X, Lock, AlertTriangle, RefreshCw, Trash2, ShieldCheck } from 'lucide-react';
 
 const DashboardView = React.lazy(() => import('./views/DashboardView.js').then((m) => ({ default: m.DashboardView })));
 const AttendanceView = React.lazy(() => import('./views/AttendanceView.js').then((m) => ({ default: m.AttendanceView })));
 const OutOfClassView = React.lazy(() => import('./views/OutOfClassView.js').then((m) => ({ default: m.OutOfClassView })));
 const ViolationsView = React.lazy(() => import('./views/ViolationsView.js').then((m) => ({ default: m.ViolationsView })));
+const SystemCheckView = React.lazy(() => import('./views/SystemCheckView.js').then((m) => ({ default: m.SystemCheckView })));
 const HomeroomView = React.lazy(() => import('./views/HomeroomView.js').then((m) => ({ default: m.HomeroomView })));
 const StudentAffairsView = React.lazy(() => import('./views/StudentAffairsView.js').then((m) => ({ default: m.StudentAffairsView })));
 const AdminView = React.lazy(() => import('./views/AdminView.js').then((m) => ({ default: m.AdminView })));
@@ -71,13 +71,13 @@ const MainAppContent: React.FC = () => {
   const {
     session,
     activeTab,
+    setActiveTab,
     logout,
     toasts,
     dismissToast,
     configError,
-    needsGoogleAuth,
-    isGoogleSigningIn,
-    connectGoogleAccount,
+    appsScriptUrl,
+    appsScriptSecretConfigured,
     confirmDialog,
     saveStatus,
     conflictPrompt,
@@ -87,11 +87,11 @@ const MainAppContent: React.FC = () => {
   if (!session) {
     return (
       <>
-        {configError && !needsGoogleAuth && (
-          <div className="bg-rose-600 text-white px-4 py-2.5 text-xs flex items-center justify-center gap-2 text-center">
+        {configError && (
+          <div className="bg-amber-600 text-white px-4 py-2.5 text-xs flex items-center justify-center gap-2 text-center">
             <AlertTriangle className="w-4 h-4 shrink-0" />
             <span>
-              <strong>Konfigurasi Server Belum Lengkap:</strong> {configError}. Atur pada Environment Variables server (Vercel / .env).
+              <strong>Konfigurasi Apps Script:</strong> {configError}
             </span>
           </div>
         )}
@@ -109,29 +109,25 @@ const MainAppContent: React.FC = () => {
       <div className="flex-1 flex flex-col min-w-0 lg:pl-64">
         <Header onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)} />
 
-        {needsGoogleAuth && (
-          <div className="bg-sky-50 dark:bg-sky-950/40 border-b border-sky-200 dark:border-sky-800 px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="text-xs text-sky-900 dark:text-sky-100">
-              <strong className="block font-semibold">Hubungkan Akun Google untuk Menyinkronkan Google Sheets &amp; Drive</strong>
-              <span className="text-sky-700 dark:text-sky-300">
-                Masuk dengan akun Google Anda agar aplikasi otomatis membaca dan menyimpan data langsung ke Spreadsheet.
+        {(configError || !appsScriptUrl || !appsScriptSecretConfigured) && (
+          <div className="bg-rose-600 text-white px-4 py-2.5 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 border-b border-rose-700">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span>
+                <strong>Koneksi Apps Script Perlu Diperiksa:</strong>{' '}
+                {configError || 'URL Web App atau SECRET_TOKEN belum diatur di perangkat ini.'}
               </span>
             </div>
-            <div className="shrink-0">
-              <GoogleSignInButton
-                onClick={connectGoogleAccount}
-                loading={isGoogleSigningIn}
-              />
-            </div>
-          </div>
-        )}
-
-        {configError && !needsGoogleAuth && (
-          <div className="bg-rose-600 text-white px-4 py-2.5 text-xs flex items-center gap-2.5 border-b border-rose-700">
-            <AlertTriangle className="w-4 h-4 shrink-0" />
-            <span>
-              <strong>Google Sheets / Drive Server Belum Terkonfigurasi:</strong> {configError}. Atur pada Environment Variables server (Vercel / .env).
-            </span>
+            {activeTab !== 'system_check' && (
+              <button
+                type="button"
+                onClick={() => setActiveTab('system_check')}
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-white text-rose-700 font-bold hover:bg-rose-50 shrink-0 self-start sm:self-center"
+              >
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span>Buka Cek Sistem</span>
+              </button>
+            )}
           </div>
         )}
 
@@ -143,6 +139,7 @@ const MainAppContent: React.FC = () => {
             {activeTab === 'attendance' && <AttendanceView />}
             {activeTab === 'out_of_class' && <OutOfClassView />}
             {activeTab === 'violations' && <ViolationsView />}
+            {activeTab === 'system_check' && <SystemCheckView />}
             {activeTab === 'homeroom' &&
               (session?.lockedMenuRole === 'homeroom' ? (
                 <HomeroomView />
@@ -207,7 +204,7 @@ const MainAppContent: React.FC = () => {
                 onClick={conflictPrompt.onReloadLatest}
                 className="px-3.5 py-2 rounded-lg text-xs font-semibold border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
               >
-                Muat Ulang Data Terbaru
+                Pakai Data Terbaru dari Sheet
               </button>
               <button
                 type="button"

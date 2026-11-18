@@ -1,9 +1,8 @@
-import { getGoogleAccessToken } from './googleAuth.js';
-import { apiFetch, getAppsScriptUrl } from './apiClient.js';
+import { apiFetch, hasCompleteAppsScriptConfig } from './apiClient.js';
 
 /**
  * Utility kompresi foto di frontend (lebar maks 800 px, JPEG kualitas 70%)
- * dan resolver sumber gambar (Google Drive fileId diproksi lewat /api/photos?id=... atau Apps Script).
+ * dan pengambil gambar privat melalui endpoint Google Apps Script (tanpa folder Drive publik).
  */
 
 export async function compressPhotoMax800Jpeg(
@@ -77,13 +76,10 @@ async function refreshStoredAppToken(): Promise<string> {
   const currentTok = getStoredAppToken();
   if (!currentTok) return '';
   try {
-    const gToken = getGoogleAccessToken();
     const res = await apiFetch('/api/auth?action=refresh_session', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
         Authorization: `Bearer ${currentTok}`,
-        ...(gToken ? { 'X-Google-Access-Token': gToken } : {}),
       },
       body: JSON.stringify({}),
     });
@@ -92,16 +88,16 @@ async function refreshStoredAppToken(): Promise<string> {
       window.dispatchEvent(new CustomEvent('dkb-app-token-refreshed', { detail: { token: data.token } }));
       return data.token as string;
     }
-    if (res.status === 401 && data?.googleAuthExpired) {
-      window.dispatchEvent(new CustomEvent('dkb-google-auth-expired', { detail: data }));
+    if (res.status === 401 && (data?.unauthorizedToken || data?.googleDeploymentUnauthorized)) {
+      window.dispatchEvent(new CustomEvent('dkb-apps-script-unauthorized', { detail: data }));
     }
   } catch {}
   return '';
 }
 
 function handlePhotoAuth401(data: any) {
-  if (data?.googleAuthExpired || data?.googleDeploymentUnauthorized) {
-    window.dispatchEvent(new CustomEvent('dkb-google-auth-expired', { detail: data }));
+  if (data?.unauthorizedToken || data?.googleDeploymentUnauthorized) {
+    window.dispatchEvent(new CustomEvent('dkb-apps-script-unauthorized', { detail: data }));
   }
 }
 
@@ -134,14 +130,11 @@ export async function uploadPhotoToBackend(
   const { base64 } = await compressPhotoMax800Jpeg(input);
 
   const sendUpload = async (appTokOverride?: string) => {
-    const googleToken = getGoogleAccessToken();
     const appToken = appTokOverride || getStoredAppToken();
     const res = await apiFetch('/api/photos', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
         ...(appToken ? { Authorization: `Bearer ${appToken}` } : {}),
-        ...(googleToken ? { 'X-Google-Access-Token': googleToken } : {}),
       },
       body: JSON.stringify({
         base64,
@@ -154,9 +147,9 @@ export async function uploadPhotoToBackend(
 
   let { res, data } = await sendUpload();
   if (res.status === 401) {
-    if (data?.googleAuthExpired || data?.googleDeploymentUnauthorized) {
+    if (data?.unauthorizedToken || data?.googleDeploymentUnauthorized) {
       handlePhotoAuth401(data);
-      throw new Error(data.error || 'Sesi akses Google berakhir. Silakan masuk ulang.');
+      throw new Error(data.error || 'Token rahasia atau deployment Apps Script ditolak.');
     }
     const nextTok = await refreshStoredAppToken();
     if (nextTok) {
@@ -200,7 +193,8 @@ function base64ToBlob(base64: string, mimeType = 'image/jpeg'): Blob {
 }
 
 /**
- * Fetch Drive photo securely via Apps Script or X-Google-Access-Token and cache object URL in memory.
+ * Mengambil foto privat dari Google Drive melalui endpoint Apps Script (/api/photos)
+ * dan menyimpan Object URL di memori sehingga folder Google Drive tidak perlu publik.
  */
 export async function fetchAuthorizedDrivePhotoUrl(fileId: string): Promise<string> {
   const trimmed = (fileId || '').trim();
@@ -216,10 +210,8 @@ export async function fetchAuthorizedDrivePhotoUrl(fileId: string): Promise<stri
     return '';
   }
 
-  const appsScriptUrl = getAppsScriptUrl();
-  const googleToken = getGoogleAccessToken();
-  if (!appsScriptUrl && !googleToken) {
-    return `/api/photos?id=${encodeURIComponent(clean)}`;
+  if (!hasCompleteAppsScriptConfig()) {
+    return '';
   }
 
   try {
@@ -228,7 +220,6 @@ export async function fetchAuthorizedDrivePhotoUrl(fileId: string): Promise<stri
       method: 'GET',
       headers: {
         ...(appToken ? { Authorization: `Bearer ${appToken}` } : {}),
-        ...(googleToken ? { 'X-Google-Access-Token': googleToken } : {}),
       },
     });
     if (!res.ok) {
@@ -241,39 +232,27 @@ export async function fetchAuthorizedDrivePhotoUrl(fileId: string): Promise<stri
       return '';
     }
 
-    const contentType = res.headers.get('content-type') || '';
-    if (contentType.includes('application/json') || appsScriptUrl) {
-      const data = await res.json().catch(() => ({}));
-      if (data?.notFound) {
-        driveMissingCache.set(clean, Date.now());
-        return '';
-      }
-      if (data?.base64) {
-        const blob = base64ToBlob(data.base64, data.mimeType || 'image/jpeg');
-        const objectUrl = URL.createObjectURL(blob);
-        driveBlobCache.set(clean, objectUrl);
-        return objectUrl;
-      }
-      if (data?.dataUrl) {
-        driveBlobCache.set(clean, data.dataUrl);
-        return data.dataUrl;
-      }
+    const data = await res.json().catch(() => ({}));
+    if (data?.notFound) {
+      driveMissingCache.set(clean, Date.now());
       return '';
     }
-
-    const blob = await res.blob();
-    const objectUrl = URL.createObjectURL(blob);
-    driveBlobCache.set(clean, objectUrl);
-    return objectUrl;
+    if (data?.base64) {
+      const blob = base64ToBlob(data.base64, data.mimeType || 'image/jpeg');
+      const objectUrl = URL.createObjectURL(blob);
+      driveBlobCache.set(clean, objectUrl);
+      return objectUrl;
+    }
+    if (data?.dataUrl) {
+      driveBlobCache.set(clean, data.dataUrl);
+      return data.dataUrl;
+    }
+    return '';
   } catch {
     return '';
   }
 }
 
-/**
- * Mengubah nilai ID file Drive menjadi URL proxy backend (/api/photos?id=<fileId>)
- * sambil mempertahankan URL preset SVG atau http(s):// non-Drive.
- */
 export function resolvePhotoSrc(val?: string | null): string {
   if (!val) return '';
   const trimmed = val.trim();
@@ -284,10 +263,5 @@ export function resolvePhotoSrc(val?: string | null): string {
   const clean = extractDriveFileId(trimmed) || trimmed;
   const cached = driveBlobCache.get(clean);
   if (cached) return cached;
-  if (driveMissingCache.has(clean)) {
-    const at = driveMissingCache.get(clean)!;
-    if (Date.now() - at < MISSING_CACHE_TTL_MS) return '';
-  }
-  return `/api/photos?id=${encodeURIComponent(clean)}`;
+  return '';
 }
-

@@ -23,22 +23,23 @@ import { resolveSessionSchedule, SessionScheduleState } from '../utils/sessionHe
 import { soundEffects } from '../utils/audio.js';
 import { ttsService } from '../utils/tts.js';
 import {
-  initGoogleAuth,
-  googleSignIn,
-  getGoogleAccessToken,
-  clearGoogleAccessToken,
-  googleLogout,
-} from '../utils/googleAuth.js';
-import {
   apiFetch,
   getAppsScriptUrl,
   setAppsScriptUrl,
   clearAppsScriptUrl,
+  getAppsScriptSecretToken,
+  setAppsScriptSecretToken,
+  clearAppsScriptSecretToken,
+  hasAppsScriptSecretToken,
+  getMissingClientConfig,
+  hasCompleteAppsScriptConfig,
   isValidAppsScriptUrl,
   testAppsScriptConnection,
   fetchServerAppsScriptUrl,
   persistServerAppsScriptUrl,
   clearServerAppsScriptUrl,
+  runAppsScriptSystemCheck,
+  type SystemCheckResult,
 } from '../utils/apiClient.js';
 
 interface ToastNotification {
@@ -63,7 +64,7 @@ export interface OfflineAttendanceScan {
 
 const OFFLINE_SCANS_KEY = 'dkb_offline_attendance_scans';
 const SYNC_BROADCAST_CHANNEL = 'dkb_sync_channel';
-const AUTO_REFRESH_INTERVAL_MS = 10000;
+const AUTO_REFRESH_INTERVAL_MS = 15000;
 const SCAN_BATCH_WINDOW_MS = 3000;
 
 export interface EnvConfigStatus {
@@ -72,11 +73,9 @@ export interface EnvConfigStatus {
   driveConfigured: boolean;
   spreadsheetConfigured: boolean;
   driveFolderConfigured: boolean;
-  hasServiceAccount?: boolean;
-  authMode?: 'google_oauth' | 'service_account' | 'apps_script' | 'unconfigured';
-  requiresGoogleSignIn?: boolean;
+  authMode?: 'apps_script' | 'unconfigured';
   emailConnected?: boolean;
-  emailTransport?: 'gmail_oauth' | 'smtp' | 'apps_script_gmail' | 'unconfigured';
+  emailTransport?: 'apps_script_gmail' | 'unconfigured';
   senderEmail?: string;
   missingEnv: string[];
 }
@@ -91,12 +90,6 @@ export interface ConfirmDialogState {
   onCancel: () => void;
 }
 
-export interface GoogleAccountProfile {
-  email: string;
-  displayName: string;
-  photoURL?: string | null;
-}
-
 interface AppContextType {
   session: AuthSession | null;
   activeTab: ActiveTab;
@@ -108,16 +101,12 @@ interface AppContextType {
   configError: string | null;
   missingEnv: string[];
   envStatus: EnvConfigStatus;
-  needsGoogleAuth: boolean;
-  isGoogleSigningIn: boolean;
-  googleAccessToken: string | null;
-  googleUser: GoogleAccountProfile | null;
-  connectGoogleAccount: () => Promise<boolean>;
-  disconnectGoogleAccount: () => Promise<void>;
   appsScriptUrl: string;
+  appsScriptSecretConfigured: boolean;
   isConnectingAppsScript: boolean;
-  connectAppsScript: (url: string) => Promise<{ ok: boolean; message: string }>;
+  connectAppsScript: (url: string, secretToken?: string) => Promise<{ ok: boolean; message: string }>;
   disconnectAppsScript: () => Promise<void>;
+  runSystemCheck: () => Promise<SystemCheckResult>;
   confirmDialog: ConfirmDialogState | null;
   requestConfirm: (opts: {
     title: string;
@@ -168,11 +157,10 @@ interface AppContextType {
   refreshAuthSession: (forceLogoutOn401?: boolean) => Promise<string | null>;
   refreshFromSheets: (
     silent?: boolean,
-    overrideGoogleToken?: string,
     options?: { afterWrite?: boolean }
   ) => Promise<void>;
 
-  // Mutators (Direct to Google Sheets API v4 / Drive v3)
+  // Mutators (Direct to Google Sheets & Drive via Apps Script Web App)
   recordAttendance: (params: {
     code?: string;
     studentId?: string;
@@ -339,7 +327,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const savedTab = localStorage.getItem('dkb_active_tab') as ActiveTab | null;
       const savedSessionRaw = localStorage.getItem('dkb_session');
       const savedSession: AuthSession | null = savedSessionRaw ? JSON.parse(savedSessionRaw) : null;
-      if (savedTab && ['dashboard', 'attendance', 'out_of_class', 'violations', 'homeroom', 'student_affairs', 'admin'].includes(savedTab)) {
+      if (
+        savedTab &&
+        ['dashboard', 'attendance', 'out_of_class', 'violations', 'system_check', 'homeroom', 'student_affairs', 'admin'].includes(savedTab)
+      ) {
         if (['homeroom', 'student_affairs', 'admin'].includes(savedTab) && savedSession?.lockedMenuRole !== savedTab) {
           return 'attendance';
         }
@@ -365,26 +356,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [isInitialLoading, setIsInitialLoading] = useState<boolean>(true);
   const [initialLoadError, setInitialLoadError] = useState<string | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
-  const [missingEnv, setMissingEnv] = useState<string[]>([]);
+  const [missingEnv, setMissingEnv] = useState<string[]>(() => getMissingClientConfig());
   const [envStatus, setEnvStatus] = useState<EnvConfigStatus>({
     configured: false,
     sheetsConfigured: false,
     driveConfigured: false,
     spreadsheetConfigured: false,
     driveFolderConfigured: false,
-    hasServiceAccount: false,
     authMode: 'unconfigured',
-    requiresGoogleSignIn: false,
     emailConnected: false,
     emailTransport: 'unconfigured',
     senderEmail: '',
-    missingEnv: [],
+    missingEnv: getMissingClientConfig(),
   });
-  const [needsGoogleAuth, setNeedsGoogleAuth] = useState<boolean>(false);
-  const [isGoogleSigningIn, setIsGoogleSigningIn] = useState<boolean>(false);
-  const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(() => getGoogleAccessToken());
-  const [googleUser, setGoogleUser] = useState<GoogleAccountProfile | null>(null);
   const [appsScriptUrl, setAppsScriptUrlState] = useState<string>(() => getAppsScriptUrl());
+  const [appsScriptSecretConfigured, setAppsScriptSecretConfigured] = useState<boolean>(() =>
+    hasAppsScriptSecretToken()
+  );
   const [isConnectingAppsScript, setIsConnectingAppsScript] = useState<boolean>(false);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
   const [conflictPrompt, setConflictPrompt] = useState<ConflictState | null>(null);
@@ -516,35 +504,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const buildApiHeaders = useCallback(
     (
       extra?: Record<string, string>,
-      overrideGoogleToken?: string,
       overrideAppToken?: string
     ): Record<string, string> => {
-      const gToken = overrideGoogleToken || googleAccessToken || getGoogleAccessToken();
       const appToken = overrideAppToken ?? session?.token ?? sessionRef.current?.token ?? '';
       return {
         ...(appToken ? { Authorization: `Bearer ${appToken}` } : {}),
-        ...(gToken ? { 'X-Google-Access-Token': gToken } : {}),
         ...(extra || {}),
       };
     },
-    [session?.token, googleAccessToken]
+    [session?.token]
   );
 
-  const handlePossibleGoogleTokenExpiry = useCallback(
+  const handleAppsScriptUnauthorized = useCallback(
     (status: number, data: any) => {
-      if (status === 401 && data?.googleAuthExpired) {
-        clearGoogleAccessToken();
-        setGoogleAccessToken(null);
-        setNeedsGoogleAuth(true);
-        showToast('Sesi akses Google berakhir. Silakan klik "Sign in with Google" lagi untuk melanjutkan.', 'info');
-        return true;
-      }
-      if (status === 401 && data?.googleDeploymentUnauthorized) {
-        showToast(
+      if (status === 401 && (data?.unauthorizedToken || data?.googleDeploymentUnauthorized)) {
+        const msg =
           data.error ||
-            'Google Apps Script menolak akses (401). Pastikan deploy Web App dengan URL /exec dan akses "Siapa saja (Anyone)".',
-          'error'
-        );
+          'Token rahasia (SECRET_TOKEN) atau deployment Google Apps Script ditolak (401). Periksa pengaturan di halaman Cek Sistem.';
+        setConfigError(msg);
+        if (Array.isArray(data?.missingConfig)) {
+          setMissingEnv(data.missingConfig);
+        }
+        showToast(msg, 'error');
         return true;
       }
       return false;
@@ -617,7 +598,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         try {
           const res = await apiFetch('/api/auth?action=refresh_session', {
             method: 'POST',
-            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, currentSess.token),
+            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, currentSess.token),
             body: JSON.stringify({}),
           });
           const data = await res.json().catch(() => ({}));
@@ -645,7 +626,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             return data.token as string;
           }
 
-          if (res.status === 401 && !data?.googleAuthExpired && !data?.googleDeploymentUnauthorized) {
+          if (
+            res.status === 401 &&
+            !data?.unauthorizedToken &&
+            !data?.googleDeploymentUnauthorized &&
+            (forceLogoutOn401 || data?.sessionInvalidated)
+          ) {
             clearExpiredAppSession(
               data?.error || 'Sesi login telah berakhir atau kata sandi diubah. Silakan masuk kembali.'
             );
@@ -749,8 +735,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   /**
    * Direct read from Google Sheets via /api/sync
    */
+  /**
+   * Memuat data langsung dari Google Sheets melalui Google Apps Script Web App
+   */
   const refreshFromSheets = useCallback(
-    async (silent = false, overrideGoogleToken?: string, options?: { afterWrite?: boolean }) => {
+    async (silent = false, options?: { afterWrite?: boolean }) => {
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         setSyncStatus('offline');
         return;
@@ -761,7 +750,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         pendingRefreshAfterWriteRef.current = true;
       }
 
-      if (isFetchingRef.current && !overrideGoogleToken) {
+      if (isFetchingRef.current) {
         if (options?.afterWrite) {
           pendingRefreshAfterWriteRef.current = true;
         }
@@ -777,40 +766,51 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const fetchStartMutationSeq = latestMutationSeqRef.current;
 
       try {
-        // Auto-discover persisted Apps Script URL from server once if local storage has none
+        // Ambil URL Web App tersimpan di server sekali jika belum ada di perangkat ini
         if (!getAppsScriptUrl() && !hasCheckedServerAppsScriptRef.current) {
           hasCheckedServerAppsScriptRef.current = true;
           const serverUrl = await fetchServerAppsScriptUrl();
           if (serverUrl) {
             const saved = setAppsScriptUrl(serverUrl);
             setAppsScriptUrlState(saved);
-            setNeedsGoogleAuth(false);
           }
         }
 
+        const clientMissing = getMissingClientConfig();
+        setAppsScriptSecretConfigured(hasAppsScriptSecretToken());
+        if (clientMissing.length > 0) {
+          setConfigError(
+            `Konfigurasi Google Apps Script belum lengkap (${clientMissing.join(', ')} masih kosong).`
+          );
+          setMissingEnv(clientMissing);
+          setEnvStatus({
+            configured: false,
+            sheetsConfigured: false,
+            driveConfigured: false,
+            spreadsheetConfigured: false,
+            driveFolderConfigured: false,
+            authMode: 'unconfigured',
+            emailConnected: false,
+            emailTransport: 'unconfigured',
+            senderEmail: '',
+            missingEnv: clientMissing,
+          });
+          setSyncStatus('error');
+          return;
+        }
+
         const res = await apiFetch('/api/sync', {
-          headers: buildApiHeaders({ 'Cache-Control': 'no-cache' }, overrideGoogleToken),
+          headers: buildApiHeaders({ 'Cache-Control': 'no-cache' }),
         });
         const data = await res.json().catch(() => ({}));
 
-        // Discard stale snapshot if a mutation happened while this GET was in-flight
+        // Abaikan snapshot lama bila ada penulisan yang baru dimulai
         if (latestMutationSeqRef.current > fetchStartMutationSeq) {
           pendingRefreshAfterWriteRef.current = true;
           return;
         }
 
-        // Auto-adopt Apps Script URL returned by server or Google Sheets Pengaturan
-        const discoveredUrl =
-          data?.savedAppsScriptUrl || data?.data?.settings?.apps_script_url || '';
-        if (!getAppsScriptUrl() && discoveredUrl && isValidAppsScriptUrl(discoveredUrl)) {
-          const saved = setAppsScriptUrl(discoveredUrl);
-          setAppsScriptUrlState(saved);
-          setNeedsGoogleAuth(false);
-          pendingRefreshAfterWriteRef.current = true;
-          return;
-        }
-
-        if (handlePossibleGoogleTokenExpiry(res.status, data)) {
+        if (handleAppsScriptUnauthorized(res.status, data)) {
           setSyncStatus('error');
           return;
         }
@@ -820,30 +820,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         if (res.status === 503) {
-          const isAppsScriptMode = Boolean(getAppsScriptUrl());
-          const requiresSignIn = !isAppsScriptMode && Boolean(data.requiresGoogleSignIn);
-          setNeedsGoogleAuth(requiresSignIn);
+          const missing = Array.isArray(data.missingConfig)
+            ? data.missingConfig
+            : Array.isArray(data.missingEnv)
+            ? data.missingEnv
+            : getMissingClientConfig();
           setConfigError(
-            requiresSignIn
-              ? null
-              : data.error || 'Environment variable server (SPREADSHEET_ID / Service Account) belum dikonfigurasi.'
+            data.error || 'Properti Skrip Google Apps Script belum lengkap (SPREADSHEET_ID / DRIVE_FOLDER_ID / SECRET_TOKEN).'
           );
-          setMissingEnv(Array.isArray(data.missingEnv) ? data.missingEnv : []);
+          setMissingEnv(missing);
           setEnvStatus({
             configured: false,
             sheetsConfigured: false,
             driveConfigured: false,
             spreadsheetConfigured: false,
             driveFolderConfigured: false,
-            hasServiceAccount: Boolean(data.hasServiceAccount),
-            authMode: isAppsScriptMode ? 'apps_script' : (data.authMode || 'unconfigured'),
-            requiresGoogleSignIn: requiresSignIn,
+            authMode: 'apps_script',
             emailConnected: Boolean(data.emailConnected),
             emailTransport: data.emailTransport || 'unconfigured',
             senderEmail: data.senderEmail || '',
-            missingEnv: Array.isArray(data.missingEnv) ? data.missingEnv : [],
+            missingEnv: missing,
           });
-          setSyncStatus(requiresSignIn ? 'offline' : 'error');
+          setSyncStatus('error');
           return;
         }
 
@@ -853,23 +851,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           return;
         }
 
+        const missingList = Array.isArray(data.missingConfig)
+          ? data.missingConfig
+          : Array.isArray(data.missingEnv)
+          ? data.missingEnv
+          : [];
         setConfigError(null);
-        setNeedsGoogleAuth(false);
         setInitialLoadError(null);
-        setMissingEnv(Array.isArray(data.missingEnv) ? data.missingEnv : []);
+        setMissingEnv(missingList);
         setEnvStatus({
           configured: Boolean(data.configured),
           sheetsConfigured: Boolean(data.sheetsConfigured),
           driveConfigured: Boolean(data.driveConfigured),
           spreadsheetConfigured: Boolean(data.spreadsheetConfigured),
           driveFolderConfigured: Boolean(data.driveFolderConfigured),
-          hasServiceAccount: Boolean(data.hasServiceAccount),
-          authMode: data.authMode || (getAppsScriptUrl() ? 'apps_script' : 'service_account'),
-          requiresGoogleSignIn: Boolean(data.requiresGoogleSignIn),
+          authMode: 'apps_script',
           emailConnected: Boolean(data.emailConnected),
-          emailTransport: data.emailTransport || 'unconfigured',
+          emailTransport: data.emailTransport || 'apps_script_gmail',
           senderEmail: data.senderEmail || '',
-          missingEnv: Array.isArray(data.missingEnv) ? data.missingEnv : [],
+          missingEnv: missingList,
         });
 
         if (data.data) {
@@ -885,116 +885,53 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       } catch (err: any) {
         setSyncStatus(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'error');
         if (!silent) {
-          setInitialLoadError(err?.message || 'Koneksi ke server bermasalah.');
+          setInitialLoadError(err?.message || 'Koneksi ke Google Apps Script bermasalah.');
         }
       } finally {
         isFetchingRef.current = false;
         setIsInitialLoading(false);
         if (pendingRefreshAfterWriteRef.current) {
           pendingRefreshAfterWriteRef.current = false;
-          void refreshFromSheets(true, overrideGoogleToken);
+          void refreshFromSheets(true);
         }
       }
     },
-    [applyDatabaseSnapshot, buildApiHeaders, handlePossibleGoogleTokenExpiry]
+    [applyDatabaseSnapshot, buildApiHeaders, handleAppsScriptUnauthorized, refreshAuthSessionIfNeeded]
   );
 
-  // Firebase Google Auth listener (in-memory access token)
-  useEffect(() => {
-    const unsubscribe = initGoogleAuth(
-      (user, token) => {
-        setGoogleAccessToken(token);
-        setGoogleUser({
-          email: user.email || '',
-          displayName: user.displayName || user.email || 'Akun Google',
-          photoURL: user.photoURL,
-        });
-        setNeedsGoogleAuth(false);
-      },
-      (user) => {
-        setGoogleAccessToken(null);
-        if (user) {
-          setGoogleUser({
-            email: user.email || '',
-            displayName: user.displayName || user.email || 'Akun Google',
-            photoURL: user.photoURL,
-          });
-        } else {
-          setGoogleUser(null);
-        }
-      }
-    );
-    return () => unsubscribe();
-  }, []);
-
-  const connectGoogleAccount = useCallback(async (): Promise<boolean> => {
-    setIsGoogleSigningIn(true);
-    try {
-      const { user, accessToken } = await googleSignIn();
-      setGoogleAccessToken(accessToken);
-      setGoogleUser({
-        email: user.email || '',
-        displayName: user.displayName || user.email || 'Akun Google',
-        photoURL: user.photoURL,
-      });
-      setNeedsGoogleAuth(false);
-      setConfigError(null);
-      showToast(`Terhubung dengan akun Google ${user.email || ''}. Menyinkronkan data...`, 'success');
-      await refreshFromSheets(false, accessToken);
-      return true;
-    } catch (err: any) {
-      const code = err?.code || '';
-      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
-        showToast('Login Google dibatalkan.', 'info');
-      } else {
-        showToast(err?.message || 'Gagal menghubungkan akun Google.', 'error');
-      }
-      return false;
-    } finally {
-      setIsGoogleSigningIn(false);
-    }
-  }, [refreshFromSheets, showToast]);
-
-  const disconnectGoogleAccount = useCallback(async () => {
-    await googleLogout();
-    setGoogleAccessToken(null);
-    setGoogleUser(null);
-    if (!getAppsScriptUrl()) {
-      setNeedsGoogleAuth(true);
-    }
-    showToast('Koneksi akun Google telah diputuskan.', 'info');
-  }, [showToast]);
-
   const connectAppsScript = useCallback(
-    async (rawUrl: string): Promise<{ ok: boolean; message: string }> => {
+    async (rawUrl: string, rawSecretToken?: string): Promise<{ ok: boolean; message: string }> => {
       setIsConnectingAppsScript(true);
       try {
-        const result = await testAppsScriptConnection(rawUrl);
+        const resolvedSecret = String(rawSecretToken ?? getAppsScriptSecretToken()).trim();
+        const result = await testAppsScriptConnection(rawUrl, resolvedSecret);
         if (!result.ok) {
           showToast(result.message, 'error');
           return { ok: false, message: result.message };
         }
         const saved = setAppsScriptUrl(rawUrl);
+        setAppsScriptSecretToken(resolvedSecret);
         setAppsScriptUrlState(saved);
-        setNeedsGoogleAuth(false);
+        setAppsScriptSecretConfigured(true);
         setConfigError(null);
         setInitialLoadError(null);
+
+        const missingList = Array.isArray(result.data?.missingConfig) ? result.data.missingConfig : [];
+        setMissingEnv(missingList);
 
         if (result.data?.data) {
           applyDatabaseSnapshot(result.data.data, result.data.serverTime);
           setEnvStatus({
-            configured: true,
+            configured: Boolean(result.data.configured ?? true),
             sheetsConfigured: Boolean(result.data.sheetsConfigured ?? true),
             driveConfigured: Boolean(result.data.driveConfigured ?? true),
             spreadsheetConfigured: true,
-            driveFolderConfigured: true,
-            hasServiceAccount: false,
+            driveFolderConfigured: Boolean(result.data.driveFolderConfigured ?? true),
             authMode: 'apps_script',
-            requiresGoogleSignIn: false,
             emailConnected: Boolean(result.data.emailConnected),
             emailTransport: result.data.emailTransport || 'apps_script_gmail',
             senderEmail: result.data.senderEmail || '',
-            missingEnv: [],
+            missingEnv: missingList,
           });
         }
 
@@ -1010,14 +947,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (activeAppToken) {
           apiFetch('/api/settings', {
             method: 'POST',
-            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, activeAppToken),
+            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, activeAppToken),
             body: JSON.stringify({ apps_script_url: saved }),
           }).catch(() => {});
         }
 
         showToast(result.message, 'success');
         if (!result.data?.data) {
-          await refreshFromSheets(false, undefined, { afterWrite: true });
+          await refreshFromSheets(false, { afterWrite: true });
         }
         return { ok: true, message: result.message };
       } finally {
@@ -1036,19 +973,33 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const disconnectAppsScript = useCallback(async () => {
     clearAppsScriptUrl();
+    clearAppsScriptSecretToken();
     setAppsScriptUrlState('');
+    setAppsScriptSecretConfigured(false);
     await clearServerAppsScriptUrl();
     broadcastSyncEvent('APPS_SCRIPT_CHANGED', { appsScriptUrl: '' });
     showToast('Koneksi backend Google Apps Script diputuskan.', 'info');
-    await refreshFromSheets(false, undefined, { afterWrite: true });
+    await refreshFromSheets(false, { afterWrite: true });
   }, [broadcastSyncEvent, refreshFromSheets, showToast]);
 
+  const runSystemCheck = useCallback(async (): Promise<SystemCheckResult> => {
+    const res = await runAppsScriptSystemCheck();
+    const combinedMissing = Array.from(new Set([...res.emptyClientKeys, ...res.emptyBackendKeys]));
+    setMissingEnv(combinedMissing);
+    if (res.tokenError) {
+      setConfigError(res.tokenError);
+    } else if (res.ok) {
+      setConfigError(null);
+    }
+    return res;
+  }, []);
+
   /**
-   * Flush offline attendance scans saved in localStorage when back online
+   * Kirim otomatis antrean scan offline yang tersimpan di localStorage saat online kembali
    */
   const flushOfflineAttendanceScans = useCallback(async () => {
     if (typeof navigator !== 'undefined' && !navigator.onLine) return;
-    if (needsGoogleAuth && !getAppsScriptUrl() && !googleAccessToken && !getGoogleAccessToken()) return;
+    if (!hasCompleteAppsScriptConfig()) return;
     const queued = readOfflineScans();
     if (queued.length === 0) return;
 
@@ -1057,7 +1008,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const sendQueued = async (tokOverride?: string) => {
         const res = await apiFetch('/api/attendance', {
           method: 'POST',
-          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, tokOverride),
+          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, tokOverride),
           body: JSON.stringify({ scans: queued }),
         });
         const data = await res.json().catch(() => ({}));
@@ -1065,7 +1016,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       };
 
       let { res, data } = await sendQueued();
-      if (handlePossibleGoogleTokenExpiry(res.status, data)) {
+      if (handleAppsScriptUnauthorized(res.status, data)) {
         return;
       }
       if (res.status === 401 && sessionRef.current?.token) {
@@ -1080,7 +1031,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (res.ok) {
         writeOfflineScans([]);
         setPendingOfflineScansCount(0);
-        setSavedState(`Tersimpan (${queued.length} scan offline terkirim)`);
+        setSavedState('Tersimpan');
         if (data.rejectedCount > 0) {
           showToast(`${data.savedCount} scan offline terkirim, ${data.rejectedCount} duplikat ditolak.`, 'info');
         } else {
@@ -1089,11 +1040,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (data.snapshot) {
           applyDatabaseSnapshot(data.snapshot, data.serverTime);
         } else {
-          await refreshFromSheets(true, undefined, { afterWrite: true });
+          await refreshFromSheets(true, { afterWrite: true });
         }
         broadcastSyncEvent('DATA_MUTATED');
       } else if (res.status < 500 && res.status !== 429 && res.status !== 401) {
-        // Unrecoverable validation error; drop bad items so queue does not loop forever
         writeOfflineScans([]);
         setPendingOfflineScansCount(0);
         setSaveErrorState(data.error || 'Gagal mengirim scan offline.');
@@ -1102,12 +1052,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setSyncStatus('offline');
     }
   }, [
-    needsGoogleAuth,
-    googleAccessToken,
     applyDatabaseSnapshot,
     buildApiHeaders,
     broadcastSyncEvent,
-    handlePossibleGoogleTokenExpiry,
+    handleAppsScriptUnauthorized,
     refreshAuthSessionIfNeeded,
     refreshFromSheets,
     setSavingState,
@@ -1116,7 +1064,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     showToast,
   ]);
 
-  // Initial load + silent session verification + 10s automatic polling + cross-tab instant sync
+  // Muat awal + verifikasi sesi + auto-reload tiap 15 detik & saat tab aktif kembali
   useEffect(() => {
     refreshFromSheets(false);
     flushOfflineAttendanceScans();
@@ -1134,20 +1082,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (!msg) return;
           if (msg.type === 'APPS_SCRIPT_CHANGED') {
             setAppsScriptUrlState(getAppsScriptUrl());
-            void refreshFromSheets(true, undefined, { afterWrite: true });
+            setAppsScriptSecretConfigured(hasAppsScriptSecretToken());
+            void refreshFromSheets(true, { afterWrite: true });
           } else if (msg.type === 'DATA_MUTATED') {
-            void refreshFromSheets(true, undefined, { afterWrite: true });
+            void refreshFromSheets(true, { afterWrite: true });
           }
         };
       }
     } catch {}
 
     const handleStorageEvent = (e: StorageEvent) => {
-      if (e.key === 'dkb_apps_script_url') {
+      if (e.key === 'dkb_apps_script_url' || e.key === 'dkb_apps_script_secret') {
         setAppsScriptUrlState(getAppsScriptUrl());
-        void refreshFromSheets(true, undefined, { afterWrite: true });
+        setAppsScriptSecretConfigured(hasAppsScriptSecretToken());
+        void refreshFromSheets(true, { afterWrite: true });
       } else if (e.key === 'dkb_last_sync_event') {
-        void refreshFromSheets(true, undefined, { afterWrite: true });
+        void refreshFromSheets(true, { afterWrite: true });
       }
     };
 
@@ -1168,16 +1118,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const handleOnline = () => {
       setSyncStatus('syncing');
       flushOfflineAttendanceScans();
-      refreshFromSheets(true, undefined, { afterWrite: true });
+      refreshFromSheets(true, { afterWrite: true });
     };
 
     const handleOffline = () => {
       setSyncStatus('offline');
     };
 
-    const handleGoogleAuthExpiredEvent = (evt: Event) => {
+    const handleAppsScriptUnauthorizedEvent = (evt: Event) => {
       const detail = (evt as CustomEvent)?.detail || {};
-      handlePossibleGoogleTokenExpiry(401, detail);
+      handleAppsScriptUnauthorized(401, detail);
     };
 
     const handleAppTokenRefreshedEvent = (evt: Event) => {
@@ -1192,7 +1142,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
     window.addEventListener('storage', handleStorageEvent);
-    window.addEventListener('dkb-google-auth-expired', handleGoogleAuthExpiredEvent);
+    window.addEventListener('dkb-apps-script-unauthorized', handleAppsScriptUnauthorizedEvent);
     window.addEventListener('dkb-app-token-refreshed', handleAppTokenRefreshedEvent);
 
     return () => {
@@ -1202,14 +1152,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
       window.removeEventListener('storage', handleStorageEvent);
-      window.removeEventListener('dkb-google-auth-expired', handleGoogleAuthExpiredEvent);
+      window.removeEventListener('dkb-apps-script-unauthorized', handleAppsScriptUnauthorizedEvent);
       window.removeEventListener('dkb-app-token-refreshed', handleAppTokenRefreshedEvent);
       try {
         bc?.close();
       } catch {}
       syncChannelRef.current = null;
     };
-  }, [refreshFromSheets, flushOfflineAttendanceScans, handlePossibleGoogleTokenExpiry, refreshAuthSessionIfNeeded]);
+  }, [refreshFromSheets, flushOfflineAttendanceScans, handleAppsScriptUnauthorized, refreshAuthSessionIfNeeded]);
 
   // Flush the 3-second batch of scans to POST /api/attendance
   const flushScanBatch = useCallback(async () => {
@@ -1227,7 +1177,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const sendBatch = async (tokOverride?: string) => {
         const res = await apiFetch('/api/attendance', {
           method: 'POST',
-          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, tokOverride),
+          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, tokOverride),
           body: JSON.stringify({
             scans: items.map((it) => it.params),
           }),
@@ -1237,8 +1187,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       };
 
       let { res, data } = await sendBatch();
-      if (handlePossibleGoogleTokenExpiry(res.status, data)) {
-        const msg = data.error || 'Sesi Google berakhir.';
+      if (handleAppsScriptUnauthorized(res.status, data)) {
+        const msg = data.error || 'Token rahasia Apps Script ditolak.';
         setSaveErrorState(msg);
         items.forEach((it) => it.resolve({ success: false, error: msg }));
         return;
@@ -1259,7 +1209,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       if (!res.ok) {
         if (res.status >= 500 || res.status === 429) {
-          // Persist offline & notify user
           const existingOffline = readOfflineScans();
           const newOffline = [...existingOffline, ...items.map((i) => i.params)];
           writeOfflineScans(newOffline);
@@ -1292,13 +1241,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           ...savedResults.map((r) => r.record),
           ...prev.filter((p) => !savedResults.some((sr) => sr.record.id === p.id)),
         ]);
-        setSavedState('Tersimpan & Tersinkron');
+        setSavedState('Tersimpan');
       } else {
         soundEffects.playErrorBeep();
         setSaveErrorState(rejectedList[0]?.message || 'Presensi ditolak.');
       }
 
-      // Map each queued item to its result
       items.forEach((it) => {
         const targetStudent = students.find(
           (s) =>
@@ -1343,7 +1291,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (data.snapshot) {
         applyDatabaseSnapshot(data.snapshot, data.serverTime);
       } else {
-        await refreshFromSheets(true, undefined, { afterWrite: true });
+        await refreshFromSheets(true, { afterWrite: true });
       }
       broadcastSyncEvent('DATA_MUTATED');
     } catch {
@@ -1365,7 +1313,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     applyDatabaseSnapshot,
     buildApiHeaders,
     broadcastSyncEvent,
-    handlePossibleGoogleTokenExpiry,
+    handleAppsScriptUnauthorized,
     refreshAuthSessionIfNeeded,
     students,
     refreshFromSheets,
@@ -1407,13 +1355,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           const payload = forceOverwrite ? { ...params.body, forceOverwrite: true } : params.body;
           const res = await apiFetch(params.url, {
             method: params.method,
-            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, overrideAppToken),
+            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, overrideAppToken),
             body: JSON.stringify(payload),
           });
           const data = await res.json().catch(() => ({}));
 
-          if (handlePossibleGoogleTokenExpiry(res.status, data)) {
-            const msg = data.error || 'Sesi Google berakhir.';
+          if (handleAppsScriptUnauthorized(res.status, data)) {
+            const msg = data.error || 'Token rahasia Apps Script ditolak.';
             setSaveErrorState(msg);
             return { ok: false, error: msg };
           }
@@ -1438,7 +1386,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 currentData: data.current,
                 onReloadLatest: async () => {
                   setConflictPrompt(null);
-                  await refreshFromSheets(true, undefined, { afterWrite: true });
+                  await refreshFromSheets(true, { afterWrite: true });
                   resolve({ ok: false, error: msg });
                 },
                 onForceOverwrite: async () => {
@@ -1458,7 +1406,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             return { ok: false, error: errMsg, data };
           }
 
-          // Instant authoritative snapshot reflection in the same HTTP roundtrip
           if (data.snapshot) {
             applyDatabaseSnapshot(data.snapshot, data.serverTime);
           } else {
@@ -1469,18 +1416,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             }
           }
 
-          setSavedState('Tersimpan & Tersinkron');
+          setSavedState('Tersimpan');
           if (params.onSuccess) params.onSuccess(data);
           if (params.successMessage && !params.silentToast) {
             showToast(params.successMessage, 'success');
           }
           broadcastSyncEvent('DATA_MUTATED');
           if (!data.snapshot) {
-            await refreshFromSheets(true, undefined, { afterWrite: true });
+            await refreshFromSheets(true, { afterWrite: true });
           }
           return { ok: true, data };
         } catch (err: any) {
-          const errMsg = err?.message || 'Gagal terhubung ke server.';
+          const errMsg = err?.message || 'Gagal terhubung ke Apps Script.';
           setSaveErrorState(errMsg);
           if (!params.silentToast) showToast(errMsg, 'error');
           return { ok: false, error: errMsg };
@@ -1493,7 +1440,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       applyDatabaseSnapshot,
       buildApiHeaders,
       broadcastSyncEvent,
-      handlePossibleGoogleTokenExpiry,
+      handleAppsScriptUnauthorized,
       refreshAuthSessionIfNeeded,
       refreshFromSheets,
       setSavingState,
@@ -1513,7 +1460,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         body: JSON.stringify({ password }),
       });
       const data = await res.json().catch(() => ({}));
-      if (handlePossibleGoogleTokenExpiry(res.status, data)) {
+      if (handleAppsScriptUnauthorized(res.status, data)) {
         return { success: false, error: data.error };
       }
       if (!res.ok) {
@@ -1538,7 +1485,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       refreshFromSheets(true);
       return { success: true };
     } catch {
-      return { success: false, error: 'Gagal menghubungi server autentikasi.' };
+      return { success: false, error: 'Gagal menghubungi Google Apps Script.' };
     }
   };
 
@@ -1550,7 +1497,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         body: JSON.stringify({ name, password, classId }),
       });
       const data = await res.json().catch(() => ({}));
-      if (handlePossibleGoogleTokenExpiry(res.status, data)) {
+      if (handleAppsScriptUnauthorized(res.status, data)) {
         return { success: false, error: data.error };
       }
       if (!res.ok) return { success: false, error: data.error || 'Password wali kelas salah' };
@@ -1571,7 +1518,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       refreshFromSheets(true);
       return { success: true, classId: data.classId };
     } catch {
-      return { success: false, error: 'Gagal menghubungi server autentikasi.' };
+      return { success: false, error: 'Gagal menghubungi Google Apps Script.' };
     }
   };
 
@@ -1583,7 +1530,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         body: JSON.stringify({ password }),
       });
       const data = await res.json().catch(() => ({}));
-      if (handlePossibleGoogleTokenExpiry(res.status, data)) {
+      if (handleAppsScriptUnauthorized(res.status, data)) {
         return { success: false, error: data.error };
       }
       if (!res.ok) return { success: false, error: data.error || 'Password kesiswaan salah' };
@@ -1603,7 +1550,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       refreshFromSheets(true);
       return { success: true };
     } catch {
-      return { success: false, error: 'Gagal menghubungi server autentikasi.' };
+      return { success: false, error: 'Gagal menghubungi Google Apps Script.' };
     }
   };
 
@@ -1615,7 +1562,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         body: JSON.stringify({ password }),
       });
       const data = await res.json().catch(() => ({}));
-      if (handlePossibleGoogleTokenExpiry(res.status, data)) {
+      if (handleAppsScriptUnauthorized(res.status, data)) {
         return { success: false, error: data.error };
       }
       if (!res.ok) return { success: false, error: data.error || 'Password admin salah' };
@@ -1635,7 +1582,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       refreshFromSheets(true);
       return { success: true };
     } catch {
-      return { success: false, error: 'Gagal menghubungi server autentikasi.' };
+      return { success: false, error: 'Gagal menghubungi Google Apps Script.' };
     }
   };
 
@@ -1963,7 +1910,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setSavingState();
     latestMutationSeqRef.current += 1;
 
-    const CHUNK_SIZE = 150;
+    const CHUNK_SIZE = 80;
     let totalAdded = 0;
     let totalUpdated = 0;
     let totalClassesCreated = 0;
@@ -1977,7 +1924,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const sendChunk = async (tokOverride?: string) => {
           const res = await apiFetch('/api/students?action=batch_import', {
             method: 'POST',
-            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, tokOverride),
+            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, tokOverride),
             body: JSON.stringify({ students: chunk }),
           });
           const data = await res.json().catch(() => ({}));
@@ -1985,8 +1932,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         };
 
         let { res, data } = await sendChunk();
-        if (handlePossibleGoogleTokenExpiry(res.status, data)) {
-          const msg = data.error || 'Sesi Google berakhir. Silakan masuk ulang.';
+        if (handleAppsScriptUnauthorized(res.status, data)) {
+          const msg = data.error || 'Token rahasia Apps Script ditolak.';
           setSaveErrorState(msg);
           return {
             success: false,
@@ -2028,9 +1975,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (lastSnapshot) {
         applyDatabaseSnapshot(lastSnapshot, lastServerTime);
       } else {
-        await refreshFromSheets(true, undefined, { afterWrite: true });
+        await refreshFromSheets(true, { afterWrite: true });
       }
-      setSavedState('Tersimpan & Tersinkron');
+      setSavedState('Tersimpan');
       broadcastSyncEvent('DATA_MUTATED');
 
       return {
@@ -2194,7 +2141,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const executeTestEmail = async (tokOverride?: string) => {
         const res = await apiFetch('/api/notifications?action=test_email', {
           method: 'POST',
-          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, tokOverride),
+          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, tokOverride),
           body: JSON.stringify({ email }),
         });
         const data = await res.json().catch(() => ({}));
@@ -2202,8 +2149,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       };
 
       let { res, data } = await executeTestEmail();
-      if (handlePossibleGoogleTokenExpiry(res.status, data)) {
-        return { success: false, message: data.error || 'Sesi Google berakhir.' };
+      if (handleAppsScriptUnauthorized(res.status, data)) {
+        return { success: false, message: data.error || 'Token rahasia Apps Script ditolak.' };
       }
       if (res.status === 401 && sessionRef.current?.token) {
         const refreshedTok = await refreshAuthSessionIfNeeded(true);
@@ -2237,7 +2184,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const executeWeeklyRecap = async (tokOverride?: string) => {
         const res = await apiFetch('/api/notifications?action=send_weekly_recap', {
           method: 'POST',
-          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, undefined, tokOverride),
+          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, tokOverride),
           body: JSON.stringify({ classId }),
         });
         const data = await res.json().catch(() => ({}));
@@ -2245,8 +2192,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       };
 
       let { res, data } = await executeWeeklyRecap();
-      if (handlePossibleGoogleTokenExpiry(res.status, data)) {
-        return { success: false, message: data.error || 'Sesi Google berakhir.' };
+      if (handleAppsScriptUnauthorized(res.status, data)) {
+        return { success: false, message: data.error || 'Token rahasia Apps Script ditolak.' };
       }
       if (res.status === 401 && sessionRef.current?.token) {
         const refreshedTok = await refreshAuthSessionIfNeeded(true);
@@ -2310,16 +2257,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         configError,
         missingEnv,
         envStatus,
-        needsGoogleAuth,
-        isGoogleSigningIn,
-        googleAccessToken,
-        googleUser,
-        connectGoogleAccount,
-        disconnectGoogleAccount,
         appsScriptUrl,
+        appsScriptSecretConfigured,
         isConnectingAppsScript,
         connectAppsScript,
         disconnectAppsScript,
+        runSystemCheck,
         confirmDialog,
         requestConfirm,
         conflictPrompt,

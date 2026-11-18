@@ -7,6 +7,7 @@ import {
   GraduationCap,
   ShieldAlert,
   Sliders,
+  ShieldCheck,
   LogOut,
   RefreshCw,
   WifiOff,
@@ -48,6 +49,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
     { id: 'attendance' as ActiveTab, label: '2. Presensi Siswa', icon: UserCheck },
     { id: 'out_of_class' as ActiveTab, label: '3. Izin Keluar Kelas', icon: DoorOpen },
     { id: 'violations' as ActiveTab, label: '4. Pelanggaran', icon: AlertTriangle },
+    { id: 'system_check' as ActiveTab, label: '5. Cek Sistem', icon: ShieldCheck },
   ];
 
   const lockedRoleLabel =
@@ -159,6 +161,11 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
                   <RefreshCw className="w-3 h-3 text-sky-500 animate-spin shrink-0" />
                   <span className="text-sky-600 dark:text-sky-400 font-medium truncate">Menyimpan...</span>
                 </>
+              ) : saveStatus.state === 'error' ? (
+                <>
+                  <AlertCircle className="w-3 h-3 text-rose-500 shrink-0" />
+                  <span className="text-rose-600 dark:text-rose-400 font-medium truncate">{saveStatus.message || 'Gagal Menyimpan'}</span>
+                </>
               ) : syncStatus === 'synced' ? (
                 <>
                   <span className="relative flex h-2 w-2 shrink-0">
@@ -166,7 +173,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
                     <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                   </span>
                   <span className="text-slate-600 dark:text-slate-300 font-medium truncate">
-                    {saveStatus.state === 'saved' ? 'Tersimpan di Sheet' : 'Google Sheets Aktif'}
+                    {saveStatus.state === 'saved' ? 'Tersimpan' : 'Google Sheets Aktif'}
                   </span>
                 </>
               ) : syncStatus === 'syncing' ? (

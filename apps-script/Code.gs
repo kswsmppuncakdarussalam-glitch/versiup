@@ -5,14 +5,18 @@
  * Cara Deploy di Google Apps Script (https://script.google.com):
  * 1. Buka https://script.google.com -> Proyek Baru ("DISIPLIN KITA BISA Backend").
  * 2. Hapus isi Code.gs bawaan lalu tempel seluruh kode ini dan Simpan (Ctrl+S).
- * 3. (Opsional) Jalankan fungsi `setupAppsScript` sekali dari editor untuk
- *    menginisialisasi 13 tab Google Sheets & memberi izin Sheets, Drive, Gmail.
- * 4. Klik "Terapkan" (Deploy) -> "Deployment baru" (New deployment):
+ * 3. Buka "Setelan Proyek" (ikon Roda Gigi) -> "Properti Skrip" (Script Properties)
+ *    lalu tambahkan 3 properti wajib berikut:
+ *    - SPREADSHEET_ID   : ID Google Spreadsheet Anda (mis. 14MkgrDI6iFV4J8b5rS_LkUZrHtYX_zzuGJUihjKdxU4)
+ *    - DRIVE_FOLDER_ID  : ID Folder Google Drive privat untuk foto (mis. 1vHFHbjW2E8Zo_-nuft4ns1NonyXcQY7K)
+ *    - SECRET_TOKEN     : Token rahasia bebas & kuat (mis. DKB-Rahasia-2026-SmpPds!)
+ * 4. Pilih fungsi `setupAppsScript` di toolbar editor lalu klik "Jalankan"
+ *    untuk membuat 13 tab Google Sheets & memberi izin Sheets, Drive, GmailApp.
+ * 5. Klik "Terapkan" (Deploy) -> "Deployment baru" (New deployment):
  *    - Jenis: Aplikasi Web (Web app)
  *    - Jalankan sebagai (Execute as): Saya (Me)
  *    - Yang memiliki akses (Who has access): Siapa saja (Anyone)
- * 5. Salin URL Web App (/exec) lalu tempelkan di menu Admin -> Sinkronisasi
- *    (atau di halaman Login -> Hubungkan Apps Script).
+ * 6. Salin URL Web App (/exec) dan masukkan bersama SECRET_TOKEN di aplikasi.
  *
  * (Opsional) Untuk rekap mingguan otomatis berjalan tanpa membuka aplikasi:
  * Buka menu Triggers (Ikon Jam) di Apps Script -> Tambah Trigger:
@@ -21,8 +25,6 @@
  * ============================================================================
  */
 
-var DEFAULT_SPREADSHEET_ID = '14MkgrDI6iFV4J8b5rS_LkUZrHtYX_zzuGJUihjKdxU4';
-var DEFAULT_DRIVE_FOLDER_ID = '1vHFHbjW2E8Zo_-nuft4ns1NonyXcQY7K';
 var TOKEN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 hari
 var LOCKOUT_MAX_ATTEMPTS = 5;
 var LOCKOUT_SECONDS = 300; // 5 menit
@@ -106,35 +108,58 @@ SHEET_HEADERS[SHEET_TABS.LOG] = [
 // ============================================================================
 
 function setupAppsScript() {
-  var ss = getSpreadsheet_();
-  ensureSheetsAndHeaders_(ss);
-  ensureSeedData_(ss);
+  var missing = getMissingConfigKeys_();
+  var ssId = getSpreadsheetId_();
+  if (!ssId) {
+    throw new Error('SPREADSHEET_ID belum diisi di Setelan Proyek -> Properti Skrip (Script Properties).');
+  }
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  var ss;
+  try {
+    ss = getSpreadsheet_();
+    ensureSheetsAndHeaders_(ss);
+    ensureSeedData_(ss);
+  } finally {
+    lock.releaseLock();
+  }
+
   var folderId = getDriveFolderId_();
-  var resolvedFolderId = folderId || '';
+  var folderOk = false;
+  var folderName = '';
   if (folderId) {
     try {
-      DriveApp.getFolderById(folderId).getName();
+      var f = DriveApp.getFolderById(folderId);
+      if (f && (!f.isTrashed || !f.isTrashed())) {
+        folderOk = true;
+        folderName = f.getName();
+      }
     } catch (eFolder) {
-      try {
-        resolvedFolderId = getOrCreateAppDriveFolder_().getId();
-      } catch (eFallback) {}
+      folderOk = false;
     }
-  } else {
-    try {
-      resolvedFolderId = getOrCreateAppDriveFolder_().getId();
-    } catch (eFallback2) {}
   }
+
+  // Sentuh GmailApp agar izin pengiriman email ikut terotorisasi saat menjalankan setupAppsScript
+  var quotaRemaining = 0;
+  try {
+    quotaRemaining = MailApp.getRemainingDailyQuota();
+  } catch (eMail) {}
+
   return {
     ok: true,
-    spreadsheetId: ss.getId(),
     spreadsheetName: ss.getName(),
-    driveFolderId: resolvedFolderId,
+    driveFolderAccessible: folderOk,
+    driveFolderName: folderName,
     senderEmail: getActiveSenderEmail_(),
+    mailQuotaRemaining: quotaRemaining,
+    missingProperties: missing,
   };
 }
 
 function checkAndTriggerWeeklyRecap() {
   try {
+    if (!getSpreadsheetId_()) return;
     var notifSettings = getNotificationSettings_();
     if (!notifSettings.weekly_recap_enabled) return;
 
@@ -157,7 +182,13 @@ function checkAndTriggerWeeklyRecap() {
         return;
       }
     }
-    sendAllWeeklyRecaps_();
+    var lock = LockService.getScriptLock();
+    lock.waitLock(15000);
+    try {
+      sendAllWeeklyRecaps_();
+    } finally {
+      lock.releaseLock();
+    }
   } catch (err) {
     Logger.log('checkAndTriggerWeeklyRecap error: ' + err);
   }
@@ -170,8 +201,58 @@ function normalizeToken_(rawTok) {
   return s;
 }
 
+function constantTimeEqual_(a, b) {
+  var sa = String(a || '');
+  var sb = String(b || '');
+  var maxLen = Math.max(sa.length, sb.length);
+  var diff = sa.length ^ sb.length;
+  for (var i = 0; i < maxLen; i++) {
+    var ca = i < sa.length ? sa.charCodeAt(i) : 0;
+    var cb = i < sb.length ? sb.charCodeAt(i) : 0;
+    diff |= (ca ^ cb);
+  }
+  return diff === 0 && sa.length > 0;
+}
+
+function verifySecretToken_(incomingSecret) {
+  var configured = getSecretToken_();
+  if (!configured) {
+    return {
+      ok: false,
+      missingSecret: true,
+      reason: 'Token rahasia (SECRET_TOKEN) belum diatur di Script Properties Google Apps Script.',
+    };
+  }
+  var cleanIncoming = normalizeToken_(incomingSecret);
+  if (!cleanIncoming || !constantTimeEqual_(cleanIncoming, configured)) {
+    return {
+      ok: false,
+      missingSecret: false,
+      reason: 'Akses ditolak: token rahasia (SECRET_TOKEN) salah atau tidak disertakan.',
+    };
+  }
+  return { ok: true };
+}
+
 function doGet(e) {
   var params = (e && e.parameter) || {};
+  var incomingSecret =
+    params.secretToken ||
+    params.secret_token ||
+    params.apiToken ||
+    params.token_rahasia ||
+    '';
+
+  var secretCheck = verifySecretToken_(incomingSecret);
+  if (!secretCheck.ok) {
+    return jsonOutput_(makeResp_(401, {
+      error: secretCheck.reason,
+      unauthorizedToken: true,
+      missingSecret: Boolean(secretCheck.missingSecret),
+      missingConfig: getMissingConfigKeys_(),
+    }));
+  }
+
   var route = params.route || '/api/setup';
   var req = {
     route: route,
@@ -193,11 +274,31 @@ function doPost(e) {
     return jsonOutput_(makeResp_(400, { error: 'Payload JSON tidak valid: ' + parseErr.message }));
   }
 
+  var params = (e && e.parameter) || {};
+  var incomingSecret =
+    payload.secretToken ||
+    payload.secret_token ||
+    payload.apiToken ||
+    params.secretToken ||
+    params.secret_token ||
+    params.apiToken ||
+    '';
+
+  var secretCheck = verifySecretToken_(incomingSecret);
+  if (!secretCheck.ok) {
+    return jsonOutput_(makeResp_(401, {
+      error: secretCheck.reason,
+      unauthorizedToken: true,
+      missingSecret: Boolean(secretCheck.missingSecret),
+      missingConfig: getMissingConfigKeys_(),
+    }));
+  }
+
   var req = {
-    route: payload.route || ((e && e.parameter && e.parameter.route) || '/api/setup'),
+    route: payload.route || params.route || '/api/setup',
     method: String(payload.method || 'POST').toUpperCase(),
-    query: payload.query || (e && e.parameter) || {},
-    token: normalizeToken_(payload.token || (e && e.parameter && e.parameter.token)),
+    query: payload.query || params || {},
+    token: normalizeToken_(payload.token || params.token),
     body: payload.body !== undefined ? payload.body : {},
   };
 
@@ -224,7 +325,7 @@ function makeResp_(status, data) {
 }
 
 // ============================================================================
-// CONFIG & HELPERS
+// CONFIG & HELPERS (Script Properties ONLY)
 // ============================================================================
 
 function getProp_(key, fallback) {
@@ -232,19 +333,33 @@ function getProp_(key, fallback) {
     var val = PropertiesService.getScriptProperties().getProperty(key);
     if (val && String(val).trim()) return String(val).trim();
   } catch (e) {}
-  return fallback;
+  return fallback !== undefined ? fallback : '';
 }
 
 function getSpreadsheetId_() {
-  var raw = getProp_('SPREADSHEET_ID', DEFAULT_SPREADSHEET_ID);
+  var raw = getProp_('SPREADSHEET_ID', '');
+  if (!raw) return '';
   var m = String(raw).match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
   return m ? m[1] : String(raw).split(/[?#/\s]/)[0];
 }
 
 function getDriveFolderId_() {
-  var raw = getProp_('DRIVE_FOLDER_ID', DEFAULT_DRIVE_FOLDER_ID);
+  var raw = getProp_('DRIVE_FOLDER_ID', '');
+  if (!raw) return '';
   var m = String(raw).match(/\/folders\/([a-zA-Z0-9_-]+)/);
   return m ? m[1] : String(raw).split(/[?#/\s]/)[0];
+}
+
+function getSecretToken_() {
+  return getProp_('SECRET_TOKEN', '');
+}
+
+function getMissingConfigKeys_() {
+  var missing = [];
+  if (!getSpreadsheetId_()) missing.push('SPREADSHEET_ID');
+  if (!getDriveFolderId_()) missing.push('DRIVE_FOLDER_ID');
+  if (!getSecretToken_()) missing.push('SECRET_TOKEN');
+  return missing;
 }
 
 function getJwtSecret_() {
@@ -253,7 +368,7 @@ function getJwtSecret_() {
 
 function getSpreadsheet_() {
   var id = getSpreadsheetId_();
-  if (!id) throw new Error('SPREADSHEET_ID belum diatur.');
+  if (!id) throw new Error('SPREADSHEET_ID belum diisi di Script Properties Google Apps Script.');
   return SpreadsheetApp.openById(id);
 }
 
@@ -382,7 +497,7 @@ function verifyJwt_(token) {
       return null;
     }
 
-    if (parts[2] === expectedSig || (payload.userId && payload.role)) {
+    if (parts[2] === expectedSig) {
       if (payload.tokenVersion !== undefined && payload.tokenVersion !== null) {
         var tv = Number(payload.tokenVersion);
         if (!isNaN(tv)) payload.tokenVersion = tv;
@@ -860,12 +975,9 @@ function appendRows_(ss, tabName, rowObjects) {
     ensureSheetsAndHeaders_(ss);
     sheet = ss.getSheetByName(tabName);
   }
-  var headers = SHEET_HEADERS[tabName];
-  var values = rowObjects.map(function (o) {
-    return objToRowArray_(tabName, o);
-  });
-  var startRow = Math.max(sheet.getLastRow() + 1, 2);
-  sheet.getRange(startRow, 1, values.length, headers.length).setValues(values);
+  for (var i = 0; i < rowObjects.length; i++) {
+    sheet.appendRow(objToRowArray_(tabName, rowObjects[i]));
+  }
 }
 
 function appendLog_(ss, entry) {
@@ -1568,18 +1680,24 @@ function extractDriveFileId_(raw) {
   return '';
 }
 
-function getOrCreateAppDriveFolder_() {
-  var folderName = 'DISIPLIN KITA BISA - Foto';
-  var existing = DriveApp.getFoldersByName(folderName);
-  if (existing.hasNext()) {
-    return existing.next();
-  }
-  return DriveApp.createFolder(folderName);
-}
-
 function uploadPhotoToDrive_(base64Data, fileName) {
   var rawStr = String(base64Data || '').trim();
   if (!rawStr) throw new Error('Data base64 foto wajib diisi.');
+
+  var folderId = getDriveFolderId_();
+  if (!folderId) {
+    throw new Error('DRIVE_FOLDER_ID belum diisi di Script Properties Google Apps Script.');
+  }
+
+  var targetFolder;
+  try {
+    targetFolder = DriveApp.getFolderById(folderId);
+    if (!targetFolder || (targetFolder.isTrashed && targetFolder.isTrashed())) {
+      throw new Error('Folder Drive tujuan sudah dipindahkan ke sampah.');
+    }
+  } catch (eFolder) {
+    throw new Error('Folder Google Drive (DRIVE_FOLDER_ID) tidak dapat diakses: ' + ((eFolder && eFolder.message) ? eFolder.message : String(eFolder)));
+  }
 
   var mimeType = 'image/jpeg';
   var cleanBase64 = rawStr;
@@ -1598,26 +1716,7 @@ function uploadPhotoToDrive_(base64Data, fileName) {
 
   var safeName = String(fileName || ('foto_' + Date.now() + '.jpg')).trim();
   var blob = Utilities.newBlob(bytes, mimeType, safeName);
-  var folderId = getDriveFolderId_();
-  var file = null;
-
-  if (folderId) {
-    try {
-      var targetFolder = DriveApp.getFolderById(folderId);
-      file = targetFolder.createFile(blob);
-    } catch (eFolder) {
-      file = null;
-    }
-  }
-
-  if (!file) {
-    try {
-      var appFolder = getOrCreateAppDriveFolder_();
-      file = appFolder.createFile(blob);
-    } catch (eAppFolder) {
-      file = DriveApp.createFile(blob);
-    }
-  }
+  var file = targetFolder.createFile(blob);
 
   var createdId = file && file.getId ? file.getId() : '';
   if (!createdId) {
@@ -2248,6 +2347,95 @@ function startOutOfClass_(ss, record, actorName) {
 // MAIN ROUTE DISPATCHER (All 15 /api/* Endpoints)
 // ============================================================================
 
+function runSystemCheck_() {
+  var missingConfig = getMissingConfigKeys_();
+  var ssId = getSpreadsheetId_();
+  var folderId = getDriveFolderId_();
+  var secretTok = getSecretToken_();
+
+  var configFlags = {
+    SPREADSHEET_ID: Boolean(ssId),
+    DRIVE_FOLDER_ID: Boolean(folderId),
+    SECRET_TOKEN: Boolean(secretTok),
+  };
+
+  var sheetsCheck = {
+    ok: false,
+    configured: Boolean(ssId),
+    spreadsheetName: '',
+    tabsCount: 0,
+    expectedTabs: 13,
+    missingTabs: [],
+    error: '',
+  };
+
+  if (!ssId) {
+    sheetsCheck.error = 'Properti skrip SPREADSHEET_ID masih kosong.';
+  } else {
+    try {
+      var ss = SpreadsheetApp.openById(ssId);
+      sheetsCheck.spreadsheetName = ss.getName();
+      var missingTabs = [];
+      var existingCount = 0;
+      for (var k in SHEET_TABS) {
+        if (Object.prototype.hasOwnProperty.call(SHEET_TABS, k)) {
+          var tName = SHEET_TABS[k];
+          if (ss.getSheetByName(tName)) {
+            existingCount++;
+          } else {
+            missingTabs.push(tName);
+          }
+        }
+      }
+      sheetsCheck.tabsCount = existingCount;
+      sheetsCheck.missingTabs = missingTabs;
+      sheetsCheck.ok = true;
+    } catch (errSs) {
+      sheetsCheck.error = (errSs && errSs.message) ? errSs.message : String(errSs);
+    }
+  }
+
+  var driveCheck = {
+    ok: false,
+    configured: Boolean(folderId),
+    folderName: '',
+    error: '',
+  };
+
+  if (!folderId) {
+    driveCheck.error = 'Properti skrip DRIVE_FOLDER_ID masih kosong.';
+  } else {
+    try {
+      var folder = DriveApp.getFolderById(folderId);
+      if (folder.isTrashed && folder.isTrashed()) {
+        driveCheck.error = 'Folder Google Drive berada di tempat sampah (trashed).';
+      } else {
+        driveCheck.folderName = folder.getName();
+        driveCheck.ok = true;
+      }
+    } catch (errDrv) {
+      driveCheck.error = (errDrv && errDrv.message) ? errDrv.message : String(errDrv);
+    }
+  }
+
+  var senderEmail = getActiveSenderEmail_();
+  var gmailCheck = {
+    ok: Boolean(senderEmail) || true,
+    senderEmail: senderEmail,
+  };
+
+  return {
+    success: sheetsCheck.ok && driveCheck.ok && missingConfig.length === 0,
+    tokenValid: Boolean(secretTok),
+    missingConfig: missingConfig,
+    configFlags: configFlags,
+    sheets: sheetsCheck,
+    drive: driveCheck,
+    gmail: gmailCheck,
+    serverTime: new Date().toISOString(),
+  };
+}
+
 function dispatchRoute_(req) {
   var pathname = req.route || '/api/setup';
   var method = String(req.method || 'GET').toUpperCase();
@@ -2256,40 +2444,67 @@ function dispatchRoute_(req) {
   var token = req.token || '';
 
   try {
+    // 0. /api/system-check (Uji koneksi Sheets & Drive + tampilkan konfigurasi yang masih kosong, tanpa nilainya)
+    if (pathname === '/api/system-check') {
+      return makeResp_(200, runSystemCheck_());
+    }
+
     // 1. /api/setup
     if (pathname === '/api/setup') {
-      var ss = getSpreadsheet_();
-      ensureSheetsAndHeaders_(ss);
-      ensureSeedData_(ss);
-      var incomingScriptUrl = String((body && body.appsScriptUrl) || (query && query.appsScriptUrl) || '').trim();
-      if (incomingScriptUrl && incomingScriptUrl.indexOf('https://script.google') === 0) {
+      var missingSetup = getMissingConfigKeys_();
+      if (!getSpreadsheetId_()) {
+        return makeResp_(503, {
+          error: 'SPREADSHEET_ID di Script Properties Google Apps Script masih kosong.',
+          configured: false,
+          missingConfig: missingSetup,
+          missingEnv: missingSetup,
+        });
+      }
+      var lockSetup = LockService.getScriptLock();
+      lockSetup.waitLock(15000);
+      var ss;
+      try {
+        ss = getSpreadsheet_();
+        ensureSheetsAndHeaders_(ss);
+        ensureSeedData_(ss);
+        var incomingScriptUrl = String((body && body.appsScriptUrl) || (query && query.appsScriptUrl) || '').trim();
+        if (incomingScriptUrl && incomingScriptUrl.indexOf('https://script.google') === 0) {
+          try {
+            updateSettings_({ apps_script_url: incomingScriptUrl.replace(/\/+$/, '') }, 'Sistem');
+          } catch (eSetUrl) {}
+        }
+      } finally {
+        lockSetup.releaseLock();
+      }
+      var driveOkSetup = false;
+      var folderIdSetup = getDriveFolderId_();
+      if (folderIdSetup) {
         try {
-          updateSettings_({ apps_script_url: incomingScriptUrl.replace(/\/+$/, '') }, 'Sistem');
-        } catch (eSetUrl) {}
+          var fSetup = DriveApp.getFolderById(folderIdSetup);
+          driveOkSetup = Boolean(fSetup && (!fSetup.isTrashed || !fSetup.isTrashed()));
+        } catch (eDrvSetup) {}
       }
       var dbSetup = getFullDatabase_();
       var senderEmail = getActiveSenderEmail_();
       return makeResp_(200, {
         success: true,
-        configured: true,
+        configured: missingSetup.length === 0 && driveOkSetup,
         sheetsConfigured: true,
-        driveConfigured: true,
+        driveConfigured: driveOkSetup,
         spreadsheetConfigured: true,
-        driveFolderConfigured: true,
-        hasServiceAccount: false,
+        driveFolderConfigured: driveOkSetup,
         authMode: 'apps_script',
-        requiresGoogleSignIn: false,
         emailConnected: true,
         emailTransport: 'apps_script_gmail',
         senderEmail: senderEmail,
-        savedAppsScriptUrl: (dbSetup.settings && dbSetup.settings.apps_script_url) || '',
-        missingEnv: [],
+        missingConfig: missingSetup,
+        missingEnv: missingSetup,
         serverTime: new Date().toISOString(),
         data: buildDatabasePayload_(dbSetup),
       });
     }
 
-    // 2. /api/photos
+    // 2. /api/photos (Upload ke folder privat & baca via endpoint Apps Script tanpa folder publik)
     if (pathname === '/api/photos') {
       if (method === 'GET') {
         var fileId = extractDriveFileId_(query.id || '');
@@ -2298,7 +2513,7 @@ function dispatchRoute_(req) {
         }
         var photo = getPhotoFromDrive_(fileId);
         if (photo.notFound) {
-          return makeResp_(404, { error: photo.error || 'Foto tidak ditemukan di Google Drive.' });
+          return makeResp_(404, { notFound: true, error: photo.error || 'Foto tidak ditemukan di Google Drive.' });
         }
         return makeResp_(200, {
           success: true,
@@ -2316,22 +2531,37 @@ function dispatchRoute_(req) {
 
     // 3. /api/sync
     if (pathname === '/api/sync') {
+      var missingSync = getMissingConfigKeys_();
+      if (!getSpreadsheetId_()) {
+        return makeResp_(503, {
+          error: 'SPREADSHEET_ID belum diisi di Script Properties Google Apps Script.',
+          configured: false,
+          missingConfig: missingSync,
+          missingEnv: missingSync,
+        });
+      }
       var dbSync = getFullDatabase_();
+      var driveOkSync = false;
+      var folderIdSync = getDriveFolderId_();
+      if (folderIdSync) {
+        try {
+          var fSync = DriveApp.getFolderById(folderIdSync);
+          driveOkSync = Boolean(fSync && (!fSync.isTrashed || !fSync.isTrashed()));
+        } catch (eDrvSync) {}
+      }
       return makeResp_(200, {
         fullSnapshot: true,
-        configured: true,
+        configured: missingSync.length === 0 && driveOkSync,
         sheetsConfigured: true,
-        driveConfigured: true,
+        driveConfigured: driveOkSync,
         spreadsheetConfigured: true,
-        driveFolderConfigured: true,
-        hasServiceAccount: false,
+        driveFolderConfigured: driveOkSync,
         authMode: 'apps_script',
-        requiresGoogleSignIn: false,
         emailConnected: true,
         emailTransport: 'apps_script_gmail',
         senderEmail: getActiveSenderEmail_(),
-        savedAppsScriptUrl: (dbSync.settings && dbSync.settings.apps_script_url) || '',
-        missingEnv: [],
+        missingConfig: missingSync,
+        missingEnv: missingSync,
         serverTime: new Date().toISOString(),
         data: buildDatabasePayload_(dbSync),
       });
@@ -2870,13 +3100,19 @@ function dispatchRoute_(req) {
         var vAttDel = validateTokenAgainstSheet_(token);
         if (!vAttDel.valid) return makeResp_(401, { error: vAttDel.reason || 'Unauthorized', sessionInvalidated: Boolean(vAttDel.invalidated) });
         var sessDel = vAttDel.session;
-        var okDel = softDeleteRow_(ssAtt, {
-          tabName: SHEET_TABS.PRESENSI,
-          id: body.id,
-          actorName: sessDel.name || 'Petugas',
-          reason: body.reason || 'Pembatalan presensi',
-        });
-        return makeResp_(200, { success: okDel, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        var lockAttDel = LockService.getScriptLock();
+        lockAttDel.waitLock(15000);
+        try {
+          var okDel = softDeleteRow_(ssAtt, {
+            tabName: SHEET_TABS.PRESENSI,
+            id: body.id,
+            actorName: sessDel.name || 'Petugas',
+            reason: body.reason || 'Pembatalan presensi',
+          });
+          return makeResp_(200, { success: okDel, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        } finally {
+          lockAttDel.releaseLock();
+        }
       }
     }
 
@@ -2884,7 +3120,14 @@ function dispatchRoute_(req) {
     if (pathname === '/api/out-of-class') {
       var ssOoc = getSpreadsheet_();
       if (method === 'GET') {
-        autoCloseOverdueOutOfClass_(ssOoc);
+        var lockOocGet = LockService.getScriptLock();
+        if (lockOocGet.tryLock(5000)) {
+          try {
+            autoCloseOverdueOutOfClass_(ssOoc);
+          } finally {
+            lockOocGet.releaseLock();
+          }
+        }
         return makeResp_(200, { records: getFullDatabase_().out_of_class });
       }
 
@@ -3075,13 +3318,19 @@ function dispatchRoute_(req) {
         var vVDel = validateTokenAgainstSheet_(token);
         if (!vVDel.valid) return makeResp_(401, { error: vVDel.reason || 'Unauthorized', sessionInvalidated: Boolean(vVDel.invalidated) });
         var sessVDel = vVDel.session;
-        var okVDel = softDeleteRow_(ssVio, {
-          tabName: SHEET_TABS.PELANGGARAN,
-          id: body.id,
-          actorName: sessVDel.name || 'Admin',
-          reason: body.reason || 'Koreksi pelanggaran',
-        });
-        return makeResp_(200, { success: okVDel, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        var lockVDel = LockService.getScriptLock();
+        lockVDel.waitLock(15000);
+        try {
+          var okVDel = softDeleteRow_(ssVio, {
+            tabName: SHEET_TABS.PELANGGARAN,
+            id: body.id,
+            actorName: sessVDel.name || 'Admin',
+            reason: body.reason || 'Koreksi pelanggaran',
+          });
+          return makeResp_(200, { success: okVDel, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        } finally {
+          lockVDel.releaseLock();
+        }
       }
     }
 
@@ -3132,8 +3381,14 @@ function dispatchRoute_(req) {
         }
       }
       if (method === 'DELETE') {
-        softDeleteRow_(ssVt, { tabName: SHEET_TABS.JENIS_PELANGGARAN, id: body.id, actorName: sessVt.name || 'Admin', reason: 'Hapus jenis pelanggaran' });
-        return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        var lockVtDel = LockService.getScriptLock();
+        lockVtDel.waitLock(15000);
+        try {
+          softDeleteRow_(ssVt, { tabName: SHEET_TABS.JENIS_PELANGGARAN, id: body.id, actorName: sessVt.name || 'Admin', reason: 'Hapus jenis pelanggaran' });
+          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        } finally {
+          lockVtDel.releaseLock();
+        }
       }
     }
 
@@ -3240,19 +3495,26 @@ function dispatchRoute_(req) {
 
               if (hasActiveExisting) {
                 var oldData = existingEntry.data;
-                var changedFields = false;
+                var changedCols = [];
                 for (var hi = 0; hi < stuHeaders.length; hi++) {
                   var colName = stuHeaders[hi];
                   if (colName === 'updated_at' || colName === 'diubah_pada') continue;
                   var oldVal = oldData[colName] !== undefined ? String(oldData[colName]) : '';
                   var newVal = rec[colName] !== undefined && rec[colName] !== null ? String(rec[colName]) : '';
                   if (oldVal !== newVal) {
-                    changedFields = true;
-                    break;
+                    changedCols.push({ index: hi + 1, value: rec[colName] });
                   }
                 }
-                if (changedFields && stuSheet) {
-                  stuSheet.getRange(existingEntry.rowNumber, 1, 1, stuHeaders.length).setValues([objToRowArray_(SHEET_TABS.SISWA, rec)]);
+                if (changedCols.length > 0 && stuSheet) {
+                  for (var ci = 0; ci < changedCols.length; ci++) {
+                    stuSheet.getRange(existingEntry.rowNumber, changedCols[ci].index).setValue(
+                      changedCols[ci].value === undefined || changedCols[ci].value === null ? '' : changedCols[ci].value
+                    );
+                  }
+                  var updColIdx = stuHeaders.indexOf('updated_at');
+                  var chgColIdx = stuHeaders.indexOf('diubah_pada');
+                  if (updColIdx >= 0) stuSheet.getRange(existingEntry.rowNumber, updColIdx + 1).setValue(nowBatch);
+                  if (chgColIdx >= 0) stuSheet.getRange(existingEntry.rowNumber, chgColIdx + 1).setValue(nowBatch);
                   existingEntry.data = rec;
                   updatedStu++;
                 }
@@ -3401,8 +3663,14 @@ function dispatchRoute_(req) {
       }
       if (method === 'DELETE') {
         var delId = body.id || query.id;
-        if (delId) softDeleteRow_(ssCls, { tabName: SHEET_TABS.KELAS, id: delId, actorName: actorCls, reason: 'Hapus kelas' });
-        return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        var lockClsDel = LockService.getScriptLock();
+        lockClsDel.waitLock(15000);
+        try {
+          if (delId) softDeleteRow_(ssCls, { tabName: SHEET_TABS.KELAS, id: delId, actorName: actorCls, reason: 'Hapus kelas' });
+          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        } finally {
+          lockClsDel.releaseLock();
+        }
       }
     }
 
@@ -3451,8 +3719,14 @@ function dispatchRoute_(req) {
       }
       if (method === 'DELETE') {
         var delSessId = body.id || query.id;
-        if (delSessId) softDeleteRow_(ssSess, { tabName: SHEET_TABS.SESI_PRESENSI, id: delSessId, actorName: actorSess, reason: 'Hapus sesi presensi' });
-        return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        var lockSessDel = LockService.getScriptLock();
+        lockSessDel.waitLock(15000);
+        try {
+          if (delSessId) softDeleteRow_(ssSess, { tabName: SHEET_TABS.SESI_PRESENSI, id: delSessId, actorName: actorSess, reason: 'Hapus sesi presensi' });
+          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), snapshot: buildDatabasePayload_() });
+        } finally {
+          lockSessDel.releaseLock();
+        }
       }
     }
 
@@ -3597,52 +3871,58 @@ function dispatchRoute_(req) {
 
     // 16. /api/simulate
     if (pathname === '/api/simulate') {
-      var ssSim = getSpreadsheet_();
-      var dbSim = getFullDatabase_();
-      var ts1 = dbSim.students[0];
-      var tSess = dbSim.sessions[0];
-      if (!ts1 || !tSess) return makeResp_(400, { error: 'Data siswa atau sesi masih kosong di Google Sheets.' });
+      var lockSim = LockService.getScriptLock();
+      lockSim.waitLock(15000);
+      try {
+        var ssSim = getSpreadsheet_();
+        var dbSim = getFullDatabase_();
+        var ts1 = dbSim.students[0];
+        var tSess = dbSim.sessions[0];
+        if (!ts1 || !tSess) return makeResp_(400, { error: 'Data siswa atau sesi masih kosong di Google Sheets.' });
 
-      if (body.testType === 'duplicate_attendance') {
-        var nowS = new Date();
-        var dStr = toDateYmd_(nowS);
-        var resSim = appendAttendanceBatch_(ssSim, [
-          { id: 'att_sim_1_' + Date.now(), student_id: ts1.nis, session_id: tSess.id, date: dStr, timestamp: nowS.toISOString(), status: 'Hadir', late_minutes: 0, method: 'rfid', device_id: 'device_gate_1', version: 1, created_at: nowS.toISOString(), updated_at: nowS.toISOString() },
-          { id: 'att_sim_2_' + Date.now(), student_id: ts1.nis, session_id: tSess.id, date: dStr, timestamp: nowS.toISOString(), status: 'Hadir', late_minutes: 0, method: 'barcode', device_id: 'device_gate_2', version: 1, created_at: nowS.toISOString(), updated_at: nowS.toISOString() },
-        ], 'Simulasi');
-        return makeResp_(200, {
-          test: 'duplicate_attendance',
-          saved: resSim.saved.length,
-          rejectedDuplicates: resSim.rejectedDuplicates,
-          conclusion: resSim.rejectedDuplicates.length > 0
-            ? 'SUKSES: Hanya satu presensi yang diterima, duplikat hari yang sama berhasil ditolak.'
-            : 'Simulasi selesai.',
-        });
+        if (body.testType === 'duplicate_attendance') {
+          var nowS = new Date();
+          var dStr = toDateYmd_(nowS);
+          var resSim = appendAttendanceBatch_(ssSim, [
+            { id: 'att_sim_1_' + Date.now(), student_id: ts1.nis, session_id: tSess.id, date: dStr, timestamp: nowS.toISOString(), status: 'Hadir', late_minutes: 0, method: 'rfid', device_id: 'device_gate_1', version: 1, created_at: nowS.toISOString(), updated_at: nowS.toISOString() },
+            { id: 'att_sim_2_' + Date.now(), student_id: ts1.nis, session_id: tSess.id, date: dStr, timestamp: nowS.toISOString(), status: 'Hadir', late_minutes: 0, method: 'barcode', device_id: 'device_gate_2', version: 1, created_at: nowS.toISOString(), updated_at: nowS.toISOString() },
+          ], 'Simulasi');
+          return makeResp_(200, {
+            test: 'duplicate_attendance',
+            saved: resSim.saved.length,
+            rejectedDuplicates: resSim.rejectedDuplicates,
+            conclusion: resSim.rejectedDuplicates.length > 0
+              ? 'SUKSES: Hanya satu presensi yang diterima, duplikat hari yang sama berhasil ditolak.'
+              : 'Simulasi selesai.',
+          });
+        }
+
+        if (body.testType === 'out_of_class_quota_race') {
+          var clsStus = dbSim.students.filter(function (s) { return s.class_id === ts1.class_id; });
+          var st1 = clsStus[0];
+          var st2 = clsStus[1] || dbSim.students[1] || st1;
+          var o1 = startOutOfClass_(ssSim, {
+            id: 'ooc_sim_1_' + Date.now(), student_id: st1.nis, class_id: st1.class_id, type: 'BAK',
+            duration_minutes: 5, started_at: new Date().toISOString(), due_at: new Date(Date.now() + 300000).toISOString(),
+            late_return_minutes: 0, status: 'active', idempotency_key: 'key_sim_1_' + Date.now(), version: 1
+          }, 'Simulasi');
+          var o2 = startOutOfClass_(ssSim, {
+            id: 'ooc_sim_2_' + Date.now(), student_id: st2.nis, class_id: st2.class_id, type: 'BAB',
+            duration_minutes: 10, started_at: new Date().toISOString(), due_at: new Date(Date.now() + 600000).toISOString(),
+            late_return_minutes: 0, status: 'active', idempotency_key: 'key_sim_2_' + Date.now(), version: 1
+          }, 'Simulasi');
+          return makeResp_(200, {
+            test: 'out_of_class_quota_race',
+            req1: { success: o1.success, error: o1.error },
+            req2: { success: o2.success, error: o2.error },
+            conclusion: 'Pengujian kuota kelas langsung ke Google Sheets selesai dievaluasi.',
+          });
+        }
+
+        return makeResp_(400, { error: 'Jenis pengujian tidak valid.' });
+      } finally {
+        lockSim.releaseLock();
       }
-
-      if (body.testType === 'out_of_class_quota_race') {
-        var clsStus = dbSim.students.filter(function (s) { return s.class_id === ts1.class_id; });
-        var st1 = clsStus[0];
-        var st2 = clsStus[1] || dbSim.students[1] || st1;
-        var o1 = startOutOfClass_(ssSim, {
-          id: 'ooc_sim_1_' + Date.now(), student_id: st1.nis, class_id: st1.class_id, type: 'BAK',
-          duration_minutes: 5, started_at: new Date().toISOString(), due_at: new Date(Date.now() + 300000).toISOString(),
-          late_return_minutes: 0, status: 'active', idempotency_key: 'key_sim_1_' + Date.now(), version: 1
-        }, 'Simulasi');
-        var o2 = startOutOfClass_(ssSim, {
-          id: 'ooc_sim_2_' + Date.now(), student_id: st2.nis, class_id: st2.class_id, type: 'BAB',
-          duration_minutes: 10, started_at: new Date().toISOString(), due_at: new Date(Date.now() + 600000).toISOString(),
-          late_return_minutes: 0, status: 'active', idempotency_key: 'key_sim_2_' + Date.now(), version: 1
-        }, 'Simulasi');
-        return makeResp_(200, {
-          test: 'out_of_class_quota_race',
-          req1: { success: o1.success, error: o1.error },
-          req2: { success: o2.success, error: o2.error },
-          conclusion: 'Pengujian kuota kelas langsung ke Google Sheets selesai dievaluasi.',
-        });
-      }
-
-      return makeResp_(400, { error: 'Jenis pengujian tidak valid.' });
     }
 
     return makeResp_(404, { error: 'Endpoint ' + pathname + ' tidak ditemukan.' });

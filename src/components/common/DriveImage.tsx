@@ -8,17 +8,12 @@ import {
 import { useApp } from '../../context/AppContext.js';
 
 export function useResolvedPhotoSrc(val?: string | null): string {
-  const { googleAccessToken, appsScriptUrl, envStatus } = useApp();
+  const { appsScriptUrl, appsScriptSecretConfigured } = useApp();
   const [resolved, setResolved] = useState<string>(() => {
     const clean = (val || '').trim();
     if (!clean) return '';
     if (isDirectPhotoUrl(clean)) return clean;
-    const preResolved = resolvePhotoSrc(clean);
-    // Avoid synchronous unauthenticated /api/photos calls when using Apps Script or browser OAuth
-    if (preResolved.startsWith('/api/photos') && (appsScriptUrl || googleAccessToken || envStatus.requiresGoogleSignIn)) {
-      return '';
-    }
-    return preResolved;
+    return resolvePhotoSrc(clean);
   });
 
   useEffect(() => {
@@ -33,16 +28,12 @@ export function useResolvedPhotoSrc(val?: string | null): string {
       return;
     }
 
-    const fileId = extractDriveFileId(clean) || clean;
-    if (!googleAccessToken && !appsScriptUrl) {
-      if (envStatus.requiresGoogleSignIn) {
-        setResolved('');
-      } else {
-        setResolved(resolvePhotoSrc(fileId));
-      }
+    if (!appsScriptUrl || !appsScriptSecretConfigured) {
+      setResolved('');
       return;
     }
 
+    const fileId = extractDriveFileId(clean) || clean;
     fetchAuthorizedDrivePhotoUrl(fileId)
       .then((url) => {
         if (active) setResolved(url || '');
@@ -54,7 +45,7 @@ export function useResolvedPhotoSrc(val?: string | null): string {
     return () => {
       active = false;
     };
-  }, [val, googleAccessToken, appsScriptUrl, envStatus.requiresGoogleSignIn]);
+  }, [val, appsScriptUrl, appsScriptSecretConfigured]);
 
   return resolved;
 }

@@ -45,7 +45,8 @@ export type ActiveTab =
   | 'dashboard'
   | 'homeroom'
   | 'student_affairs'
-  | 'admin';
+  | 'admin'
+  | 'system_check';
 
 export interface AuthSession {
   token: string;

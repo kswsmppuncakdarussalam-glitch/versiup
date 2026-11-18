@@ -39,14 +39,13 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
     syncStatus,
     saveStatus,
     envStatus,
-    needsGoogleAuth,
-    googleUser,
-    connectGoogleAccount,
     appsScriptUrl,
+    appsScriptSecretConfigured,
   } = useApp();
 
   const isLockedMenuOpen = Boolean(session?.lockedMenuRole);
   const logoSrc = useResolvedPhotoSrc(settings.logo_url);
+  const isBackendConfigured = Boolean(appsScriptUrl) && appsScriptSecretConfigured && envStatus.sheetsConfigured;
 
   const toggleSound = () => {
     updateSettings({ tts_enabled: !settings.tts_enabled });
@@ -158,60 +157,46 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
             {saveStatus.state === 'saving' && <RefreshCw className="w-3 h-3 animate-spin" />}
             {saveStatus.state === 'saved' && <CheckCircle2 className="w-3 h-3" />}
             {saveStatus.state === 'error' && <AlertCircle className="w-3 h-3" />}
-            <span className="max-w-[140px] truncate">{saveStatus.message}</span>
+            <span className="max-w-[160px] truncate">{saveStatus.message}</span>
           </div>
         )}
 
-        {/* Read-only Google Sheets / Apps Script Direct API Status (Auto-refresh 15s) */}
-        {needsGoogleAuth && !appsScriptUrl ? (
-          <button
-            type="button"
-            onClick={connectGoogleAccount}
-            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-semibold border bg-sky-50 dark:bg-sky-950/30 text-sky-700 dark:text-sky-300 border-sky-200 dark:border-sky-800 hover:bg-sky-100 transition-colors"
-            title="Klik untuk masuk dan menghubungkan akun Google"
-          >
-            <Database className="w-3 h-3" />
-            <span>Hubungkan Google</span>
-          </button>
-        ) : (
-          <div
-            title={
-              envStatus.authMode === 'apps_script' || Boolean(appsScriptUrl)
-                ? `Terhubung langsung ke Google Apps Script Web App${envStatus.senderEmail ? ` (${envStatus.senderEmail})` : ''} (refresh otomatis tiap 15 detik).`
-                : googleUser?.email
-                ? `Terhubung ke Google Sheets & Drive dengan akun ${googleUser.email} (refresh otomatis tiap 15 detik).`
-                : 'Membaca dan menulis langsung ke Google Sheets API v4 & Drive v3 (refresh otomatis tiap 15 detik).'
-            }
-            className={`hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border ${
-              !envStatus.sheetsConfigured
-                ? 'bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800'
-                : syncStatus === 'synced'
-                ? 'bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800'
-                : syncStatus === 'syncing'
-                ? 'bg-sky-50 dark:bg-sky-950/30 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800'
-                : syncStatus === 'offline'
-                ? 'bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800'
-                : 'bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-800'
-            }`}
-          >
-            <Database className="w-3 h-3" />
-            <span className="max-w-[170px] truncate">
-              {!envStatus.sheetsConfigured
-                ? 'Sheets Belum Diset'
-                : syncStatus === 'synced'
-                ? envStatus.authMode === 'apps_script' || Boolean(appsScriptUrl)
-                  ? 'Apps Script (Aktif)'
-                  : googleUser?.email
-                  ? `Google (${googleUser.email})`
-                  : 'Sheets Langsung (Auto 15d)'
-                : syncStatus === 'syncing'
-                ? 'Memuat Sheets...'
-                : syncStatus === 'offline'
-                ? 'Offline Lokal'
-                : 'Gangguan Koneksi'}
-            </span>
-          </div>
-        )}
+        {/* Read-only Apps Script Status (links to Cek Sistem when incomplete) */}
+        <button
+          type="button"
+          onClick={() => setActiveTab('system_check')}
+          title={
+            isBackendConfigured
+              ? `Terhubung langsung ke Google Apps Script Web App${envStatus.senderEmail ? ` (${envStatus.senderEmail})` : ''} (auto-reload 15 detik). Klik untuk membuka Cek Sistem.`
+              : 'Klik untuk membuka Cek Sistem dan melihat bagian konfigurasi yang belum lengkap.'
+          }
+          className={`hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-medium border transition-colors ${
+            !isBackendConfigured
+              ? 'bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800 hover:bg-amber-100'
+              : syncStatus === 'synced'
+              ? 'bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800'
+              : syncStatus === 'syncing'
+              ? 'bg-sky-50 dark:bg-sky-950/30 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800'
+              : syncStatus === 'offline'
+              ? 'bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800'
+              : 'bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-800'
+          }`}
+        >
+          <Database className="w-3 h-3" />
+          <span className="max-w-[170px] truncate">
+            {!appsScriptUrl || !appsScriptSecretConfigured
+              ? 'Apps Script Belum Diset'
+              : !envStatus.sheetsConfigured
+              ? 'Cek Konfigurasi Sheets'
+              : syncStatus === 'synced'
+              ? 'Apps Script (Aktif)'
+              : syncStatus === 'syncing'
+              ? 'Memuat Sheets...'
+              : syncStatus === 'offline'
+              ? 'Offline Lokal'
+              : 'Gangguan Koneksi'}
+          </span>
+        </button>
 
         {/* Date & Server Authoritative Clock */}
         <div className="flex items-center gap-2 px-2.5 py-1 rounded bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 text-xs">

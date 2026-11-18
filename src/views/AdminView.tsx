@@ -53,10 +53,9 @@ import {
 } from '../utils/excel.js';
 import { uploadPhotoToBackend } from '../utils/photo.js';
 import { DriveImage } from '../components/common/DriveImage.js';
-import { getGoogleAccessToken } from '../utils/googleAuth.js';
 import { apiFetch } from '../utils/apiClient.js';
-import { GoogleSignInButton } from '../components/auth/GoogleSignInButton.js';
 import { AppsScriptPanel } from '../components/auth/AppsScriptPanel.js';
+import { SystemCheckView } from './SystemCheckView.js';
 import {
   SCHOOL_NAME_PRESETS,
   SCHOOL_LOGO_PRESETS,
@@ -104,13 +103,9 @@ export const AdminView: React.FC = () => {
     envStatus,
     configError,
     missingEnv,
-    needsGoogleAuth,
-    isGoogleSigningIn,
-    googleAccessToken,
-    googleUser,
-    connectGoogleAccount,
-    disconnectGoogleAccount,
     appsScriptUrl,
+    appsScriptSecretConfigured,
+    setActiveTab,
     requestConfirm,
     saveStatus,
     syncStatus,
@@ -271,11 +266,9 @@ export const AdminView: React.FC = () => {
   };
 
   const getAdminHeaders = (extra?: Record<string, string>, overrideToken?: string): Record<string, string> => {
-    const gToken = googleAccessToken || getGoogleAccessToken();
     const appTok = overrideToken || session?.token;
     return {
       ...(appTok ? { Authorization: `Bearer ${appTok}` } : {}),
-      ...(gToken ? { 'X-Google-Access-Token': gToken } : {}),
       ...(extra || {}),
     };
   };
@@ -289,8 +282,8 @@ export const AdminView: React.FC = () => {
     let data = await safeReadJson(res);
 
     if (res.status === 401) {
-      if (data?.googleAuthExpired || data?.googleDeploymentUnauthorized) {
-        window.dispatchEvent(new CustomEvent('dkb-google-auth-expired', { detail: data }));
+      if (data?.unauthorizedToken || data?.googleDeploymentUnauthorized) {
+        window.dispatchEvent(new CustomEvent('dkb-apps-script-unauthorized', { detail: data }));
         return { res, data };
       }
       if (session?.token) {
@@ -309,7 +302,7 @@ export const AdminView: React.FC = () => {
 
   // Fetch all user accounts from server (with automatic 401 session renewal)
   const fetchUsers = async () => {
-    if (!session?.token || configError || (needsGoogleAuth && !appsScriptUrl)) return;
+    if (!session?.token || configError || !appsScriptUrl || !appsScriptSecretConfigured) return;
     setLoadingUsers(true);
     try {
       const { res, data } = await fetchAdminWithRetry('/api/auth?action=manage_accounts');
@@ -324,10 +317,22 @@ export const AdminView: React.FC = () => {
   };
 
   useEffect(() => {
-    if ((activeSection === 'accounts' || !usersList.length) && !configError && (!needsGoogleAuth || Boolean(appsScriptUrl))) {
+    if ((activeSection === 'accounts' || !usersList.length) && !configError && Boolean(appsScriptUrl) && appsScriptSecretConfigured) {
       fetchUsers();
     }
-  }, [activeSection, session?.token, configError, needsGoogleAuth, appsScriptUrl, googleAccessToken]);
+  }, [activeSection, session?.token, configError, appsScriptUrl, appsScriptSecretConfigured]);
+
+  useEffect(() => {
+    if (activeSection !== 'accounts' || !session?.token || configError || !appsScriptUrl || !appsScriptSecretConfigured) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        void fetchUsers();
+      }
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [activeSection, session?.token, configError, appsScriptUrl, appsScriptSecretConfigured]);
 
   const handleSaveTargetPassword = async (targetUser: User, newPass: string, confirmPass?: string) => {
     if (!newPass || newPass.trim().length < 4) {
@@ -365,7 +370,7 @@ export const AdminView: React.FC = () => {
       setTargetConfirmPassword('');
       setSelectedUserForPassword(null);
       await fetchUsers();
-      void refreshFromSheets(true, undefined, { afterWrite: true });
+      void refreshFromSheets(true, { afterWrite: true });
     } catch (err: any) {
       showToast(`Terjadi kesalahan: ${err.message}`, 'error');
     } finally {
@@ -418,7 +423,7 @@ export const AdminView: React.FC = () => {
       }
 
       await fetchUsers();
-      void refreshFromSheets(true, undefined, { afterWrite: true });
+      void refreshFromSheets(true, { afterWrite: true });
       return true;
     } catch (err: any) {
       showToast(`Terjadi kesalahan: ${err.message}`, 'error');
@@ -467,7 +472,7 @@ export const AdminView: React.FC = () => {
       setNewAccountLabel('');
       setNewAccountPassword('');
       await fetchUsers();
-      void refreshFromSheets(true, undefined, { afterWrite: true });
+      void refreshFromSheets(true, { afterWrite: true });
     } catch (err: any) {
       showToast(`Terjadi kesalahan: ${err.message}`, 'error');
     }
@@ -497,7 +502,7 @@ export const AdminView: React.FC = () => {
       }
       showToast(`Akun "${name}" telah dihapus.`, 'success');
       await fetchUsers();
-      void refreshFromSheets(true, undefined, { afterWrite: true });
+      void refreshFromSheets(true, { afterWrite: true });
     } catch (err: any) {
       showToast(`Gagal menghapus akun: ${err.message}`, 'error');
     }
@@ -708,7 +713,7 @@ export const AdminView: React.FC = () => {
                 ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800'
                 : 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800'
             }`}>
-              {envStatus.configured ? 'Sheets API v4 Aktif' : 'Env Server Belum Lengkap'}
+              {envStatus.configured ? 'Apps Script Aktif' : 'Konfigurasi Apps Script'}
             </span>
             <button
               type="button"
@@ -776,11 +781,11 @@ export const AdminView: React.FC = () => {
                 </>
               ) : saveStatus.state === 'saving' ? (
                 <>
-                  <strong>Menyimpan...</strong> Menulis perubahan langsung ke Google Sheets API v4...
+                  <strong>Menyimpan...</strong> Menulis perubahan ke Google Sheets melalui Google Apps Script...
                 </>
               ) : (
                 <>
-                  <strong>Google Sheets API v4 &amp; Drive API v3 (Service Account) Aktif:</strong> Semua perubahan langsung ditulis ke Spreadsheet &amp; Drive melalui server, dimuat ulang otomatis tiap 15 detik dan saat tab aktif.
+                  <strong>Tersimpan • Google Apps Script Web App Aktif:</strong> Semua perubahan ditulis langsung ke Spreadsheet &amp; Drive melalui Apps Script, dimuat ulang otomatis tiap 15 detik dan saat tab aktif.
                   {lastSyncTime ? ` (Pembaruan terakhir: ${lastSyncTime.toLocaleTimeString('id-ID')})` : ''}
                 </>
               )}
@@ -1417,16 +1422,9 @@ export const AdminView: React.FC = () => {
             </div>
 
             <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => fetchUsers()}
-                disabled={loadingUsers}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
-                title="Muat ulang data akun dari server"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${loadingUsers ? 'animate-spin' : ''}`} />
-                Muat Ulang
-              </button>
+              <span className="text-[11px] text-slate-500">
+                {loadingUsers ? 'Memuat akun...' : 'Auto-refresh 15d'}
+              </span>
               <button
                 type="button"
                 onClick={() => {
@@ -2973,7 +2971,7 @@ export const AdminView: React.FC = () => {
             </div>
           </div>
 
-          {/* Hubungkan Email Pengirim (Gmail / Apps Script GmailApp) */}
+          {/* Status Email Pengirim (Google Apps Script GmailApp) */}
           <div
             className={`p-4 rounded-xl border space-y-2.5 ${
               envStatus.emailConnected
@@ -2985,7 +2983,7 @@ export const AdminView: React.FC = () => {
               <div className="space-y-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <Mail className="w-4 h-4 shrink-0" />
-                  <span className="font-bold">Hubungkan Email Pengirim (Gmail)</span>
+                  <span className="font-bold">Email Pengirim (Apps Script GmailApp)</span>
                   <span
                     className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
                       envStatus.emailConnected
@@ -2993,52 +2991,26 @@ export const AdminView: React.FC = () => {
                         : 'bg-amber-100 text-amber-800 dark:bg-amber-900/60 dark:text-amber-200'
                     }`}
                   >
-                    {envStatus.emailTransport === 'apps_script_gmail'
+                    {envStatus.emailConnected
                       ? `Aktif via Apps Script (${envStatus.senderEmail || 'GmailApp'})`
-                      : envStatus.emailTransport === 'gmail_oauth'
-                      ? `Terhubung via Gmail (${googleUser?.email || 'Aktif'})`
-                      : envStatus.emailTransport === 'smtp'
-                      ? 'Terhubung via SMTP Server'
-                      : 'Email Pengirim Belum Terhubung'}
+                      : 'Menunggu Koneksi Apps Script'}
                   </span>
                 </div>
                 <p className="text-[11px] opacity-85 leading-relaxed">
-                  {envStatus.emailTransport === 'apps_script_gmail'
-                    ? `Email notifikasi orang tua & rekap mingguan wali kelas dikirim langsung melalui layanan GmailApp dari akun pemilik Google Apps Script${envStatus.senderEmail ? ` (${envStatus.senderEmail})` : ''}.`
-                    : envStatus.emailTransport === 'gmail_oauth'
-                    ? `Email dikirim langsung menggunakan Gmail API dari akun Google ${googleUser?.email || ''}. Anda dapat mengganti atau menghubungkan ulang akun pengirim kapan saja.`
-                    : envStatus.emailTransport === 'smtp'
-                    ? 'Email dikirim menggunakan konfigurasi SMTP server. Anda juga dapat menghubungkan akun Gmail secara langsung via tombol di sebelah kanan.'
-                    : 'Hubungkan akun Google Anda (beri izin Gmail Send) agar sistem dapat mengirim email notifikasi orang tua dan rekap mingguan ke wali kelas secara nyata.'}
+                  {envStatus.emailConnected
+                    ? `Email notifikasi orang tua & rekap mingguan wali kelas dikirim langsung melalui layanan GmailApp dari akun Google pemilik Google Apps Script${envStatus.senderEmail ? ` (${envStatus.senderEmail})` : ''}.`
+                    : 'Pengiriman email otomatis berjalan langsung melalui GmailApp di Google Apps Script Web App. Pastikan Web App & token rahasia sudah terhubung dan jalankan setupAppsScript() sekali di editor Apps Script untuk memberi izin Gmail.'}
                 </p>
               </div>
 
-              {!appsScriptUrl && envStatus.authMode !== 'apps_script' && (
-                <div className="shrink-0 flex flex-wrap items-center gap-2">
-                  {googleAccessToken ? (
-                    <>
-                      <GoogleSignInButton
-                        onClick={connectGoogleAccount}
-                        loading={isGoogleSigningIn}
-                        label="Ganti / Izinkan Ulang Gmail"
-                      />
-                      <button
-                        type="button"
-                        onClick={disconnectGoogleAccount}
-                        className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-900 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-100 transition-colors"
-                      >
-                        <LogOut className="w-3.5 h-3.5" />
-                        <span>Putuskan</span>
-                      </button>
-                    </>
-                  ) : (
-                    <GoogleSignInButton
-                      onClick={connectGoogleAccount}
-                      loading={isGoogleSigningIn}
-                      label="Hubungkan Email Gmail"
-                    />
-                  )}
-                </div>
+              {!envStatus.emailConnected && (
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('system_check')}
+                  className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold transition-colors"
+                >
+                  Buka Cek Sistem
+                </button>
               )}
             </div>
           </div>
@@ -3281,11 +3253,14 @@ export const AdminView: React.FC = () => {
         </div>
       )}
 
-      {/* SECTION 10: KONEKSI LANGSUNG GOOGLE APPS SCRIPT / SHEETS API v4 & DRIVE API v3 */}
+      {/* SECTION 10: KONEKSI LANGSUNG GOOGLE APPS SCRIPT WEB APP */}
       {activeSection === 'sync_status' && (
         <div className="space-y-5 text-xs">
           {/* Backend Google Apps Script (.gs) Panel */}
           <AppsScriptPanel />
+
+          {/* Cek Sistem Live Diagnostics (tanpa menampilkan nilai rahasia) */}
+          <SystemCheckView embedded />
 
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-5">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 dark:border-slate-800 pb-4">
@@ -3297,75 +3272,32 @@ export const AdminView: React.FC = () => {
                 </div>
                 <div>
                   <h2 className="text-sm font-bold text-slate-900 dark:text-white flex flex-wrap items-center gap-2">
-                    Integrasi Langsung Google Sheets, Drive &amp; Apps Script
+                    Integrasi Google Sheets &amp; Drive via Google Apps Script
                     <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
                       envStatus.configured
                         ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
                         : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
                     }`}>
-                      {envStatus.authMode === 'apps_script' || Boolean(appsScriptUrl)
-                        ? `Terhubung via Google Apps Script${envStatus.senderEmail ? ` (${envStatus.senderEmail})` : ''}`
-                        : envStatus.authMode === 'google_oauth'
-                        ? `Terhubung via Akun Google (${googleUser?.email || 'Aktif'})`
-                        : envStatus.configured
-                        ? 'Terhubung via Service Account Server'
-                        : 'Menunggu Koneksi Google'}
+                      {envStatus.configured
+                        ? `Aktif via Apps Script${envStatus.senderEmail ? ` (${envStatus.senderEmail})` : ''}`
+                        : 'Menunggu Konfigurasi Apps Script'}
                     </span>
                   </h2>
                   <p className="text-slate-500">
-                    Seluruh data dibaca dan ditulis langsung ke Google Spreadsheet menggunakan Google Apps Script Web App atau akun Google Anda tanpa penyimpanan draf lokal.
+                    Google Sheets adalah satu-satunya database. Semua permintaan dikirim dengan token rahasia ke Web App doGet / doPost tanpa Google Cloud maupun Service Account.
                   </p>
                 </div>
               </div>
             </div>
 
-            {(needsGoogleAuth || envStatus.authMode === 'google_oauth') && (
-              <div className={`p-4 rounded-xl border space-y-2.5 ${
-                googleAccessToken
-                  ? 'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/30 text-emerald-900 dark:text-emerald-100'
-                  : 'border-sky-200 dark:border-sky-800 bg-sky-50 dark:bg-sky-950/30 text-sky-900 dark:text-sky-100'
-              }`}>
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <div className="font-bold">
-                      {googleAccessToken && googleUser
-                        ? `Akun Google Terhubung: ${googleUser.email || googleUser.displayName}`
-                        : 'Hubungkan Akun Google Anda'}
-                    </div>
-                    <p className="text-[11px] opacity-85 mt-0.5">
-                      {googleAccessToken
-                        ? 'Aplikasi membaca & menulis Google Sheets dan Google Drive langsung melalui akun Google ini.'
-                        : 'Masuk dengan akun Google Anda agar sinkronisasi berjalan otomatis tanpa file JSON Service Account.'}
-                    </p>
-                  </div>
-                  <div className="shrink-0 flex items-center gap-2">
-                    {googleAccessToken ? (
-                      <button
-                        type="button"
-                        onClick={disconnectGoogleAccount}
-                        className="px-3 py-1.5 rounded-lg text-xs font-semibold border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-900 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-100 transition-colors"
-                      >
-                        Ganti / Putuskan Akun
-                      </button>
-                    ) : (
-                      <GoogleSignInButton
-                        onClick={connectGoogleAccount}
-                        loading={isGoogleSigningIn}
-                      />
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {!needsGoogleAuth && envStatus.authMode !== 'google_oauth' && missingEnv.length > 0 && (
+            {missingEnv.length > 0 && (
               <div className="p-4 rounded-xl border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-100 space-y-2">
                 <div className="flex items-center gap-2 font-bold">
                   <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                  <span>Environment Variable Server Belum Lengkap</span>
+                  <span>Bagian Konfigurasi yang Masih Kosong</span>
                 </div>
                 <p className="text-[11px] leading-relaxed">
-                  Variabel server yang belum terdeteksi:
+                  Lengkapi bagian berikut (nilai rahasia tidak ditampilkan):
                 </p>
                 <div className="flex flex-wrap gap-1.5 font-mono text-[11px]">
                   {missingEnv.map((envName) => (
@@ -3378,7 +3310,7 @@ export const AdminView: React.FC = () => {
             )}
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {/* Card 1: Google Sheets API v4 */}
+              {/* Card 1: Google Sheets */}
               <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40 space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -3386,8 +3318,8 @@ export const AdminView: React.FC = () => {
                       <FileSpreadsheet className="w-4 h-4" />
                     </div>
                     <div>
-                      <h3 className="font-bold text-slate-900 dark:text-white">Google Sheets API v4</h3>
-                      <p className="text-[11px] text-slate-500">Basis Data Langsung Tanpa Draft</p>
+                      <h3 className="font-bold text-slate-900 dark:text-white">Google Sheets (SpreadsheetApp)</h3>
+                      <p className="text-[11px] text-slate-500">Satu-satunya Basis Data Utama</p>
                     </div>
                   </div>
                   <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
@@ -3411,7 +3343,7 @@ export const AdminView: React.FC = () => {
                 </div>
               </div>
 
-              {/* Card 2: Google Drive API v3 (Photos Only) */}
+              {/* Card 2: Google Drive (Photos Only) */}
               <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40 space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -3419,8 +3351,8 @@ export const AdminView: React.FC = () => {
                       <ImageIcon className="w-4 h-4" />
                     </div>
                     <div>
-                      <h3 className="font-bold text-slate-900 dark:text-white">Google Drive API v3 (Media Foto)</h3>
-                      <p className="text-[11px] text-slate-500">Folder Privat via Proxy Server (/api/photos)</p>
+                      <h3 className="font-bold text-slate-900 dark:text-white">Google Drive Privat (DriveApp)</h3>
+                      <p className="text-[11px] text-slate-500">Akses Media via Endpoint Apps Script (/api/photos)</p>
                     </div>
                   </div>
                   <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
@@ -3434,7 +3366,7 @@ export const AdminView: React.FC = () => {
 
                 <div className="space-y-1.5 bg-white dark:bg-slate-900 p-3 rounded-lg border border-slate-200 dark:border-slate-800 text-[11px] text-slate-600 dark:text-slate-300">
                   <p>
-                    Foto siswa, bukti pelanggaran, bukti presensi, dan logo sekolah dikecilkan di perangkat (maks <strong>800 px</strong>, JPEG <strong>70%</strong>) lalu diunggah ke folder Drive privat (<code className="font-mono">drive.file</code>). Hanya ID file yang disimpan ke Google Sheets.
+                    Foto siswa, bukti pelanggaran, bukti presensi, dan logo sekolah dikecilkan di perangkat (maks <strong>800 px</strong>, JPEG <strong>70%</strong>) lalu diunggah ke folder Drive privat via <code className="font-mono">DriveApp</code>. Hanya ID file yang disimpan ke Google Sheets.
                   </p>
                 </div>
               </div>
@@ -3463,35 +3395,35 @@ export const AdminView: React.FC = () => {
 
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 shadow-sm space-y-4">
             <h3 className="font-bold text-slate-900 dark:text-white">
-              Arsitektur Serverless Stateless &amp; Perlindungan Data
+              Arsitektur Google Apps Script &amp; Integritas Data
             </h3>
 
             <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
               <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50">
                 <span className="text-slate-500 block text-[10px]">Pembaruan Otomatis:</span>
                 <span className="text-xs font-bold text-slate-900 dark:text-white">
-                  Setiap 15s &amp; Saat Tab Aktif
+                  Setiap 15d &amp; Saat Tab Aktif
                 </span>
               </div>
 
               <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50">
                 <span className="text-slate-500 block text-[10px]">Batch Scan Perangkat:</span>
                 <span className="text-xs font-bold text-slate-900 dark:text-white">
-                  Kumpul 3 Detik &amp; Retry 429 (3x)
+                  Kumpul 3 Detik &amp; Offline Auto-Sync
                 </span>
               </div>
 
               <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50">
                 <span className="text-slate-500 block text-[10px]">Integritas Edit &amp; Hapus:</span>
                 <span className="text-xs font-bold text-slate-900 dark:text-white">
-                  Lock 409 &amp; Soft Delete
+                  LockService + 409 + Soft Delete
                 </span>
               </div>
 
               <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50">
-                <span className="text-slate-500 block text-[10px]">Cadangan Offline Scan:</span>
+                <span className="text-slate-500 block text-[10px]">Keamanan Endpoint:</span>
                 <span className="text-xs font-bold text-emerald-600 dark:text-emerald-400">
-                  Kirim Otomatis Saat Online
+                  SECRET_TOKEN di Script Properties
                 </span>
               </div>
             </div>
@@ -3499,13 +3431,13 @@ export const AdminView: React.FC = () => {
             <div className="p-3.5 rounded-lg bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 space-y-2">
               <ul className="list-disc pl-4 space-y-1.5 text-slate-600 dark:text-slate-300 text-[11px] leading-relaxed">
                 <li>
-                  <strong>ID Unik &amp; Partial Cell Update:</strong> Kolom A menyimpan <code>id</code> unik dan kolom <code>diubah_pada</code> mencatat waktu pembaruan terakhir. Operasi edit hanya menulis sel yang berubah menggunakan <code>values.batchUpdate</code> dan memeriksa kecocokan <code>diubah_pada</code> sebelum menimpa data orang lain.
+                  <strong>ID Unik &amp; Partial Cell Update:</strong> Kolom A menyimpan <code>id</code> unik dan kolom <code>diubah_pada</code> mencatat waktu pembaruan terakhir. Operasi tambah memakai <code>appendRow</code>, sedangkan operasi edit mencari baris dari ID kolom A, membandingkan <code>diubah_pada</code> (HTTP 409 jika sudah berubah), dan hanya memperbarui sel yang berubah.
                 </li>
                 <li>
-                  <strong>Soft Delete &amp; Sheet Log:</strong> Penghapusan data mengubah kolom <code>status</code> menjadi <code>dihapus</code> tanpa menggeser nomor baris. Setiap tambah, edit, dan hapus otomatis dicatat ke lembar <code>Log</code>.
+                  <strong>LockService, Soft Delete &amp; Sheet Log:</strong> Semua operasi tulis dibungkus <code>LockService.getScriptLock()</code>. Penghapusan mengubah kolom <code>status</code> menjadi <code>dihapus</code> tanpa menggeser baris, dan setiap perubahan dicatat otomatis ke sheet <code>Log</code>.
                 </li>
                 <li>
-                  <strong>Presensi Cepat Tahan Kuota:</strong> Scan beruntun di satu perangkat dikumpulkan di frontend selama 3 detik dan dikirim dalam satu permintaan batch ke backend tanpa antrean memori server, dengan pengecekan presensi ganda di hari yang sama.
+                  <strong>Presensi Beruntun &amp; Mode Offline:</strong> Waktu presensi diambil dari server Apps Script, presensi ganda di hari yang sama ditolak, scan beruntun dikumpulkan tiap 3 detik menjadi batch, dan scan saat offline disimpan sementara lalu otomatis terkirim ketika online.
                 </li>
               </ul>
             </div>
