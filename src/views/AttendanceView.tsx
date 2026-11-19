@@ -65,6 +65,13 @@ export const AttendanceView: React.FC = () => {
   const [selectedStudent, setSelectedStudent] = useState<Student | null>(null);
   const [manualStatus, setManualStatus] = useState<AttendanceStatus>('Hadir');
   const [manualNotes, setManualNotes] = useState('');
+  const [manualFeedback, setManualFeedback] = useState<{
+    studentName: string;
+    status: AttendanceStatus;
+    sessionName: string;
+    synced: boolean;
+  } | null>(null);
+  const manualSearchInputRef = useRef<HTMLInputElement | null>(null);
 
   // Edit / Delete Attendance Record state
   const [editingRecord, setEditingRecord] = useState<AttendanceRecord | null>(null);
@@ -74,35 +81,15 @@ export const AttendanceView: React.FC = () => {
   // Drilldown Profile Modal
   const [profileStudent, setProfileStudent] = useState<Student | null>(null);
 
-  // Keep scan input ALWAYS focused (Bagian 4 Poin 60)
+  // Auto-focus input pencarian siswa ketika modal Presensi Manual dibuka (cursor utama scan/RFID tidak pernah dikunci)
   useEffect(() => {
-    const focusInput = () => {
-      if (inputRef.current && !showManualModal && !editingRecord && !profileStudent) {
-        inputRef.current.focus();
-      }
-    };
-
-    focusInput();
-    const interval = setInterval(focusInput, 1500);
-
-    const handleWindowFocus = () => focusInput();
-    const handleDocumentClick = (e: MouseEvent) => {
-      // Don't steal focus if user is clicking on modals or inputs
-      const target = e.target as HTMLElement;
-      if (target.tagName !== 'INPUT' && target.tagName !== 'BUTTON' && target.tagName !== 'SELECT' && target.tagName !== 'TEXTAREA') {
-        focusInput();
-      }
-    };
-
-    window.addEventListener('focus', handleWindowFocus);
-    document.addEventListener('click', handleDocumentClick);
-
-    return () => {
-      clearInterval(interval);
-      window.removeEventListener('focus', handleWindowFocus);
-      document.removeEventListener('click', handleDocumentClick);
-    };
-  }, [showManualModal, editingRecord, profileStudent]);
+    if (showManualModal) {
+      const t = setTimeout(() => {
+        manualSearchInputRef.current?.focus();
+      }, 30);
+      return () => clearTimeout(t);
+    }
+  }, [showManualModal]);
 
   // Handle Automatic Scan Submission on Enter (USB Barcode & RFID "Keyboard" Mode)
   const handleScanSubmit = async (e: React.FormEvent) => {
@@ -159,10 +146,13 @@ export const AttendanceView: React.FC = () => {
       const isDup = res.isDuplicate || (res.error && res.error.toLowerCase().includes('sudah tercatat'));
       let speechMsg = '';
       if (isDup) {
-        if (res.student) {
-          speechMsg = `${res.student.name}, kelas ${res.student.class_id}, sudah melakukan presensi hari ini.`;
+        if (res.student && res.record) {
+          const methodSrc = res.record.method === 'manual' ? 'Manual' : 'Scan';
+          speechMsg = `${res.student.name}, kelas ${res.student.class_id}, sudah tercatat ${res.record.status} melalui ${methodSrc} pada sesi ini.`;
+        } else if (res.student) {
+          speechMsg = `${res.student.name}, kelas ${res.student.class_id}, sudah melakukan presensi sesi ini hari ini.`;
         } else {
-          speechMsg = 'Perhatian, siswa sudah melakukan presensi hari ini.';
+          speechMsg = 'Perhatian, siswa sudah melakukan presensi pada sesi ini hari ini.';
         }
       } else if (res.error && (res.error.toLowerCase().includes('tidak terdaftar') || res.error.toLowerCase().includes('tidak dikenali'))) {
         speechMsg = 'Kartu tidak terdaftar.';
@@ -172,7 +162,7 @@ export const AttendanceView: React.FC = () => {
 
       const errorMsg = res.error || 'Kartu tidak dikenali';
       setModalStudent(res.student || null);
-      setModalRecord(null);
+      setModalRecord(res.record || null);
       setModalMessage(errorMsg);
       setModalIsError(true);
       setShowNotificationModal(true);
@@ -180,38 +170,46 @@ export const AttendanceView: React.FC = () => {
     }
   };
 
-  // Manual Attendance submission
+  // Manual Attendance submission (tersimpan instan, tetap berada di modal, dan langsung kembali ke pencarian siswa berikutnya)
   const handleManualSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedStudent) return;
 
-    const chosenSessionId = manualTargetSessionId || activeSession?.id;
+    const chosenStudent = selectedStudent;
+    const chosenStatus = manualStatus;
+    const chosenSessionId = manualTargetSessionId || activeSession?.id || sessions.find((s) => s.is_active)?.id || sessions[0]?.id;
+    const targetSessName = sessions.find((s) => s.id === chosenSessionId)?.name || activeSession?.name || 'presensi';
+
     const res = await recordAttendance({
-      studentId: selectedStudent.nis,
+      studentId: chosenStudent.nis,
       sessionId: chosenSessionId,
-      status: manualStatus,
+      status: chosenStatus,
       notes: manualNotes,
       method: 'manual',
     });
 
-    if (res.success && res.record) {
-      setShowManualModal(false);
-      const studentName = selectedStudent.name;
-      const studentClass = selectedStudent.class_id;
-      const targetSessName = sessions.find((s) => s.id === res.record?.session_id)?.name || activeSession?.name || 'presensi';
-      const speechMsg = `${studentName}, kelas ${studentClass}, Tercatat ${manualStatus}.`;
-      const displayMsg = `Presensi manual ${studentName} (${studentClass}) pada sesi ${targetSessName} berhasil disimpan dengan status ${manualStatus}.`;
-      setModalStudent(selectedStudent);
-      setModalRecord(res.record);
-      setModalMessage(displayMsg);
-      setModalIsError(false);
-      setShowNotificationModal(true);
+    if (res.success) {
+      const speechMsg = `${chosenStudent.name}, kelas ${chosenStudent.class_id}, Tercatat ${chosenStatus}.`;
+      setManualFeedback({
+        studentName: chosenStudent.name,
+        status: chosenStatus,
+        sessionName: targetSessName,
+        synced: Boolean(res.syncedFromExisting),
+      });
+      showToast(
+        `${res.syncedFromExisting ? 'Sinkron' : 'Tersimpan'}: ${chosenStudent.name} (${chosenStatus}) di sesi ${targetSessName}.`,
+        'success'
+      );
       speak(speechMsg);
 
-      // Reset
+      // Reset pilihan & langsung kembalikan fokus ke kolom pencarian nama siswa
       setSelectedStudent(null);
       setManualSearch('');
       setManualNotes('');
+      setManualStatus('Hadir');
+      setTimeout(() => {
+        manualSearchInputRef.current?.focus();
+      }, 15);
     } else {
       showToast(res.error || 'Gagal menyimpan presensi manual', 'error');
     }
@@ -224,6 +222,17 @@ export const AttendanceView: React.FC = () => {
     ? todayAttendanceAll.filter((a) => a.session_id === activeSession.id)
     : todayAttendanceAll;
   const scopedAttendance = counterScope === 'session' ? activeSessionAttendance : todayAttendanceAll;
+
+  const effectiveManualSessionId =
+    manualTargetSessionId || activeSession?.id || sessions.find((s) => s.is_active)?.id || sessions[0]?.id || '';
+  const manualSessionAttendanceMap = new Map<string, AttendanceRecord>();
+  todayAttendanceAll.forEach((a) => {
+    if (!effectiveManualSessionId || a.session_id === effectiveManualSessionId) {
+      if (!manualSessionAttendanceMap.has(a.student_id)) {
+        manualSessionAttendanceMap.set(a.student_id, a);
+      }
+    }
+  });
 
   const totalStudents = students.length;
   const hadirCount = scopedAttendance.filter((a) => a.status === 'Hadir').length;
@@ -514,15 +523,14 @@ export const AttendanceView: React.FC = () => {
             Pembaca kartu bekerja otomatis layaknya keyboard. Cukup tap kartu atau sorot barcode kartu ke alat scanner.
           </p>
 
-          {/* SINGLE AUTOMATIC INPUT FIELD (Bagian 4 Poin 60) */}
+          {/* SINGLE AUTOMATIC INPUT FIELD (Kursor bebas, tidak dikunci) */}
           <form onSubmit={handleScanSubmit} className="mt-6">
             <input
               ref={inputRef}
               type="text"
               value={scanInput}
               onChange={(e) => setScanInput(e.target.value)}
-              placeholder="Menunggu pembaca kartu RFID / Barcode scanner..."
-              disabled={isProcessing}
+              placeholder={isProcessing ? 'Memproses scan...' : 'Menunggu pembaca kartu RFID / Barcode scanner...'}
               className="w-full text-center px-4 py-3 rounded-md text-sm font-mono border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-inner focus:outline-none focus:ring-2 focus:ring-slate-900 dark:focus:ring-slate-400"
             />
           </form>
@@ -565,10 +573,12 @@ export const AttendanceView: React.FC = () => {
                         } else {
                           const isDup = res.isDuplicate || (res.error && res.error.toLowerCase().includes('sudah tercatat'));
                           const speechMsg = isDup
-                            ? `${res.student ? res.student.name : s.name}, kelas ${res.student ? res.student.class_id : s.class_id}, sudah melakukan presensi hari ini.`
+                            ? res.student && res.record
+                              ? `${res.student.name}, kelas ${res.student.class_id}, sudah tercatat ${res.record.status} (${res.record.method === 'manual' ? 'Manual' : 'Scan'}) pada sesi ini.`
+                              : `${res.student ? res.student.name : s.name}, kelas ${res.student ? res.student.class_id : s.class_id}, sudah melakukan presensi pada sesi ini.`
                             : res.error || 'Presensi gagal';
                           setModalStudent(res.student || s);
-                          setModalRecord(null);
+                          setModalRecord(res.record || null);
                           setModalMessage(res.error || 'Sudah presensi');
                           setModalIsError(true);
                           setShowNotificationModal(true);
@@ -590,7 +600,13 @@ export const AttendanceView: React.FC = () => {
         <div className="mt-6 flex flex-wrap items-center justify-center gap-2.5 sm:gap-3">
           <button
             type="button"
-            onClick={() => setShowManualModal(true)}
+            onClick={() => {
+              setManualFeedback(null);
+              if (!manualTargetSessionId && activeSession?.id) {
+                setManualTargetSessionId(activeSession.id);
+              }
+              setShowManualModal(true);
+            }}
             className="flex items-center gap-2 px-4 py-2 rounded text-xs font-semibold bg-slate-900 text-white hover:bg-slate-800 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200 transition-colors shadow-sm"
           >
             <Plus className="w-3.5 h-3.5" />
@@ -720,41 +736,209 @@ export const AttendanceView: React.FC = () => {
                 </div>
                 <div>
                   <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-                    Presensi Manual Siswa
+                    Presensi Manual Siswa (Sinkron Otomatis Sesi)
                   </h3>
                   <p className="text-[11px] text-slate-500">
-                    Pilih siswa dan tentukan status kehadiran secara langsung
+                    Cari siswa, pilih status kehadiran, lalu simpan — langsung siap mencari siswa berikutnya
                   </p>
                 </div>
               </div>
               <button
                 type="button"
-                onClick={() => setShowManualModal(false)}
+                onClick={() => {
+                  setShowManualModal(false);
+                  setManualFeedback(null);
+                }}
                 className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <form onSubmit={handleManualSubmit} className="mt-4 space-y-4 text-xs overflow-y-auto pr-0.5">
-              {/* Selected Student Card with Dropdown Status Presensi on the Right */}
-              {selectedStudent ? (
+            <form onSubmit={handleManualSubmit} className="mt-3 space-y-3.5 text-xs overflow-y-auto pr-0.5">
+              {/* Target Session Selector (Berdiri Sendiri Per Sesi) */}
+              <div>
+                <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1 text-xs">
+                  Sesi Presensi Target (Data Terpisah Per Sesi):
+                </label>
+                <select
+                  value={effectiveManualSessionId}
+                  onChange={(e) => {
+                    const nextSessId = e.target.value;
+                    setManualTargetSessionId(nextSessId);
+                    if (selectedStudent) {
+                      const existingRec = todayAttendanceAll.find(
+                        (a) => a.student_id === selectedStudent.nis && a.session_id === nextSessId
+                      );
+                      setManualStatus(existingRec?.status || 'Hadir');
+                      setManualNotes(existingRec?.notes || '');
+                    }
+                  }}
+                  className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-semibold"
+                >
+                  {sessions.filter((s) => s.is_active).map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name} ({s.start_time} - {s.end_time}){activeSession?.id === s.id ? ' — [Sesi Aktif Otomatis]' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Persistent Active Search Bar — ALWAYS visible above selected student & list */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="block font-bold text-slate-700 dark:text-slate-300 text-xs">
+                    Cari Nama Siswa / NIS / Kelas:
+                  </label>
+                  <span className="text-[10px] text-slate-400">
+                    {filteredStudents.length} siswa ditampilkan
+                  </span>
+                </div>
+
+                <div className="relative">
+                  <input
+                    ref={manualSearchInputRef}
+                    type="text"
+                    autoFocus
+                    value={manualSearch}
+                    onChange={(e) => setManualSearch(e.target.value)}
+                    placeholder="Ketik nama siswa, NIS, atau kelas..."
+                    className="w-full pl-9 pr-8 py-2.5 text-xs rounded-lg border border-emerald-400 dark:border-emerald-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-emerald-500 transition-all font-medium"
+                  />
+                  <Search className="w-4 h-4 text-emerald-500 absolute left-3 top-3" />
+                  {manualSearch && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setManualSearch('');
+                        manualSearchInputRef.current?.focus();
+                      }}
+                      className="p-1 rounded-full text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 absolute right-2.5 top-2.5"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Inline last-saved banner */}
+                {manualFeedback && (
+                  <div className="px-3 py-2 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200 flex items-center justify-between gap-2 text-[11px]">
+                    <span className="flex items-center gap-1.5 font-medium">
+                      <CheckCircle className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                      <span>
+                        <strong>{manualFeedback.studentName}</strong> ({manualFeedback.status}) di sesi{' '}
+                        <strong>{manualFeedback.sessionName}</strong>{' '}
+                        {manualFeedback.synced ? 'diperbarui & disinkronkan' : 'tersimpan'}.
+                      </span>
+                    </span>
+                    <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-semibold shrink-0">
+                      Siap input berikutnya
+                    </span>
+                  </div>
+                )}
+
+                {/* Student List (always visible if no student selected OR user is typing a new search) */}
+                {(!selectedStudent || manualSearch.trim().length > 0) && (
+                  <div className="border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 max-h-48 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-700/60 shadow-inner">
+                    {filteredStudents.length > 0 ? (
+                      filteredStudents.map((s) => {
+                        const existingAtt = manualSessionAttendanceMap.get(s.nis);
+                        const isChosen = selectedStudent?.nis === s.nis;
+                        return (
+                          <div
+                            key={s.nis}
+                            onClick={() => {
+                              setSelectedStudent(s);
+                              setManualSearch('');
+                              setManualStatus(existingAtt?.status || 'Hadir');
+                              setManualNotes(existingAtt?.notes || '');
+                            }}
+                            className={`p-2.5 hover:bg-emerald-50/70 dark:hover:bg-slate-700/80 cursor-pointer flex items-center justify-between gap-2 transition-colors group ${
+                              isChosen ? 'bg-emerald-50 dark:bg-emerald-950/30' : ''
+                            }`}
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 flex items-center justify-center font-bold text-xs shrink-0 group-hover:bg-emerald-600 group-hover:text-white transition-colors">
+                                {s.name.slice(0, 2).toUpperCase()}
+                              </div>
+                              <div className="min-w-0">
+                                <span className="font-semibold text-slate-900 dark:text-white text-xs block truncate group-hover:text-emerald-700 dark:group-hover:text-emerald-400">
+                                  {s.name}
+                                </span>
+                                <span className="text-[10px] text-slate-400 block">
+                                  Kelas: <strong className="font-semibold text-slate-600 dark:text-slate-300">{s.class_id}</strong> • NIS: <span className="font-mono">{s.nis}</span>
+                                </span>
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              {existingAtt ? (
+                                <span
+                                  className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                    existingAtt.status === 'Hadir'
+                                      ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                                      : existingAtt.status === 'Terlambat'
+                                      ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+                                      : existingAtt.status === 'Izin'
+                                      ? 'bg-blue-100 text-blue-800 dark:bg-blue-950/60 dark:text-blue-300'
+                                      : existingAtt.status === 'Sakit'
+                                      ? 'bg-purple-100 text-purple-800 dark:bg-purple-950/60 dark:text-purple-300'
+                                      : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300'
+                                  }`}
+                                >
+                                  {existingAtt.status} ({existingAtt.method === 'manual' ? 'Manual' : 'Scan'})
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400">
+                                  Belum
+                                </span>
+                              )}
+                              <button
+                                type="button"
+                                className="px-2.5 py-1 rounded-md text-[10px] font-bold bg-slate-900 dark:bg-slate-600 text-white group-hover:bg-emerald-600 transition-colors"
+                              >
+                                Pilih
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <div className="p-4 text-center text-slate-400 text-xs">
+                        Tidak ada siswa yang cocok dengan "{manualSearch}".
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Selected Student Card BELOW active search bar */}
+              {selectedStudent && (
                 <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/80 border border-emerald-300 dark:border-emerald-800/60 shadow-xs space-y-2.5">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2">
                     <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700 dark:text-emerald-400 flex items-center gap-1">
                       <CheckCircle className="w-3.5 h-3.5 text-emerald-600" />
                       Siswa Terpilih
+                      {(() => {
+                        const curAtt = manualSessionAttendanceMap.get(selectedStudent.nis);
+                        return curAtt ? (
+                          <span className="ml-1.5 px-1.5 py-0.5 rounded bg-sky-100 dark:bg-sky-900/50 text-sky-700 dark:text-sky-300 normal-case font-semibold">
+                            Saat ini: {curAtt.status} ({curAtt.method === 'manual' ? 'Manual' : 'Scan'})
+                          </span>
+                        ) : null;
+                      })()}
                     </span>
                     <button
                       type="button"
                       onClick={() => {
                         setSelectedStudent(null);
                         setManualSearch('');
+                        setTimeout(() => manualSearchInputRef.current?.focus(), 10);
                       }}
                       className="text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1"
                     >
-                      <Search className="w-3 h-3" />
-                      <span>Ganti / Cari Siswa Lain</span>
+                      <X className="w-3 h-3" />
+                      <span>Batal Pilih</span>
                     </button>
                   </div>
 
@@ -807,98 +991,7 @@ export const AttendanceView: React.FC = () => {
                     </div>
                   </div>
                 </div>
-              ) : (
-                /* Student Search & Immediate Student List */
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <label className="block font-bold text-slate-700 dark:text-slate-300 text-xs">
-                      Pencarian Siswa (Ketik Nama / NIS / Kelas):
-                    </label>
-                    <span className="text-[10px] text-slate-400">
-                      {filteredStudents.length} siswa tersedia
-                    </span>
-                  </div>
-
-                  <div className="relative">
-                    <input
-                      type="text"
-                      autoFocus
-                      value={manualSearch}
-                      onChange={(e) => setManualSearch(e.target.value)}
-                      placeholder="Ketik nama siswa, NIS, atau kelas..."
-                      className="w-full pl-9 pr-8 py-2.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-emerald-500 transition-all font-medium"
-                    />
-                    <Search className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
-                    {manualSearch && (
-                      <button
-                        type="button"
-                        onClick={() => setManualSearch('')}
-                        className="p-1 rounded-full text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 absolute right-2.5 top-2.5"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-
-                  {/* Immediate List of Students (Always shown immediately) */}
-                  <div className="border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 max-h-56 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-700/60 shadow-inner">
-                    {filteredStudents.length > 0 ? (
-                      filteredStudents.map((s) => (
-                        <div
-                          key={s.nis}
-                          onClick={() => {
-                            setSelectedStudent(s);
-                            setManualSearch('');
-                          }}
-                          className="p-2.5 hover:bg-emerald-50/70 dark:hover:bg-slate-700/80 cursor-pointer flex items-center justify-between transition-colors group"
-                        >
-                          <div className="flex items-center gap-2.5 min-w-0">
-                            <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 flex items-center justify-center font-bold text-xs shrink-0 group-hover:bg-emerald-600 group-hover:text-white transition-colors">
-                              {s.name.slice(0, 2).toUpperCase()}
-                            </div>
-                            <div className="min-w-0">
-                              <span className="font-semibold text-slate-900 dark:text-white text-xs block truncate group-hover:text-emerald-700 dark:group-hover:text-emerald-400">
-                                {s.name}
-                              </span>
-                              <span className="text-[10px] text-slate-400 block">
-                                Kelas: <strong className="font-semibold text-slate-600 dark:text-slate-300">{s.class_id}</strong> • NIS: <span className="font-mono">{s.nis}</span>
-                              </span>
-                            </div>
-                          </div>
-                          <button
-                            type="button"
-                            className="px-2.5 py-1 rounded-md text-[10px] font-bold bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 group-hover:bg-emerald-600 group-hover:text-white transition-colors shrink-0"
-                          >
-                            Pilih
-                          </button>
-                        </div>
-                      ))
-                    ) : (
-                      <div className="p-4 text-center text-slate-400 text-xs">
-                        Tidak ada siswa yang cocok dengan "{manualSearch}".
-                      </div>
-                    )}
-                  </div>
-                </div>
               )}
-
-              {/* Target Session Selector inside Manual Modal */}
-              <div>
-                <label className="block font-medium text-slate-700 dark:text-slate-300 mb-1 text-xs">
-                  Sesi Presensi Target:
-                </label>
-                <select
-                  value={manualTargetSessionId || activeSession?.id || ''}
-                  onChange={(e) => setManualTargetSessionId(e.target.value)}
-                  className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
-                >
-                  {sessions.filter((s) => s.is_active).map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name} ({s.start_time} - {s.end_time}){activeSession?.id === s.id ? ' — [Sesi Aktif Otomatis]' : ''}
-                    </option>
-                  ))}
-                </select>
-              </div>
 
               {/* Notes */}
               <div>
@@ -917,15 +1010,18 @@ export const AttendanceView: React.FC = () => {
               {/* Footer Buttons */}
               <div className="flex items-center justify-between pt-2 border-t border-slate-100 dark:border-slate-800 shrink-0">
                 <span className="text-[11px] text-slate-400">
-                  {selectedStudent ? 'Siswa terpilih siap disimpan' : 'Pilih siswa terlebih dahulu'}
+                  {selectedStudent ? 'Simpan & otomatis kembali ke pencarian' : 'Pilih siswa dari daftar di atas'}
                 </span>
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setShowManualModal(false)}
+                    onClick={() => {
+                      setShowManualModal(false);
+                      setManualFeedback(null);
+                    }}
                     className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-semibold"
                   >
-                    Batal
+                    Tutup
                   </button>
                   <button
                     type="submit"
@@ -933,7 +1029,7 @@ export const AttendanceView: React.FC = () => {
                     className="px-4 py-1.5 rounded-lg font-bold text-xs text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-xs transition-colors flex items-center gap-1.5"
                   >
                     <CheckCircle className="w-3.5 h-3.5" />
-                    <span>Simpan Presensi</span>
+                    <span>Simpan &amp; Cari Berikutnya</span>
                   </button>
                 </div>
               </div>

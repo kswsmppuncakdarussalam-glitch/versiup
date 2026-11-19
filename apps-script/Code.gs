@@ -103,6 +103,36 @@ SHEET_HEADERS[SHEET_TABS.LOG] = [
   'reason', 'status', 'diubah_pada'
 ];
 
+var SESSION_ATTENDANCE_PREFIX_ = 'Presensi - ';
+
+function isSessionAttendanceTab_(tabName) {
+  return Boolean(tabName && String(tabName).indexOf(SESSION_ATTENDANCE_PREFIX_) === 0);
+}
+
+function getHeadersForTab_(tabName) {
+  if (SHEET_HEADERS[tabName]) return SHEET_HEADERS[tabName];
+  if (isSessionAttendanceTab_(tabName)) return SHEET_HEADERS[SHEET_TABS.PRESENSI];
+  return null;
+}
+
+function getSessionAttendanceTabName_(sess, allSessions) {
+  if (!sess) return SHEET_TABS.PRESENSI;
+  var rawName = String(sess.name || sess.id || 'Sesi').replace(/[\[\]\*\?\/\\:]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!rawName) rawName = String(sess.id || 'Sesi');
+  var list = Array.isArray(allSessions) ? allSessions : [];
+  var dupNameCount = 0;
+  for (var i = 0; i < list.length; i++) {
+    var sName = String((list[i] && list[i].name) || '').replace(/[\[\]\*\?\/\\:]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (sName && sName.toLowerCase() === rawName.toLowerCase()) {
+      dupNameCount++;
+    }
+  }
+  var suffix = (dupNameCount > 1 && sess.id) ? (' (' + String(sess.id).slice(-6) + ')') : '';
+  var maxBaseLen = Math.max(10, 95 - SESSION_ATTENDANCE_PREFIX_.length - suffix.length);
+  if (rawName.length > maxBaseLen) rawName = rawName.substring(0, maxBaseLen).trim();
+  return SESSION_ATTENDANCE_PREFIX_ + rawName + suffix;
+}
+
 // ============================================================================
 // ENTRY POINTS (Web App + Setup + Scheduler Trigger)
 // ============================================================================
@@ -238,6 +268,7 @@ var EXEC_PROPS_CACHE_ = null;
 var EXEC_SS_CACHE_ = null;
 var EXEC_TAB_CACHE_ = {};
 var EXEC_SCHEMA_READY_ = false;
+var EXEC_SYNC_META_ = null;
 var TAB_CACHE_PREFIX_ = 'dkb_tc_v1_';
 var SCHEMA_READY_PROP_ = 'dkb_schema_ready_v2';
 
@@ -246,6 +277,7 @@ function resetExecCaches_() {
   EXEC_SS_CACHE_ = null;
   EXEC_TAB_CACHE_ = {};
   EXEC_SCHEMA_READY_ = false;
+  EXEC_SYNC_META_ = null;
 }
 
 function getTabCacheTtl_(tabName) {
@@ -471,40 +503,174 @@ function getJwtSecret_() {
 }
 
 var DATA_REV_KEY = 'dkb_data_rev';
+var SYNC_RING_KEY = 'dkb_sync_ring_v1';
+var FULL_SNAP_CACHE_PREFIX_ = 'dkb_fsnap_v1_';
+var DRIVE_OK_CACHE_PREFIX_ = 'dkb_drv_ok_';
+var SENDER_EMAIL_CACHE_KEY_ = 'dkb_sender_em';
+var SYNC_RING_MAX_EVENTS_ = 40;
 
-function bumpDataRevision_() {
+function invalidateFullSnapshotCache_() {
+  try {
+    var keys = [FULL_SNAP_CACHE_PREFIX_ + 'm'];
+    for (var i = 0; i < 8; i++) {
+      keys.push(FULL_SNAP_CACHE_PREFIX_ + i);
+    }
+    CacheService.getScriptCache().removeAll(keys);
+  } catch (e) {}
+}
+
+function loadFullSnapshotCache_(expectedRev) {
+  try {
+    if (!expectedRev) return null;
+    var cache = CacheService.getScriptCache();
+    var metaRaw = cache.get(FULL_SNAP_CACHE_PREFIX_ + 'm');
+    if (!metaRaw) return null;
+    var meta = JSON.parse(metaRaw);
+    if (!meta || meta.rev !== expectedRev || !meta.count || meta.count < 1 || meta.count > 8) {
+      return null;
+    }
+    if (meta.count === 1) {
+      var single = cache.get(FULL_SNAP_CACHE_PREFIX_ + '0');
+      return single ? JSON.parse(single) : null;
+    }
+    var keys = [];
+    for (var i = 0; i < meta.count; i++) {
+      keys.push(FULL_SNAP_CACHE_PREFIX_ + i);
+    }
+    var map = cache.getAll(keys);
+    var joined = '';
+    for (var j = 0; j < meta.count; j++) {
+      var part = map[keys[j]];
+      if (part === undefined || part === null) return null;
+      joined += part;
+    }
+    return JSON.parse(joined);
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveFullSnapshotCache_(rev, data) {
+  try {
+    if (!rev || !data) return;
+    var json = JSON.stringify(data);
+    var chunkSize = 85000;
+    var count = Math.ceil(json.length / chunkSize) || 1;
+    if (count > 8) {
+      invalidateFullSnapshotCache_();
+      return;
+    }
+    var payload = {};
+    payload[FULL_SNAP_CACHE_PREFIX_ + 'm'] = JSON.stringify({ rev: rev, count: count });
+    for (var i = 0; i < count; i++) {
+      payload[FULL_SNAP_CACHE_PREFIX_ + i] = json.substring(i * chunkSize, (i + 1) * chunkSize);
+    }
+    CacheService.getScriptCache().putAll(payload, 180);
+  } catch (e) {}
+}
+
+function getSyncMeta_() {
+  if (EXEC_SYNC_META_) return EXEC_SYNC_META_;
+  var cache = CacheService.getScriptCache();
+  try {
+    var ringRaw = cache.get(SYNC_RING_KEY);
+    if (ringRaw) {
+      var parsed = JSON.parse(ringRaw);
+      if (parsed && parsed.rev && parsed.seq) {
+        if (!Array.isArray(parsed.events)) parsed.events = [];
+        EXEC_SYNC_META_ = parsed;
+        return parsed;
+      }
+    }
+  } catch (e) {}
+
+  var baseRev = '';
+  try {
+    var cRev = cache.get(DATA_REV_KEY);
+    if (cRev && String(cRev).trim()) baseRev = String(cRev).trim();
+  } catch (e2) {}
+  if (!baseRev) {
+    baseRev = getProp_(DATA_REV_KEY, '');
+  }
+  if (!baseRev) {
+    baseRev = String(Date.now()) + '_' + Math.floor(Math.random() * 1000000);
+    try {
+      PropertiesService.getScriptProperties().setProperty(DATA_REV_KEY, baseRev);
+      if (EXEC_PROPS_CACHE_) EXEC_PROPS_CACHE_[DATA_REV_KEY] = baseRev;
+    } catch (e3) {}
+  }
+
+  var seeded = { seq: 1, rev: baseRev, events: [] };
+  EXEC_SYNC_META_ = seeded;
+  try {
+    var putMap = {};
+    putMap[SYNC_RING_KEY] = JSON.stringify(seeded);
+    putMap[DATA_REV_KEY] = baseRev;
+    cache.putAll(putMap, 21600);
+  } catch (e4) {}
+  return seeded;
+}
+
+function bumpDataRevision_(eventsOpt) {
   try {
     if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.flush) {
       SpreadsheetApp.flush();
     }
   } catch (ef) {}
+
+  var meta = getSyncMeta_();
+  var nowIso = new Date().toISOString();
   var nextRev = String(Date.now()) + '_' + Math.floor(Math.random() * 1000000);
+  var rawEvents = (Array.isArray(eventsOpt) && eventsOpt.length > 0)
+    ? eventsOpt
+    : [{ op: 'full_reload' }];
+
+  var events = Array.isArray(meta.events) ? meta.events.slice() : [];
+  var seq = Number(meta.seq || 0);
+  var hasFullReload = false;
+
+  for (var i = 0; i < rawEvents.length; i++) {
+    var src = rawEvents[i] || {};
+    seq += 1;
+    var ev = {
+      seq: seq,
+      op: src.op || 'full_reload',
+      at: nowIso,
+    };
+    if (src.id !== undefined) ev.id = src.id;
+    if (src.record !== undefined) ev.record = src.record;
+    if (ev.op === 'full_reload') hasFullReload = true;
+    events.push(ev);
+  }
+
+  if (events.length > SYNC_RING_MAX_EVENTS_) {
+    events = events.slice(events.length - SYNC_RING_MAX_EVENTS_);
+  }
+
+  var nextMeta = { seq: seq, rev: nextRev, events: events };
+  EXEC_SYNC_META_ = nextMeta;
+
   try {
-    CacheService.getScriptCache().put(DATA_REV_KEY, nextRev, 21600);
+    var putMap = {};
+    putMap[SYNC_RING_KEY] = JSON.stringify(nextMeta);
+    putMap[DATA_REV_KEY] = nextRev;
+    CacheService.getScriptCache().putAll(putMap, 21600);
   } catch (e) {}
-  try {
-    PropertiesService.getScriptProperties().setProperty(DATA_REV_KEY, nextRev);
-    if (EXEC_PROPS_CACHE_) EXEC_PROPS_CACHE_[DATA_REV_KEY] = nextRev;
-  } catch (e2) {}
-  return nextRev;
+
+  invalidateFullSnapshotCache_();
+
+  if (hasFullReload || (seq % 10 === 0)) {
+    try {
+      PropertiesService.getScriptProperties().setProperty(DATA_REV_KEY, nextRev);
+      if (EXEC_PROPS_CACHE_) EXEC_PROPS_CACHE_[DATA_REV_KEY] = nextRev;
+    } catch (e2) {}
+  }
+
+  return { rev: nextRev, seq: seq };
 }
 
 function getDataRevision_() {
-  try {
-    var cVal = CacheService.getScriptCache().get(DATA_REV_KEY);
-    if (cVal && String(cVal).trim()) return String(cVal).trim();
-  } catch (e) {}
-  try {
-    var pVal = getProp_(DATA_REV_KEY, '');
-    if (pVal && String(pVal).trim()) {
-      var cleanP = String(pVal).trim();
-      try {
-        CacheService.getScriptCache().put(DATA_REV_KEY, cleanP, 21600);
-      } catch (ec) {}
-      return cleanP;
-    }
-  } catch (e2) {}
-  return bumpDataRevision_();
+  return getSyncMeta_().rev;
 }
 
 function getSpreadsheet_() {
@@ -524,6 +690,45 @@ function getActiveSenderEmail_() {
   } catch (e) {
     return '';
   }
+}
+
+function checkDriveFolderFast_(folderId, bypassCache) {
+  if (!folderId) return false;
+  var cacheKey = DRIVE_OK_CACHE_PREFIX_ + folderId;
+  if (!bypassCache) {
+    try {
+      var cached = CacheService.getScriptCache().get(cacheKey);
+      if (cached === '1') return true;
+      if (cached === '0') return false;
+    } catch (e) {}
+  }
+  var ok = false;
+  try {
+    var f = DriveApp.getFolderById(folderId);
+    ok = Boolean(f && (!f.isTrashed || !f.isTrashed()));
+  } catch (eDrv) {
+    ok = false;
+  }
+  try {
+    CacheService.getScriptCache().put(cacheKey, ok ? '1' : '0', 600);
+  } catch (ec) {}
+  return ok;
+}
+
+function getActiveSenderEmailFast_(bypassCache) {
+  if (!bypassCache) {
+    try {
+      var cached = CacheService.getScriptCache().get(SENDER_EMAIL_CACHE_KEY_);
+      if (cached !== null && cached !== undefined) {
+        return String(cached).indexOf('v:') === 0 ? String(cached).substring(2) : String(cached);
+      }
+    } catch (e) {}
+  }
+  var em = getActiveSenderEmail_();
+  try {
+    CacheService.getScriptCache().put(SENDER_EMAIL_CACHE_KEY_, 'v:' + em, 600);
+  } catch (ec) {}
+  return em;
 }
 
 function parseBool_(v, defVal) {
@@ -1053,6 +1258,9 @@ function ensureInitializedOnce_(ss, forceCheck) {
   }
   ensureSheetsAndHeaders_(ss);
   ensureSeedData_(ss);
+  try {
+    ensureSessionAttendanceSheets_(ss);
+  } catch (es) {}
   EXEC_SCHEMA_READY_ = true;
   if (ssId) {
     try { CacheService.getScriptCache().put('dkb_schema_v2_' + ssId, '1', 21600); } catch (e2) {}
@@ -1061,6 +1269,66 @@ function ensureInitializedOnce_(ss, forceCheck) {
       if (EXEC_PROPS_CACHE_) EXEC_PROPS_CACHE_[SCHEMA_READY_PROP_] = ssId;
     } catch (e3) {}
   }
+}
+
+function ensureSheetTabWithHeaders_(ss, tabName, headers) {
+  var sheet = ss.getSheetByName(tabName);
+  if (!sheet) {
+    sheet = ss.insertSheet(tabName);
+    sheet.setFrozenRows(1);
+  }
+  var lastCol = sheet.getLastColumn();
+  var needsHeader = lastCol < headers.length || sheet.getLastRow() === 0;
+  if (!needsHeader) {
+    var existingRow = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+    for (var c = 0; c < headers.length; c++) {
+      if (String(existingRow[c] || '').trim() !== headers[c]) {
+        needsHeader = true;
+        break;
+      }
+    }
+  }
+  if (needsHeader) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function getSessionsForTabs_(ss, sessionsListOpt) {
+  if (Array.isArray(sessionsListOpt)) return sessionsListOpt;
+  return activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.SESI_PRESENSI)).map(function (r) {
+    return {
+      id: r.id,
+      name: r.name || r.id,
+      is_active: parseBool_(r.is_active, true),
+    };
+  });
+}
+
+function getAttendanceTabMap_(ss, sessionsListOpt) {
+  var sessionsList = getSessionsForTabs_(ss, sessionsListOpt);
+  var map = {};
+  for (var i = 0; i < sessionsList.length; i++) {
+    var sess = sessionsList[i];
+    if (!sess || !sess.id) continue;
+    map[sess.id] = getSessionAttendanceTabName_(sess, sessionsList);
+  }
+  return map;
+}
+
+function ensureSessionAttendanceSheets_(ss, sessionsListOpt) {
+  var sessionsList = getSessionsForTabs_(ss, sessionsListOpt);
+  var headers = SHEET_HEADERS[SHEET_TABS.PRESENSI];
+  var map = {};
+  for (var i = 0; i < sessionsList.length; i++) {
+    var sess = sessionsList[i];
+    if (!sess || !sess.id) continue;
+    var tName = getSessionAttendanceTabName_(sess, sessionsList);
+    ensureSheetTabWithHeaders_(ss, tName, headers);
+    map[sess.id] = tName;
+  }
+  return map;
 }
 
 function ensureSheetsAndHeaders_(ss) {
@@ -1074,26 +1342,7 @@ function ensureSheetsAndHeaders_(ss) {
   for (var i = 0; i < allTabs.length; i++) {
     var tabName = allTabs[i];
     var headers = SHEET_HEADERS[tabName];
-    var sheet = ss.getSheetByName(tabName);
-    if (!sheet) {
-      sheet = ss.insertSheet(tabName);
-      sheet.setFrozenRows(1);
-    }
-    var lastCol = sheet.getLastColumn();
-    var needsHeader = lastCol < headers.length || sheet.getLastRow() === 0;
-    if (!needsHeader) {
-      var existingRow = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
-      for (var c = 0; c < headers.length; c++) {
-        if (String(existingRow[c] || '').trim() !== headers[c]) {
-          needsHeader = true;
-          break;
-        }
-      }
-    }
-    if (needsHeader) {
-      sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-      sheet.setFrozenRows(1);
-    }
+    ensureSheetTabWithHeaders_(ss, tabName, headers);
   }
 }
 
@@ -1109,12 +1358,18 @@ function readTabWithRowNumbers_(ss, tabName, bypassScriptCache) {
     }
   }
 
-  var headers = SHEET_HEADERS[tabName];
+  var headers = getHeadersForTab_(tabName);
+  if (!headers) return [];
   var sheet = ss.getSheetByName(tabName);
   if (!sheet) {
-    ensureSheetsAndHeaders_(ss);
-    sheet = ss.getSheetByName(tabName);
+    if (SHEET_HEADERS[tabName]) {
+      ensureSheetsAndHeaders_(ss);
+      sheet = ss.getSheetByName(tabName);
+    } else if (isSessionAttendanceTab_(tabName)) {
+      sheet = ensureSheetTabWithHeaders_(ss, tabName, headers);
+    }
   }
+  if (!sheet) return [];
   var lastRow = sheet.getLastRow();
   if (lastRow <= 1) {
     EXEC_TAB_CACHE_[tabName] = [];
@@ -1139,8 +1394,67 @@ function readTabWithRowNumbers_(ss, tabName, bypassScriptCache) {
   return results;
 }
 
+function readAllAttendanceRowEntries_(ss, bypassScriptCache, sessionsListOpt) {
+  var sessionsList = getSessionsForTabs_(ss, sessionsListOpt);
+  var tabMap = getAttendanceTabMap_(ss, sessionsList);
+  var seenTabs = {};
+  var tabList = [];
+  for (var sid in tabMap) {
+    if (Object.prototype.hasOwnProperty.call(tabMap, sid)) {
+      var tn = tabMap[sid];
+      if (!seenTabs[tn] && ss.getSheetByName(tn)) {
+        seenTabs[tn] = true;
+        tabList.push(tn);
+      }
+    }
+  }
+  try {
+    var allSheets = ss.getSheets();
+    for (var si = 0; si < allSheets.length; si++) {
+      var sName = allSheets[si].getName();
+      if (isSessionAttendanceTab_(sName) && !seenTabs[sName]) {
+        seenTabs[sName] = true;
+        tabList.push(sName);
+      }
+    }
+  } catch (es) {}
+  if (!seenTabs[SHEET_TABS.PRESENSI] && ss.getSheetByName(SHEET_TABS.PRESENSI)) {
+    seenTabs[SHEET_TABS.PRESENSI] = true;
+    tabList.push(SHEET_TABS.PRESENSI);
+  }
+
+  var entries = [];
+  var seenIds = {};
+  for (var ti = 0; ti < tabList.length; ti++) {
+    var tName = tabList[ti];
+    var rows = readTabWithRowNumbers_(ss, tName, bypassScriptCache);
+    for (var ri = 0; ri < rows.length; ri++) {
+      var entry = rows[ri];
+      if (entry && entry.data && entry.data.id && !seenIds[entry.data.id]) {
+        seenIds[entry.data.id] = true;
+        entries.push({
+          tabName: tName,
+          rowNumber: entry.rowNumber,
+          data: entry.data,
+        });
+      }
+    }
+  }
+  return entries;
+}
+
+function findAttendanceTabForId_(ss, id, sessionsListOpt) {
+  var entries = readAllAttendanceRowEntries_(ss, false, sessionsListOpt);
+  for (var i = 0; i < entries.length; i++) {
+    if (entries[i].data.id === id) {
+      return entries[i].tabName;
+    }
+  }
+  return null;
+}
+
 function objToRowArray_(tabName, obj) {
-  var headers = SHEET_HEADERS[tabName];
+  var headers = getHeadersForTab_(tabName);
   var arr = [];
   for (var i = 0; i < headers.length; i++) {
     var h = headers[i];
@@ -1157,7 +1471,7 @@ function objToRowArray_(tabName, obj) {
 }
 
 function rowToStringData_(tabName, obj) {
-  var headers = SHEET_HEADERS[tabName];
+  var headers = getHeadersForTab_(tabName);
   var out = {};
   for (var i = 0; i < headers.length; i++) {
     var h = headers[i];
@@ -1175,11 +1489,16 @@ function rowToStringData_(tabName, obj) {
 
 function appendRows_(ss, tabName, rowObjects, opts) {
   if (!rowObjects || rowObjects.length === 0) return;
-  var headers = SHEET_HEADERS[tabName];
+  var headers = getHeadersForTab_(tabName);
+  if (!headers) return;
   var sheet = ss.getSheetByName(tabName);
   if (!sheet) {
-    ensureSheetsAndHeaders_(ss);
-    sheet = ss.getSheetByName(tabName);
+    if (SHEET_HEADERS[tabName]) {
+      ensureSheetsAndHeaders_(ss);
+      sheet = ss.getSheetByName(tabName);
+    } else if (isSessionAttendanceTab_(tabName)) {
+      sheet = ensureSheetTabWithHeaders_(ss, tabName, headers);
+    }
   }
   var matrix = [];
   for (var i = 0; i < rowObjects.length; i++) {
@@ -1233,9 +1552,9 @@ function updateRowPartial_(ss, opts) {
   var skipLog = Boolean(opts.skipLog);
   var skipBump = Boolean(opts.skipBump);
 
-  var headers = SHEET_HEADERS[tabName];
+  var headers = getHeadersForTab_(tabName);
   var sheet = ss.getSheetByName(tabName);
-  if (!sheet) return { updated: false };
+  if (!headers || !sheet) return { updated: false };
 
   var rows = readTabWithRowNumbers_(ss, tabName);
   var match = null;
@@ -1353,9 +1672,9 @@ function softDeleteRow_(ss, opts) {
   var skipBump = Boolean(opts.skipBump);
   var skipLog = Boolean(opts.skipLog);
 
-  var headers = SHEET_HEADERS[tabName];
+  var headers = getHeadersForTab_(tabName);
   var sheet = ss.getSheetByName(tabName);
-  if (!sheet) return false;
+  if (!headers || !sheet) return false;
 
   var rows = readTabWithRowNumbers_(ss, tabName);
   var match = null;
@@ -1406,9 +1725,9 @@ function softDeleteRowsBatch_(ss, opts) {
   var actorName = opts.actorName || 'Admin';
   var reason = opts.reason || 'Hapus massal';
 
-  var headers = SHEET_HEADERS[tabName];
+  var headers = getHeadersForTab_(tabName);
   var sheet = ss.getSheetByName(tabName);
-  if (!sheet) return 0;
+  if (!headers || !sheet) return 0;
 
   var rows = readTabWithRowNumbers_(ss, tabName);
   var nowIso = new Date().toISOString();
@@ -1659,6 +1978,188 @@ function getSettingsFast_(ss) {
   return { settings: settings, notification_settings: notifSettings };
 }
 
+function mapStudentRow_(r, nowIso) {
+  return {
+    nis: r.nis || r.id,
+    nisn: r.nisn || '',
+    name: r.name || '',
+    class_id: r.class_id || '',
+    gender: r.gender === 'P' ? 'P' : 'L',
+    rfid_uid: r.rfid_uid || '',
+    card_code: r.card_code || r.rfid_uid || '',
+    photo_url: r.photo_url || '',
+    parent_name: r.parent_name || '',
+    parent_email: r.parent_email || '',
+    created_at: r.created_at || nowIso,
+    updated_at: r.updated_at || r.diubah_pada || nowIso,
+    diubah_pada: r.diubah_pada || r.updated_at || nowIso,
+  };
+}
+
+function mapSessionRow_(r, nowIso) {
+  return {
+    id: r.id,
+    name: r.name || r.id,
+    start_time: r.start_time || '06:00',
+    on_time_limit: r.on_time_limit || '07:00',
+    end_time: r.end_time || '08:00',
+    active_days: parseJsonArray_(r.active_days, [1, 2, 3, 4, 5, 6]),
+    late_tolerance_minutes: parseNum_(r.late_tolerance_minutes, 0),
+    is_active: parseBool_(r.is_active, true),
+    is_override: parseBool_(r.is_override, false),
+    created_at: r.created_at || nowIso,
+    updated_at: r.updated_at || r.diubah_pada || nowIso,
+    diubah_pada: r.diubah_pada || r.updated_at || nowIso,
+  };
+}
+
+function mapAttendanceRow_(r, nowIso) {
+  return {
+    id: r.id,
+    student_id: r.student_id,
+    session_id: r.session_id,
+    date: r.date,
+    timestamp: r.timestamp || r.created_at || nowIso,
+    status: r.status_presensi || r.status || 'Hadir',
+    late_minutes: parseNum_(r.late_minutes, 0),
+    method: r.method || 'barcode',
+    device_id: r.device_id || 'kiosk_main',
+    photo_id: r.photo_id || '',
+    notes: r.notes || '',
+    audited_by: r.audited_by || '',
+    audit_reason: r.audit_reason || '',
+    version: parseNum_(r.version, 1),
+    created_at: r.created_at || nowIso,
+    updated_at: r.updated_at || r.diubah_pada || nowIso,
+    diubah_pada: r.diubah_pada || r.updated_at || nowIso,
+  };
+}
+
+function mapOutOfClassRow_(r, nowIso) {
+  return {
+    id: r.id,
+    student_id: r.student_id,
+    class_id: r.class_id,
+    type: r.type || 'BAK',
+    duration_minutes: parseNum_(r.duration_minutes, 5),
+    started_at: r.started_at || nowIso,
+    due_at: r.due_at || nowIso,
+    returned_at: r.returned_at || undefined,
+    actual_minutes: r.actual_minutes ? parseNum_(r.actual_minutes, 0) : undefined,
+    late_return_minutes: parseNum_(r.late_return_minutes, 0),
+    return_method: r.return_method || undefined,
+    status: r.status_izin || 'active',
+    return_notes: r.return_notes || undefined,
+    audited_by: r.audited_by || undefined,
+    audit_reason: r.audit_reason || undefined,
+    idempotency_key: r.idempotency_key || r.id,
+    version: parseNum_(r.version, 1),
+    created_at: r.created_at || nowIso,
+    updated_at: r.updated_at || r.diubah_pada || nowIso,
+    diubah_pada: r.diubah_pada || r.updated_at || nowIso,
+  };
+}
+
+function mapViolationRow_(r, nowIso) {
+  return {
+    id: r.id,
+    student_id: r.student_id,
+    class_id: r.class_id,
+    violation_type_id: r.violation_type_id,
+    type_name: r.type_name,
+    category: r.category || 'ringan',
+    points: parseNum_(r.points, 0),
+    notes: r.notes || '',
+    location: r.location || '',
+    evidence_photo_url: r.evidence_photo_url || '',
+    recorded_by: r.recorded_by || 'Petugas',
+    recorded_at: r.recorded_at || r.created_at || nowIso,
+    version: parseNum_(r.version, 1),
+    created_at: r.created_at || nowIso,
+    updated_at: r.updated_at || r.diubah_pada || nowIso,
+    diubah_pada: r.diubah_pada || r.updated_at || nowIso,
+  };
+}
+
+function mapLeaveRequestRow_(r, nowIso) {
+  return {
+    id: r.id,
+    student_id: r.student_id,
+    class_id: r.class_id,
+    type: r.type || 'Izin',
+    start_date: r.start_date,
+    end_date: r.end_date,
+    reason: r.reason || '',
+    letter_file_url: r.letter_file_url || undefined,
+    status: r.status_persetujuan || 'pending',
+    approved_by: r.approved_by || undefined,
+    approved_at: r.approved_at || undefined,
+    rejection_reason: r.rejection_reason || undefined,
+    created_at: r.created_at || nowIso,
+    updated_at: r.updated_at || r.diubah_pada || nowIso,
+    diubah_pada: r.diubah_pada || r.updated_at || nowIso,
+  };
+}
+
+function getStudentsFast_(ss) {
+  ensureInitializedOnce_(ss, false);
+  var nowIso = new Date().toISOString();
+  return activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.SISWA)).map(function (r) {
+    return mapStudentRow_(r, nowIso);
+  });
+}
+
+function getSessionsFast_(ss) {
+  ensureInitializedOnce_(ss, false);
+  var nowIso = new Date().toISOString();
+  return activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.SESI_PRESENSI)).map(function (r) {
+    return mapSessionRow_(r, nowIso);
+  });
+}
+
+function getOutOfClassFast_(ss) {
+  ensureInitializedOnce_(ss, false);
+  var nowIso = new Date().toISOString();
+  return activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.IZIN_KELUAR)).map(function (r) {
+    return mapOutOfClassRow_(r, nowIso);
+  });
+}
+
+function getViolationTypesFast_(ss) {
+  ensureInitializedOnce_(ss, false);
+  var nowIso = new Date().toISOString();
+  return activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.JENIS_PELANGGARAN)).map(function (r) {
+    return {
+      id: r.id,
+      code: r.code || '',
+      name: r.name || '',
+      category: r.category || 'ringan',
+      default_points: parseNum_(r.default_points, 5),
+      is_active: parseBool_(r.is_active, true),
+      description: r.description || '',
+      created_at: r.created_at || nowIso,
+      updated_at: r.updated_at || r.diubah_pada || nowIso,
+      diubah_pada: r.diubah_pada || r.updated_at || nowIso,
+    };
+  });
+}
+
+function getViolationsFast_(ss) {
+  ensureInitializedOnce_(ss, false);
+  var nowIso = new Date().toISOString();
+  return activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.PELANGGARAN)).map(function (r) {
+    return mapViolationRow_(r, nowIso);
+  });
+}
+
+function getLeaveRequestsFast_(ss) {
+  ensureInitializedOnce_(ss, false);
+  var nowIso = new Date().toISOString();
+  return activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.IZIN_TIDAK_MASUK)).map(function (r) {
+    return mapLeaveRequestRow_(r, nowIso);
+  });
+}
+
 function upgradeLegacyBcryptHash_(ss, userRec, plainPassword) {
   try {
     if (!userRec || !userRec.id || !userRec.password_hash) return;
@@ -1722,7 +2223,7 @@ function getFullDatabase_(bypassScriptCache) {
     };
   });
 
-  var attendance = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.PRESENSI, bypass)).map(function (r) {
+  var attendance = activeOnly_(readAllAttendanceRowEntries_(ss, bypass, sessions)).map(function (r) {
     return {
       id: r.id,
       student_id: r.student_id,
@@ -1742,6 +2243,8 @@ function getFullDatabase_(bypassScriptCache) {
       updated_at: r.updated_at || r.diubah_pada || nowIso,
       diubah_pada: r.diubah_pada || r.updated_at || nowIso,
     };
+  }).sort(function (a, b) {
+    return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
   });
 
   var out_of_class = activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.IZIN_KELUAR, bypass)).map(function (r) {
@@ -1986,10 +2489,17 @@ function resolveSessionSchedule_(sessions, now, autoSwitchEnabled, manualOverrid
 }
 
 function syncSessionRecapSheet_(ss, targetDate, dbOpt) {
-  var db = dbOpt || getFullDatabase_();
+  var studentsList = (dbOpt && dbOpt.students) || getStudentsFast_(ss);
+  var sessionsList = (dbOpt && dbOpt.sessions) || getSessionsFast_(ss);
   var dateStr = targetDate || toDateYmd_(new Date());
-  var totalStudents = db.students.length;
-  var dayAtt = db.attendance.filter(function (a) { return a.date === dateStr; });
+  var totalStudents = studentsList.length;
+  var nowIsoRecap = new Date().toISOString();
+  var allAttendance = (dbOpt && dbOpt.attendance)
+    ? dbOpt.attendance
+    : activeOnly_(readAllAttendanceRowEntries_(ss, false, sessionsList)).map(function (r) {
+        return mapAttendanceRow_(r, nowIsoRecap);
+      });
+  var dayAtt = allAttendance.filter(function (a) { return a.date === dateStr; });
 
   var existingRows = readTabWithRowNumbers_(ss, SHEET_TABS.REKAP_PER_SESI);
   var existingById = {};
@@ -2001,7 +2511,7 @@ function syncSessionRecapSheet_(ss, targetDate, dbOpt) {
   var toAppend = [];
   var rowUpdates = [];
 
-  db.sessions.forEach(function (sess) {
+  sessionsList.forEach(function (sess) {
     var sessAtt = dayAtt.filter(function (a) { return a.session_id === sess.id; });
     var hadir = sessAtt.filter(function (a) { return a.status === 'Hadir'; }).length;
     var terlambat = sessAtt.filter(function (a) { return a.status === 'Terlambat'; }).length;
@@ -2154,7 +2664,7 @@ function logNotification_(ss, log) {
     created_at: log.created_at || nowIso,
     status: 'aktif',
     diubah_pada: nowIso,
-  }]);
+  }], { skipBump: true });
 }
 
 function notifyParent_(payload, dbOpt) {
@@ -2565,45 +3075,132 @@ function updateNotificationSettings_(patch, actorName) {
 function appendAttendanceBatch_(ss, records, actorName, dbOpt) {
   if (!records || records.length === 0) return { saved: [], rejectedDuplicates: [] };
 
-  var existingRows = readTabWithRowNumbers_(ss, SHEET_TABS.PRESENSI);
-  var activeExisting = existingRows.filter(function (r) { return r.data.status !== 'dihapus'; }).map(function (r) { return r.data; });
+  var sessionsList = getSessionsForTabs_(ss, dbOpt && dbOpt.sessions);
+  var sessionTabMap = ensureSessionAttendanceSheets_(ss, sessionsList);
+  var sessionNameMap = {};
+  for (var si = 0; si < sessionsList.length; si++) {
+    sessionNameMap[sessionsList[si].id] = sessionsList[si].name || sessionsList[si].id;
+  }
 
-  var exactKeys = {};
-  var dayKeys = {};
-  activeExisting.forEach(function (r) {
-    exactKeys[r.student_id + '::' + r.date + '::' + r.session_id] = true;
-    dayKeys[r.student_id + '::' + r.date] = true;
-  });
-
-  var sessionsList = (dbOpt && dbOpt.sessions) || activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.SESI_PRESENSI)).map(function (r) {
-    return { id: r.id, is_active: parseBool_(r.is_active, true) };
-  });
-  var multiSession = sessionsList.filter(function (s) { return s.is_active; }).length > 1;
+  var existingEntries = readAllAttendanceRowEntries_(ss, false, sessionsList);
+  var exactByKey = {};
+  for (var ei = 0; ei < existingEntries.length; ei++) {
+    var ent = existingEntries[ei];
+    if (ent.data && ent.data.status !== 'dihapus') {
+      var k = ent.data.student_id + '::' + ent.data.date + '::' + ent.data.session_id;
+      exactByKey[k] = { tabName: ent.tabName, data: ent.data };
+    }
+  }
 
   var toInsert = [];
+  var updatedExisting = [];
   var rejected = [];
 
   records.forEach(function (rec) {
     var ek = rec.student_id + '::' + rec.date + '::' + rec.session_id;
-    var dk = rec.student_id + '::' + rec.date;
-    var isDup = multiSession ? Boolean(exactKeys[ek]) : (Boolean(exactKeys[ek]) || Boolean(dayKeys[dk]));
-    if (isDup) {
+    var existingHit = exactByKey[ek];
+    if (existingHit) {
+      if (rec.upsert || rec.method === 'manual') {
+        var nowSyncIso = new Date().toISOString();
+        var nextLate = rec.status === 'Terlambat'
+          ? (rec.late_minutes !== undefined ? rec.late_minutes : parseNum_(existingHit.data.late_minutes, 0))
+          : 0;
+        if (existingHit._pendingInsert) {
+          existingHit.data.status = rec.status;
+          existingHit.data.late_minutes = nextLate;
+          existingHit.data.method = rec.method || 'manual';
+          if (rec.notes !== undefined) existingHit.data.notes = rec.notes;
+          existingHit.data.updated_at = nowSyncIso;
+          existingHit.data.diubah_pada = nowSyncIso;
+          return;
+        }
+        var patchObj = {
+          status_presensi: rec.status,
+          late_minutes: nextLate,
+          method: rec.method || 'manual',
+          notes: rec.notes !== undefined ? rec.notes : existingHit.data.notes,
+          audited_by: actorName || 'Petugas',
+          audit_reason: 'Sinkronisasi presensi manual',
+          updated_at: nowSyncIso,
+          diubah_pada: nowSyncIso,
+        };
+        var updHit = updateRowPartial_(ss, {
+          tabName: existingHit.tabName,
+          id: existingHit.data.id,
+          newRowObj: patchObj,
+          forceOverwrite: true,
+          actorName: actorName || 'Petugas',
+          reason: 'Sinkronisasi presensi manual',
+          skipBump: true,
+        });
+        if (updHit.updated && updHit.newObj) {
+          existingHit.data = updHit.newObj;
+          var mappedSynced = {
+            id: updHit.newObj.id,
+            student_id: updHit.newObj.student_id,
+            session_id: updHit.newObj.session_id,
+            date: updHit.newObj.date,
+            timestamp: updHit.newObj.timestamp || updHit.newObj.created_at || nowSyncIso,
+            status: updHit.newObj.status_presensi || rec.status,
+            late_minutes: parseNum_(updHit.newObj.late_minutes, 0),
+            method: updHit.newObj.method || 'manual',
+            device_id: updHit.newObj.device_id || 'kiosk_main',
+            photo_id: updHit.newObj.photo_id || '',
+            notes: updHit.newObj.notes || '',
+            version: parseNum_(updHit.newObj.version, 1),
+            created_at: updHit.newObj.created_at || nowSyncIso,
+            updated_at: updHit.newObj.updated_at || nowSyncIso,
+            diubah_pada: updHit.newObj.diubah_pada || nowSyncIso,
+          };
+          updatedExisting.push(mappedSynced);
+          return;
+        }
+      }
+      var sessLabel = sessionNameMap[rec.session_id] || rec.session_id || '';
+      var exSt = existingHit.data.status_presensi || existingHit.data.status || 'Hadir';
+      var exMethodLabel = existingHit.data.method === 'manual' ? 'Manual' : 'Scan';
       rejected.push({
         student_id: rec.student_id,
         date: rec.date,
         session_id: rec.session_id,
-        reason: 'Presensi ganda ditolak: siswa NIS ' + rec.student_id + ' sudah tercatat presensi hari ini (' + rec.date + ').',
+        existingRecord: {
+          id: existingHit.data.id,
+          student_id: existingHit.data.student_id,
+          session_id: existingHit.data.session_id,
+          date: existingHit.data.date,
+          timestamp: existingHit.data.timestamp || existingHit.data.created_at,
+          status: exSt,
+          late_minutes: parseNum_(existingHit.data.late_minutes, 0),
+          method: existingHit.data.method || 'barcode',
+          notes: existingHit.data.notes || '',
+        },
+        reason: 'Presensi ganda ditolak: siswa NIS ' + rec.student_id + ' sudah tercatat ' + exSt + ' (' + exMethodLabel + ') pada sesi ' + sessLabel + ' hari ini (' + rec.date + ').',
       });
       return;
     }
-    exactKeys[ek] = true;
-    dayKeys[dk] = true;
-    toInsert.push(rec);
+    var cleanRec = {};
+    for (var rk in rec) {
+      if (Object.prototype.hasOwnProperty.call(rec, rk) && rk !== 'upsert') {
+        cleanRec[rk] = rec[rk];
+      }
+    }
+    exactByKey[ek] = {
+      tabName: sessionTabMap[cleanRec.session_id] || getSessionAttendanceTabName_({ id: cleanRec.session_id, name: sessionNameMap[cleanRec.session_id] || cleanRec.session_id }, sessionsList),
+      data: cleanRec,
+      _pendingInsert: true,
+    };
+    toInsert.push(cleanRec);
   });
 
+  var revInfo = null;
+
   if (toInsert.length > 0) {
-    appendRows_(ss, SHEET_TABS.PRESENSI, toInsert.map(function (r) {
-      return {
+    var groupedByTab = {};
+    var logBatch = [];
+    toInsert.forEach(function (r) {
+      var targetTab = sessionTabMap[r.session_id] || getSessionAttendanceTabName_({ id: r.session_id, name: sessionNameMap[r.session_id] || r.session_id }, sessionsList);
+      if (!groupedByTab[targetTab]) groupedByTab[targetTab] = [];
+      groupedByTab[targetTab].push({
         id: r.id,
         student_id: r.student_id,
         session_id: r.session_id,
@@ -2622,36 +3219,47 @@ function appendAttendanceBatch_(ss, records, actorName, dbOpt) {
         updated_at: r.updated_at,
         status: 'aktif',
         diubah_pada: r.diubah_pada || r.updated_at,
-      };
-    }), { skipBump: true });
-
-    var logBatch = toInsert.map(function (r) {
-      return {
+      });
+      logBatch.push({
         id: randomId_('log'),
         waktu: r.created_at,
         pengguna: actorName || 'Sistem Presensi',
         id_data: r.id,
-        tabel: SHEET_TABS.PRESENSI,
+        tabel: targetTab,
         aksi: 'tambah',
         nilai_lama: '',
-        nilai_baru: JSON.stringify({ student_id: r.student_id, session_id: r.session_id, date: r.date, status: r.status }),
+        nilai_baru: JSON.stringify({ student_id: r.student_id, session_id: r.session_id, date: r.date, status: r.status, method: r.method }),
         reason: '',
         status: 'aktif',
         diubah_pada: r.created_at,
-      };
+      });
     });
+
+    for (var tKey in groupedByTab) {
+      if (Object.prototype.hasOwnProperty.call(groupedByTab, tKey)) {
+        appendRows_(ss, tKey, groupedByTab[tKey], { skipBump: true });
+      }
+    }
+
     appendRows_(ss, SHEET_TABS.LOG, logBatch, { skipBump: true });
-    bumpDataRevision_();
+  }
+
+  var savedRecords = toInsert.concat(updatedExisting);
+  if (savedRecords.length > 0) {
+    var deltaEvents = savedRecords.map(function (rec) {
+      return { op: 'attendance_upsert', record: rec };
+    });
+    revInfo = bumpDataRevision_(deltaEvents);
 
     try {
-      var recapDb = dbOpt
-        ? { students: dbOpt.students, sessions: dbOpt.sessions, attendance: (dbOpt.attendance || []).concat(toInsert) }
-        : null;
-      syncSessionRecapSheet_(ss, toInsert[0].date, recapDb);
+      syncSessionRecapSheet_(ss, savedRecords[0].date, {
+        students: (dbOpt && dbOpt.students) || getStudentsFast_(ss),
+        sessions: sessionsList,
+      });
     } catch (e) {}
   }
 
-  return { saved: toInsert, rejectedDuplicates: rejected };
+  return { saved: savedRecords, rejectedDuplicates: rejected, revInfo: revInfo };
 }
 
 function autoCloseOverdueOutOfClass_(ss) {
@@ -2741,7 +3349,7 @@ function startOutOfClass_(ss, record, actorName, dbOpt) {
     updated_at: nowIso,
     status: 'aktif',
     diubah_pada: nowIso,
-  }]);
+  }], { skipBump: Boolean(dbOpt && dbOpt.skipBump) });
 
   appendLog_(ss, {
     waktu: nowIso,
@@ -2896,10 +3504,12 @@ function dispatchRoute_(req) {
         } catch (eDrvSetup) {}
       }
       var dbSetup = getFullDatabase_();
+      var setupMeta = getSyncMeta_();
       var senderEmail = getActiveSenderEmail_();
       return makeResp_(200, {
         success: true,
-        rev: getDataRevision_(),
+        rev: setupMeta.rev,
+        seq: setupMeta.seq,
         configured: missingSetup.length === 0 && driveOkSetup,
         sheetsConfigured: true,
         driveConfigured: driveOkSetup,
@@ -2941,7 +3551,7 @@ function dispatchRoute_(req) {
       }
     }
 
-    // 3. /api/sync
+    // 3. /api/sync (Fast Revision + Sub-Second Delta Ring + Cached Full Snapshot)
     if (pathname === '/api/sync') {
       var missingSync = getMissingConfigKeys_();
       if (!getSpreadsheetId_()) {
@@ -2953,21 +3563,27 @@ function dispatchRoute_(req) {
         });
       }
       var clientRev = String(query.rev || body.rev || '').trim();
+      var clientSeq = parseNum_(query.seq || body.seq, 0);
       var forceFull = parseBool_(query.full || body.full, false);
       var bypassCacheSync = parseBool_(query.fresh || body.fresh, false);
-      var currentRev = getDataRevision_();
+      var meta = getSyncMeta_();
+      var currentRev = meta.rev;
+      var currentSeq = meta.seq || 1;
+      var folderIdSync = getDriveFolderId_();
+      var driveOkFast = checkDriveFolderFast_(folderIdSync, bypassCacheSync);
 
-      if (clientRev && clientRev === currentRev && !forceFull) {
-        var folderIdFast = getDriveFolderId_();
+      if (!forceFull && clientRev && clientRev === currentRev && (!clientSeq || clientSeq === currentSeq)) {
         return makeResp_(200, {
           fullSnapshot: false,
           unchanged: true,
+          delta: false,
           rev: currentRev,
-          configured: missingSync.length === 0,
+          seq: currentSeq,
+          configured: missingSync.length === 0 && driveOkFast,
           sheetsConfigured: true,
-          driveConfigured: Boolean(folderIdFast),
+          driveConfigured: driveOkFast,
           spreadsheetConfigured: true,
-          driveFolderConfigured: Boolean(folderIdFast),
+          driveFolderConfigured: driveOkFast,
           authMode: 'apps_script',
           emailConnected: true,
           emailTransport: 'apps_script_gmail',
@@ -2977,32 +3593,66 @@ function dispatchRoute_(req) {
         });
       }
 
-      var dbSync = getFullDatabase_(bypassCacheSync);
-      var driveOkSync = false;
-      var folderIdSync = getDriveFolderId_();
-      if (folderIdSync) {
-        try {
-          var fSync = DriveApp.getFolderById(folderIdSync);
-          driveOkSync = Boolean(fSync && (!fSync.isTrashed || !fSync.isTrashed()));
-        } catch (eDrvSync) {}
+      if (
+        !forceFull &&
+        clientSeq > 0 &&
+        currentSeq > clientSeq &&
+        Array.isArray(meta.events) &&
+        meta.events.length > 0 &&
+        meta.events[0].seq <= (clientSeq + 1)
+      ) {
+        var missedEvents = meta.events.filter(function (ev) { return ev && ev.seq > clientSeq; });
+        var hasFullReloadEv = missedEvents.some(function (ev) { return ev.op === 'full_reload'; });
+        if (missedEvents.length > 0 && !hasFullReloadEv) {
+          return makeResp_(200, {
+            fullSnapshot: false,
+            unchanged: false,
+            delta: true,
+            rev: currentRev,
+            seq: currentSeq,
+            events: missedEvents,
+            configured: missingSync.length === 0 && driveOkFast,
+            sheetsConfigured: true,
+            driveConfigured: driveOkFast,
+            spreadsheetConfigured: true,
+            driveFolderConfigured: driveOkFast,
+            authMode: 'apps_script',
+            emailConnected: true,
+            emailTransport: 'apps_script_gmail',
+            missingConfig: missingSync,
+            missingEnv: missingSync,
+            serverTime: new Date().toISOString(),
+          });
+        }
       }
+
+      var cachedSnapshot = !bypassCacheSync ? loadFullSnapshotCache_(currentRev) : null;
+      var snapshotData = cachedSnapshot;
+      if (!snapshotData) {
+        var dbSync = getFullDatabase_(bypassCacheSync);
+        snapshotData = buildDatabasePayload_(dbSync);
+        saveFullSnapshotCache_(currentRev, snapshotData);
+      }
+
       return makeResp_(200, {
         fullSnapshot: true,
         unchanged: false,
+        delta: false,
         rev: currentRev,
-        configured: missingSync.length === 0 && driveOkSync,
+        seq: currentSeq,
+        configured: missingSync.length === 0 && driveOkFast,
         sheetsConfigured: true,
-        driveConfigured: driveOkSync,
+        driveConfigured: driveOkFast,
         spreadsheetConfigured: true,
-        driveFolderConfigured: driveOkSync,
+        driveFolderConfigured: driveOkFast,
         authMode: 'apps_script',
         emailConnected: true,
         emailTransport: 'apps_script_gmail',
-        senderEmail: getActiveSenderEmail_(),
+        senderEmail: getActiveSenderEmailFast_(bypassCacheSync),
         missingConfig: missingSync,
         missingEnv: missingSync,
         serverTime: new Date().toISOString(),
-        data: buildDatabasePayload_(dbSync),
+        data: snapshotData,
       });
     }
 
@@ -3334,11 +3984,18 @@ function dispatchRoute_(req) {
       return makeResp_(400, { error: 'Aksi auth tidak dikenali.' });
     }
 
-    // 5. /api/attendance
+    // 5. /api/attendance (Targeted cached reads + delta-emitting writes)
     if (pathname === '/api/attendance') {
       var ssAtt = getSpreadsheet_();
       if (method === 'GET') {
-        return makeResp_(200, { records: getFullDatabase_().attendance, serverTime: new Date().toISOString() });
+        var nowGetAtt = new Date().toISOString();
+        var sessGetAtt = getSessionsFast_(ssAtt);
+        var attGetList = activeOnly_(readAllAttendanceRowEntries_(ssAtt, false, sessGetAtt)).map(function (r) {
+          return mapAttendanceRow_(r, nowGetAtt);
+        }).sort(function (a, b) {
+          return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
+        });
+        return makeResp_(200, { records: attGetList, serverTime: nowGetAtt });
       }
 
       if (method === 'POST') {
@@ -3348,11 +4005,15 @@ function dispatchRoute_(req) {
         var lockAtt = LockService.getScriptLock();
         lockAtt.waitLock(15000);
         try {
-          var dbAtt = getFullDatabase_();
+          var studentsAtt = getStudentsFast_(ssAtt);
+          var sessionsAtt = getSessionsFast_(ssAtt);
+          var leaveAtt = getLeaveRequestsFast_(ssAtt);
+          var cfgAtt = getSettingsFast_(ssAtt);
+
           var serverNow = new Date();
           var curDateStr = toDateYmd_(serverNow);
           var clockNow = getLocalClockParts_(serverNow);
-          var autoSwitch = dbAtt.settings.auto_session_switch !== false;
+          var autoSwitch = cfgAtt.settings.auto_session_switch !== false;
           var sessTok = token ? verifyJwt_(token) : null;
           var actorNameAtt = (sessTok && sessTok.name) || 'Sistem Presensi';
 
@@ -3376,11 +4037,11 @@ function dispatchRoute_(req) {
             var student = null;
             if (code) {
               var clean = String(code).trim().toLowerCase();
-              student = dbAtt.students.filter(function (s) {
+              student = studentsAtt.filter(function (s) {
                 return s.nis.toLowerCase() === clean || s.rfid_uid.toLowerCase() === clean || s.card_code.toLowerCase() === clean;
               })[0];
             } else if (studentId) {
-              student = dbAtt.students.filter(function (s) { return s.nis === String(studentId).trim(); })[0];
+              student = studentsAtt.filter(function (s) { return s.nis === String(studentId).trim(); })[0];
             }
 
             if (!student) {
@@ -3388,18 +4049,18 @@ function dispatchRoute_(req) {
               return;
             }
 
-            var sched = resolveSessionSchedule_(dbAtt.sessions, serverNow, autoSwitch, manualOverride ? sessionId : null);
+            var sched = resolveSessionSchedule_(sessionsAtt, serverNow, autoSwitch, manualOverride ? sessionId : null);
             var matchedSess = null;
             if (manualOverride && sessionId) {
-              matchedSess = dbAtt.sessions.filter(function (s) { return s.id === sessionId; })[0];
+              matchedSess = sessionsAtt.filter(function (s) { return s.id === sessionId; })[0];
             } else if (autoSwitch && sched.liveWindowSession) {
               matchedSess = sched.liveWindowSession;
             } else if (sessionId) {
-              matchedSess = dbAtt.sessions.filter(function (s) { return s.id === sessionId && s.is_active; })[0];
+              matchedSess = sessionsAtt.filter(function (s) { return s.id === sessionId && s.is_active; })[0];
             }
-            var activeSess = matchedSess || sched.activeSession || dbAtt.sessions.filter(function (s) { return s.is_active; })[0] || dbAtt.sessions[0];
+            var activeSess = matchedSess || sched.activeSession || sessionsAtt.filter(function (s) { return s.is_active; })[0] || sessionsAtt[0];
 
-            var activeLeave = dbAtt.leave_requests.filter(function (l) {
+            var activeLeave = leaveAtt.filter(function (l) {
               return l.student_id === student.nis && l.status === 'approved' && curDateStr >= l.start_date && curDateStr <= l.end_date;
             })[0];
 
@@ -3430,6 +4091,7 @@ function dispatchRoute_(req) {
 
             var nowIso = serverNow.toISOString();
             var recId = randomId_('att');
+            var resolvedMethod = attMethod || (String(code || '').indexOf('RFID-') === 0 ? 'rfid' : 'barcode');
             var record = {
               id: recId,
               student_id: student.nis,
@@ -3438,7 +4100,8 @@ function dispatchRoute_(req) {
               timestamp: nowIso,
               status: attStatus,
               late_minutes: lateMinutes,
-              method: attMethod || (String(code || '').indexOf('RFID-') === 0 ? 'rfid' : 'barcode'),
+              method: resolvedMethod,
+              upsert: Boolean((item && item.upsert) || resolvedMethod === 'manual'),
               device_id: deviceId || 'kiosk_main',
               photo_id: photoId,
               notes: notes || '',
@@ -3452,29 +4115,37 @@ function dispatchRoute_(req) {
             sessByRec[recId] = activeSess;
           });
 
-          var batchRes = appendAttendanceBatch_(ssAtt, prepared, actorNameAtt, dbAtt);
+          var batchRes = appendAttendanceBatch_(ssAtt, prepared, actorNameAtt, {
+            students: studentsAtt,
+            sessions: sessionsAtt,
+          });
           batchRes.saved.forEach(function (rec) {
             if (rec.status === 'Terlambat' || rec.status === 'Alpha') {
-              var st = stuByRec[rec.id];
+              var st = stuByRec[rec.id] || studentsAtt.filter(function (s) { return s.nis === rec.student_id; })[0];
               if (st) {
                 notifyParent_({
                   student: st,
                   triggerType: rec.status === 'Terlambat' ? 'terlambat' : 'alpha',
                   status: rec.status + ' (' + rec.late_minutes + ' menit)',
-                }, dbAtt);
+                }, cfgAtt);
               }
             }
           });
 
           var allRej = immedRejections.concat(batchRes.rejectedDuplicates.map(function (d) {
-            return { studentId: d.student_id, isDuplicate: true, message: d.reason };
+            return { studentId: d.student_id, isDuplicate: true, existingRecord: d.existingRecord, message: d.reason };
           }));
+
+          var metaAtt = getSyncMeta_();
+          var revVal = (batchRes.revInfo && batchRes.revInfo.rev) || metaAtt.rev;
+          var seqVal = (batchRes.revInfo && batchRes.revInfo.seq) || metaAtt.seq;
 
           if (!Array.isArray(body.scans)) {
             if (batchRes.saved.length === 0 && allRej.length > 0) {
               return makeResp_(400, {
                 error: allRej[0].message,
                 isDuplicate: Boolean(allRej[0].isDuplicate),
+                existingRecord: allRej[0].existingRecord,
                 student: prepared[0] ? stuByRec[prepared[0].id] : undefined,
               });
             }
@@ -3482,10 +4153,12 @@ function dispatchRoute_(req) {
             return makeResp_(200, {
               success: true,
               record: single,
-              student: stuByRec[single.id],
-              session: sessByRec[single.id],
+              student: stuByRec[single.id] || (single ? studentsAtt.filter(function (s) { return s.nis === single.student_id; })[0] : undefined),
+              session: sessByRec[single.id] || (single ? sessionsAtt.filter(function (s) { return s.id === single.session_id; })[0] : undefined),
               serverTime: serverNow.toISOString(),
-              rev: getDataRevision_(), snapshot: buildDatabasePayload_(),
+              deltaApplied: true,
+              rev: revVal,
+              seq: seqVal,
             });
           }
 
@@ -3494,11 +4167,17 @@ function dispatchRoute_(req) {
             savedCount: batchRes.saved.length,
             rejectedCount: allRej.length,
             results: batchRes.saved.map(function (rec) {
-              return { record: rec, student: stuByRec[rec.id], session: sessByRec[rec.id] };
+              return {
+                record: rec,
+                student: stuByRec[rec.id] || studentsAtt.filter(function (s) { return s.nis === rec.student_id; })[0],
+                session: sessByRec[rec.id] || sessionsAtt.filter(function (s) { return s.id === rec.session_id; })[0],
+              };
             }),
             rejectedDuplicates: allRej,
             serverTime: serverNow.toISOString(),
-            rev: getDataRevision_(), snapshot: buildDatabasePayload_(),
+            deltaApplied: true,
+            rev: revVal,
+            seq: seqVal,
           });
         } finally {
           lockAtt.releaseLock();
@@ -3522,20 +4201,39 @@ function dispatchRoute_(req) {
           if (body.updates && body.updates.status) patchAtt.status_presensi = body.updates.status;
           if (body.updates && body.updates.late_minutes !== undefined) patchAtt.late_minutes = body.updates.late_minutes;
           if (body.updates && body.updates.notes !== undefined) patchAtt.notes = body.updates.notes;
+          if (body.updates && body.updates.method) patchAtt.method = body.updates.method;
 
+          var sessionsPut = getSessionsFast_(ssAtt);
+          var targetTabPut = findAttendanceTabForId_(ssAtt, body.id, sessionsPut) || SHEET_TABS.PRESENSI;
           var updRes = updateRowPartial_(ssAtt, {
-            tabName: SHEET_TABS.PRESENSI,
+            tabName: targetTabPut,
             id: body.id,
             newRowObj: patchAtt,
             expectedUpdatedAt: body.expected_updated_at,
             forceOverwrite: Boolean(body.forceOverwrite),
             actorName: sessPut.name || 'Petugas',
             reason: body.reason || 'Koreksi presensi',
+            skipBump: true,
           });
           if (updRes.conflict) return makeResp_(409, { error: 'Data sudah diubah oleh pengguna lain sebelum Anda menyimpan.', conflict: true, current: updRes.current });
           if (!updRes.updated) return makeResp_(404, { error: 'Data presensi tidak ditemukan.' });
-          try { syncSessionRecapSheet_(ssAtt, updRes.oldObj.date); } catch (e) {}
-          return makeResp_(200, { success: true, record: updRes.oldObj, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var newAttRow = updRes.newObj || updRes.oldObj;
+          var mappedUpdatedAtt = mapAttendanceRow_(newAttRow, nowIsoPut);
+          var revPut = bumpDataRevision_([{ op: 'attendance_upsert', record: mappedUpdatedAtt }]);
+          try {
+            syncSessionRecapSheet_(ssAtt, newAttRow.date, {
+              students: getStudentsFast_(ssAtt),
+              sessions: sessionsPut,
+            });
+          } catch (e) {}
+          return makeResp_(200, {
+            success: true,
+            record: mappedUpdatedAtt,
+            serverTime: new Date().toISOString(),
+            deltaApplied: true,
+            rev: revPut.rev,
+            seq: revPut.seq,
+          });
         } finally {
           lockPut.releaseLock();
         }
@@ -3548,20 +4246,32 @@ function dispatchRoute_(req) {
         var lockAttDel = LockService.getScriptLock();
         lockAttDel.waitLock(15000);
         try {
+          var targetTabDel = findAttendanceTabForId_(ssAtt, body.id) || SHEET_TABS.PRESENSI;
           var okDel = softDeleteRow_(ssAtt, {
-            tabName: SHEET_TABS.PRESENSI,
+            tabName: targetTabDel,
             id: body.id,
             actorName: sessDel.name || 'Petugas',
             reason: body.reason || 'Pembatalan presensi',
+            skipBump: true,
           });
-          return makeResp_(200, { success: okDel, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var revDelInfo = okDel
+            ? bumpDataRevision_([{ op: 'attendance_delete', id: body.id }])
+            : getSyncMeta_();
+          return makeResp_(200, {
+            success: okDel,
+            deletedId: body.id,
+            serverTime: new Date().toISOString(),
+            deltaApplied: true,
+            rev: revDelInfo.rev,
+            seq: revDelInfo.seq,
+          });
         } finally {
           lockAttDel.releaseLock();
         }
       }
     }
 
-    // 6. /api/out-of-class
+    // 6. /api/out-of-class (Targeted cached reads + delta-emitting writes)
     if (pathname === '/api/out-of-class') {
       var ssOoc = getSpreadsheet_();
       if (method === 'GET') {
@@ -3573,7 +4283,7 @@ function dispatchRoute_(req) {
             lockOocGet.releaseLock();
           }
         }
-        return makeResp_(200, { records: getFullDatabase_().out_of_class });
+        return makeResp_(200, { records: getOutOfClassFast_(ssOoc) });
       }
 
       if (method === 'POST') {
@@ -3583,9 +4293,12 @@ function dispatchRoute_(req) {
         var lockOoc = LockService.getScriptLock();
         lockOoc.waitLock(15000);
         try {
-          var dbOoc = getFullDatabase_();
-          var stuOoc = dbOoc.students.filter(function (s) { return s.nis === body.studentId; })[0];
+          var studentsOoc = getStudentsFast_(ssOoc);
+          var stuOoc = studentsOoc.filter(function (s) { return s.nis === body.studentId; })[0];
           if (!stuOoc) return makeResp_(400, { error: 'Siswa tidak ditemukan.' });
+          var classesOoc = getClassesFast_(ssOoc);
+          var cfgOoc = getSettingsFast_(ssOoc);
+          var outListOoc = getOutOfClassFast_(ssOoc);
           var sessOoc = token ? verifyJwt_(token) : null;
           var nowOoc = new Date();
           var dueOoc = new Date(nowOoc.getTime() + Number(body.durationMinutes) * 60000);
@@ -3603,10 +4316,25 @@ function dispatchRoute_(req) {
             version: 1,
             created_at: nowOoc.toISOString(),
             updated_at: nowOoc.toISOString(),
+            diubah_pada: nowOoc.toISOString(),
           };
-          var oocRes = startOutOfClass_(ssOoc, newOoc, (sessOoc && sessOoc.name) || 'Petugas Piket', dbOoc);
+          var oocRes = startOutOfClass_(ssOoc, newOoc, (sessOoc && sessOoc.name) || 'Petugas Piket', {
+            out_of_class: outListOoc,
+            classes: classesOoc,
+            settings: cfgOoc.settings,
+            skipBump: true,
+          });
           if (!oocRes.success) return makeResp_(400, { error: oocRes.error });
-          return makeResp_(200, { success: true, record: oocRes.record, student: stuOoc, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var revOocPost = bumpDataRevision_([{ op: 'ooc_upsert', record: oocRes.record }]);
+          return makeResp_(200, {
+            success: true,
+            record: oocRes.record,
+            student: stuOoc,
+            serverTime: new Date().toISOString(),
+            deltaApplied: true,
+            rev: revOocPost.rev,
+            seq: revOocPost.seq,
+          });
         } finally {
           lockOoc.releaseLock();
         }
@@ -3616,11 +4344,19 @@ function dispatchRoute_(req) {
         var lockOocPut = LockService.getScriptLock();
         lockOocPut.waitLock(15000);
         try {
-          var dbPutOoc = getFullDatabase_();
-          var existingOoc = dbPutOoc.out_of_class.filter(function (r) { return r.id === body.id; })[0];
+          var oocPutList = getOutOfClassFast_(ssOoc);
+          var existingOoc = oocPutList.filter(function (r) { return r.id === body.id; })[0];
           if (!existingOoc) return makeResp_(400, { error: 'Catatan izin keluar tidak ditemukan.' });
           if (existingOoc.status === 'returned' || existingOoc.status === 'auto_closed') {
-            return makeResp_(200, { success: true, alreadyReturned: true, record: existingOoc });
+            var metaExOoc = getSyncMeta_();
+            return makeResp_(200, {
+              success: true,
+              alreadyReturned: true,
+              record: existingOoc,
+              deltaApplied: true,
+              rev: metaExOoc.rev,
+              seq: metaExOoc.seq,
+            });
           }
 
           var nowRet = new Date();
@@ -3649,6 +4385,7 @@ function dispatchRoute_(req) {
             forceOverwrite: Boolean(body.forceOverwrite),
             actorName: actorOocPut,
             reason: body.auditReason || 'Konfirmasi kembali ke kelas',
+            skipBump: true,
           });
           if (updOoc.conflict) return makeResp_(409, { error: 'Data izin keluar telah diperbarui pengguna lain.', conflict: true, current: updOoc.current });
 
@@ -3658,43 +4395,53 @@ function dispatchRoute_(req) {
             started_at: existingOoc.started_at, due_at: existingOoc.due_at,
             status: 'returned', returned_at: nowRetIso, actual_minutes: actualMin,
             late_return_minutes: lateRetMin, return_method: body.returnMethod || 'click',
-            return_notes: body.notes, updated_at: nowRetIso, diubah_pada: nowRetIso,
+            return_notes: body.notes, audited_by: actorOocPut, audit_reason: body.auditReason || undefined,
+            idempotency_key: existingOoc.idempotency_key, version: existingOoc.version,
+            created_at: existingOoc.created_at, updated_at: nowRetIso, diubah_pada: nowRetIso,
           };
 
+          var revOocPut = bumpDataRevision_([{ op: 'ooc_upsert', record: updatedOocRec }]);
+
           if (lateRetMin > 0) {
-            var stuRet = dbPutOoc.students.filter(function (s) { return s.nis === existingOoc.student_id; })[0];
+            var stuRet = getStudentsFast_(ssOoc).filter(function (s) { return s.nis === existingOoc.student_id; })[0];
             if (stuRet) {
               notifyParent_({
                 student: stuRet,
                 triggerType: 'melebihi_waktu',
                 status: 'Melebihi Waktu Izin Keluar (+' + lateRetMin + ' menit)',
                 lateReturnMinutes: lateRetMin,
-              }, dbPutOoc);
+              }, getSettingsFast_(ssOoc));
             }
           }
 
-          return makeResp_(200, { success: true, record: updatedOocRec, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, {
+            success: true,
+            record: updatedOocRec,
+            serverTime: new Date().toISOString(),
+            deltaApplied: true,
+            rev: revOocPut.rev,
+            seq: revOocPut.seq,
+          });
         } finally {
           lockOocPut.releaseLock();
         }
       }
     }
 
-    // 7. /api/violations
+    // 7. /api/violations (Targeted cached reads + delta-emitting writes)
     if (pathname === '/api/violations') {
       var ssVio = getSpreadsheet_();
       if (method === 'GET') {
-        var dbVio = getFullDatabase_();
-        return makeResp_(200, { violations: dbVio.violations, types: dbVio.violation_types });
+        return makeResp_(200, { violations: getViolationsFast_(ssVio), types: getViolationTypesFast_(ssVio) });
       }
       if (method === 'POST') {
         var lockVio = LockService.getScriptLock();
         lockVio.waitLock(15000);
         try {
-          var dbVioPost = getFullDatabase_();
-          var stuV = dbVioPost.students.filter(function (s) { return s.nis === body.studentId; })[0];
+          var studentsV = getStudentsFast_(ssVio);
+          var stuV = studentsV.filter(function (s) { return s.nis === body.studentId; })[0];
           if (!stuV) return makeResp_(400, { error: 'Siswa tidak ditemukan.' });
-          var vt = dbVioPost.violation_types.filter(function (t) { return t.id === body.violationTypeId; })[0];
+          var vt = getViolationTypesFast_(ssVio).filter(function (t) { return t.id === body.violationTypeId; })[0];
           if (!vt) return makeResp_(400, { error: 'Jenis pelanggaran tidak valid.' });
 
           var evidenceId = '';
@@ -3724,26 +4471,33 @@ function dispatchRoute_(req) {
             status: 'aktif',
             diubah_pada: nowV,
           };
-          appendRows_(ssVio, SHEET_TABS.PELANGGARAN, [vioRec]);
+          appendRows_(ssVio, SHEET_TABS.PELANGGARAN, [vioRec], { skipBump: true });
           appendLog_(ssVio, {
             waktu: nowV, pengguna: recordedBy, id_data: vioRec.id, tabel: SHEET_TABS.PELANGGARAN,
             aksi: 'tambah', nilai_baru: JSON.stringify(vioRec)
           });
 
-          var studentVios = dbVioPost.violations.concat([vioRec]).filter(function (v) { return v.student_id === stuV.nis; });
+          var revVioPost = bumpDataRevision_([{ op: 'violation_upsert', record: vioRec }]);
+
+          var existingVios = getViolationsFast_(ssVio);
+          var studentVios = existingVios.filter(function (v) { return v.student_id === stuV.nis; });
+          if (!studentVios.some(function (v) { return v.id === vioRec.id; })) {
+            studentVios = studentVios.concat([vioRec]);
+          }
           var totalPoints = studentVios.reduce(function (acc, cur) {
             return acc + (cur.category === 'prestasi' ? -cur.points : cur.points);
           }, 0);
 
+          var cfgVio = getSettingsFast_(ssVio);
           notifyParent_({
             student: stuV,
             triggerType: 'pelanggaran',
             status: 'Pelanggaran: ' + vt.name,
             violationName: vt.name,
             points: vioRec.points,
-          }, dbVioPost);
+          }, cfgVio);
 
-          var threshold = (dbVioPost.notification_settings && dbVioPost.notification_settings.warning_threshold_points) || 25;
+          var threshold = (cfgVio.notification_settings && cfgVio.notification_settings.warning_threshold_points) || 25;
           if (totalPoints >= threshold && vt.category !== 'prestasi') {
             notifyParent_({
               student: stuV,
@@ -3751,10 +4505,18 @@ function dispatchRoute_(req) {
               status: 'Poin Pelanggaran Mencapai Ambang Batas SP (' + totalPoints + ' poin)',
               violationName: vt.name,
               points: totalPoints,
-            }, dbVioPost);
+            }, cfgVio);
           }
 
-          return makeResp_(200, { success: true, violation: vioRec, studentTotalPoints: totalPoints, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, {
+            success: true,
+            violation: vioRec,
+            studentTotalPoints: totalPoints,
+            serverTime: new Date().toISOString(),
+            deltaApplied: true,
+            rev: revVioPost.rev,
+            seq: revVioPost.seq,
+          });
         } finally {
           lockVio.releaseLock();
         }
@@ -3771,8 +4533,19 @@ function dispatchRoute_(req) {
             id: body.id,
             actorName: sessVDel.name || 'Admin',
             reason: body.reason || 'Koreksi pelanggaran',
+            skipBump: true,
           });
-          return makeResp_(200, { success: okVDel, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var revVDelInfo = okVDel
+            ? bumpDataRevision_([{ op: 'violation_delete', id: body.id }])
+            : getSyncMeta_();
+          return makeResp_(200, {
+            success: okVDel,
+            deletedId: body.id,
+            serverTime: new Date().toISOString(),
+            deltaApplied: true,
+            rev: revVDelInfo.rev,
+            seq: revVDelInfo.seq,
+          });
         } finally {
           lockVDel.releaseLock();
         }
@@ -3820,7 +4593,8 @@ function dispatchRoute_(req) {
             appendRows_(ssVt, SHEET_TABS.JENIS_PELANGGARAN, [cleanVt]);
             appendLog_(ssVt, { waktu: nowVt, pengguna: sessVt.name || 'Admin', id_data: cleanVt.id, tabel: SHEET_TABS.JENIS_PELANGGARAN, aksi: 'tambah', nilai_baru: JSON.stringify(cleanVt) });
           }
-          return makeResp_(200, { success: true, violationType: cleanVt, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var vtPostMeta = getSyncMeta_();
+          return makeResp_(200, { success: true, violationType: cleanVt, serverTime: new Date().toISOString(), rev: vtPostMeta.rev, seq: vtPostMeta.seq, snapshot: buildDatabasePayload_() });
         } finally {
           lockVt.releaseLock();
         }
@@ -3830,7 +4604,8 @@ function dispatchRoute_(req) {
         lockVtDel.waitLock(15000);
         try {
           softDeleteRow_(ssVt, { tabName: SHEET_TABS.JENIS_PELANGGARAN, id: body.id, actorName: sessVt.name || 'Admin', reason: 'Hapus jenis pelanggaran' });
-          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var vtDelMeta = getSyncMeta_();
+          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), rev: vtDelMeta.rev, seq: vtDelMeta.seq, snapshot: buildDatabasePayload_() });
         } finally {
           lockVtDel.releaseLock();
         }
@@ -3983,9 +4758,11 @@ function dispatchRoute_(req) {
               });
             }
             var skipSnapshotFlag = parseBool_(body.skipSnapshot, false);
+            var batchStuMeta = getSyncMeta_();
             var batchRespPayload = {
               success: true,
-              rev: getDataRevision_(),
+              rev: batchStuMeta.rev,
+              seq: batchStuMeta.seq,
               inserted: toAppendStu.length,
               updated: updatedStu,
               classesCreated: newClassesArr.length,
@@ -4026,7 +4803,8 @@ function dispatchRoute_(req) {
             appendRows_(ssStu, SHEET_TABS.SISWA, [stuPayload]);
             appendLog_(ssStu, { waktu: nowStu, pengguna: actorStu, id_data: nisClean, tabel: SHEET_TABS.SISWA, aksi: 'tambah', nilai_baru: JSON.stringify(stuPayload) });
           }
-          return makeResp_(200, { success: true, student: stuPayload, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var stuPostMeta = getSyncMeta_();
+          return makeResp_(200, { success: true, student: stuPayload, serverTime: new Date().toISOString(), rev: stuPostMeta.rev, seq: stuPostMeta.seq, snapshot: buildDatabasePayload_() });
         } finally {
           lockStu.releaseLock();
         }
@@ -4042,7 +4820,8 @@ function dispatchRoute_(req) {
               actorName: actorStu,
               reason: 'Kosongkan data siswa',
             });
-            return makeResp_(200, { success: true, count: clearedCount, message: clearedCount + ' data siswa berhasil dihapus.', serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+            var clrStuMeta = getSyncMeta_();
+            return makeResp_(200, { success: true, count: clearedCount, message: clearedCount + ' data siswa berhasil dihapus.', serverTime: new Date().toISOString(), rev: clrStuMeta.rev, seq: clrStuMeta.seq, snapshot: buildDatabasePayload_() });
           }
           if (Array.isArray(body.nisses) && body.nisses.length > 0) {
             var nissSet = {};
@@ -4053,11 +4832,13 @@ function dispatchRoute_(req) {
               actorName: actorStu,
               reason: 'Hapus siswa',
             });
-            return makeResp_(200, { success: true, count: cDel, message: cDel + ' siswa berhasil dihapus.', serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+            var mDelStuMeta = getSyncMeta_();
+            return makeResp_(200, { success: true, count: cDel, message: cDel + ' siswa berhasil dihapus.', serverTime: new Date().toISOString(), rev: mDelStuMeta.rev, seq: mDelStuMeta.seq, snapshot: buildDatabasePayload_() });
           }
           if (body.nis) {
             var okStu = softDeleteRow_(ssStu, { tabName: SHEET_TABS.SISWA, id: body.nis, actorName: actorStu, reason: 'Hapus siswa' });
-            return makeResp_(200, { success: okStu, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+            var sDelStuMeta = getSyncMeta_();
+            return makeResp_(200, { success: okStu, serverTime: new Date().toISOString(), rev: sDelStuMeta.rev, seq: sDelStuMeta.seq, snapshot: buildDatabasePayload_() });
           }
           return makeResp_(400, { error: 'Parameter nis, nisses, atau action diperlukan.' });
         } finally {
@@ -4110,7 +4891,8 @@ function dispatchRoute_(req) {
             if (cleanCls.homeroom_teacher_email && hrU.email !== cleanCls.homeroom_teacher_email) { hrU.email = cleanCls.homeroom_teacher_email; changedHr = true; }
             if (changedHr) saveUser_(ssCls, hrU, actorCls);
           }
-          return makeResp_(200, { success: true, class: cleanCls, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var clsPostMeta = getSyncMeta_();
+          return makeResp_(200, { success: true, class: cleanCls, serverTime: new Date().toISOString(), rev: clsPostMeta.rev, seq: clsPostMeta.seq, snapshot: buildDatabasePayload_() });
         } finally {
           lockCls.releaseLock();
         }
@@ -4121,7 +4903,8 @@ function dispatchRoute_(req) {
         lockClsDel.waitLock(15000);
         try {
           if (delId) softDeleteRow_(ssCls, { tabName: SHEET_TABS.KELAS, id: delId, actorName: actorCls, reason: 'Hapus kelas' });
-          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var clsDelMeta = getSyncMeta_();
+          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), rev: clsDelMeta.rev, seq: clsDelMeta.seq, snapshot: buildDatabasePayload_() });
         } finally {
           lockClsDel.releaseLock();
         }
@@ -4165,8 +4948,12 @@ function dispatchRoute_(req) {
             appendRows_(ssSess, SHEET_TABS.SESI_PRESENSI, [cleanSess]);
             appendLog_(ssSess, { waktu: nowSess, pengguna: actorSess, id_data: cleanSess.id, tabel: SHEET_TABS.SESI_PRESENSI, aksi: 'tambah', nilai_baru: JSON.stringify(cleanSess) });
           }
+          try {
+            ensureSessionAttendanceSheets_(ssSess);
+          } catch (eTabSess) {}
           cleanSess.active_days = parseJsonArray_(cleanSess.active_days, [1, 2, 3, 4, 5, 6]);
-          return makeResp_(200, { success: true, session: cleanSess, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var sessPostMeta = getSyncMeta_();
+          return makeResp_(200, { success: true, session: cleanSess, serverTime: new Date().toISOString(), rev: sessPostMeta.rev, seq: sessPostMeta.seq, snapshot: buildDatabasePayload_() });
         } finally {
           lockSess.releaseLock();
         }
@@ -4177,7 +4964,8 @@ function dispatchRoute_(req) {
         lockSessDel.waitLock(15000);
         try {
           if (delSessId) softDeleteRow_(ssSess, { tabName: SHEET_TABS.SESI_PRESENSI, id: delSessId, actorName: actorSess, reason: 'Hapus sesi presensi' });
-          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var sessDelMeta = getSyncMeta_();
+          return makeResp_(200, { success: true, serverTime: new Date().toISOString(), rev: sessDelMeta.rev, seq: sessDelMeta.seq, snapshot: buildDatabasePayload_() });
         } finally {
           lockSessDel.releaseLock();
         }
@@ -4201,7 +4989,8 @@ function dispatchRoute_(req) {
         }
         var resSet = updateSettings_(patchSet, sessSet.name || 'Admin');
         if (resSet.conflict) return makeResp_(409, { error: 'Konflik pengaturan.', conflict: true, current: resSet.current });
-        return makeResp_(200, { success: true, settings: resSet.settings, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+        var setMeta = getSyncMeta_();
+        return makeResp_(200, { success: true, settings: resSet.settings, serverTime: new Date().toISOString(), rev: setMeta.rev, seq: setMeta.seq, snapshot: buildDatabasePayload_() });
       } finally {
         lockSet.releaseLock();
       }
@@ -4240,16 +5029,17 @@ function dispatchRoute_(req) {
       try {
         var updNotif = updateNotificationSettings_(body, actorN);
         if (updNotif.conflict) return makeResp_(409, { error: 'Konflik pengaturan notifikasi.', conflict: true, current: updNotif.current });
-        return makeResp_(200, { success: true, settings: updNotif.settings, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+        var notifMeta = getSyncMeta_();
+        return makeResp_(200, { success: true, settings: updNotif.settings, serverTime: new Date().toISOString(), rev: notifMeta.rev, seq: notifMeta.seq, snapshot: buildDatabasePayload_() });
       } finally {
         lockNotif.releaseLock();
       }
     }
 
-    // 14. /api/leave-requests
+    // 14. /api/leave-requests (Targeted cached reads + delta-emitting writes)
     if (pathname === '/api/leave-requests') {
       var ssLr = getSpreadsheet_();
-      if (method === 'GET') return makeResp_(200, { requests: getFullDatabase_().leave_requests });
+      if (method === 'GET') return makeResp_(200, { requests: getLeaveRequestsFast_(ssLr) });
       if (method === 'POST') {
         var lockLrP = LockService.getScriptLock();
         lockLrP.waitLock(15000);
@@ -4270,9 +5060,18 @@ function dispatchRoute_(req) {
             rejection_reason: '',
             created_at: nowLr, updated_at: nowLr, status: 'aktif', diubah_pada: nowLr,
           };
-          appendRows_(ssLr, SHEET_TABS.IZIN_TIDAK_MASUK, [lrRow]);
+          appendRows_(ssLr, SHEET_TABS.IZIN_TIDAK_MASUK, [lrRow], { skipBump: true });
           appendLog_(ssLr, { waktu: nowLr, pengguna: 'Pengaju Izin', id_data: lrRow.id, tabel: SHEET_TABS.IZIN_TIDAK_MASUK, aksi: 'tambah', nilai_baru: JSON.stringify(lrRow) });
-          return makeResp_(200, { success: true, request: lrRow, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          var mappedLrPost = mapLeaveRequestRow_(lrRow, nowLr);
+          var revLrPost = bumpDataRevision_([{ op: 'leave_upsert', record: mappedLrPost }]);
+          return makeResp_(200, {
+            success: true,
+            request: mappedLrPost,
+            serverTime: new Date().toISOString(),
+            deltaApplied: true,
+            rev: revLrPost.rev,
+            seq: revLrPost.seq,
+          });
         } finally {
           lockLrP.releaseLock();
         }
@@ -4284,8 +5083,7 @@ function dispatchRoute_(req) {
         var lockLrPut = LockService.getScriptLock();
         lockLrPut.waitLock(15000);
         try {
-          var dbLr = getFullDatabase_();
-          var exLr = dbLr.leave_requests.filter(function (r) { return r.id === body.id; })[0];
+          var exLr = getLeaveRequestsFast_(ssLr).filter(function (r) { return r.id === body.id; })[0];
           if (!exLr) return makeResp_(404, { error: 'Pengajuan izin tidak ditemukan.' });
           var nowLrU = new Date().toISOString();
           var patchLr = {
@@ -4300,18 +5098,28 @@ function dispatchRoute_(req) {
             tabName: SHEET_TABS.IZIN_TIDAK_MASUK, id: body.id, newRowObj: patchLr,
             expectedUpdatedAt: body.expected_updated_at, forceOverwrite: Boolean(body.forceOverwrite),
             actorName: sessLr.name || 'Wali Kelas', reason: 'Status izin: ' + body.status,
+            skipBump: true,
           });
           if (updLr.conflict) return makeResp_(409, { error: 'Konflik persetujuan izin.', conflict: true, current: updLr.current });
+          var mappedLrPut = mapLeaveRequestRow_(updLr.newObj || updLr.oldObj, nowLrU);
+          var revLrPut = bumpDataRevision_([{ op: 'leave_upsert', record: mappedLrPut }]);
           if (body.status === 'approved') {
-            var stuLr = dbLr.students.filter(function (s) { return s.nis === exLr.student_id; })[0];
+            var stuLr = getStudentsFast_(ssLr).filter(function (s) { return s.nis === exLr.student_id; })[0];
             if (stuLr) {
               notifyParent_({
                 student: stuLr, triggerType: 'izin_sakit',
                 status: 'Izin / Sakit Disetujui (' + exLr.type + ': ' + exLr.start_date + ' s/d ' + exLr.end_date + ')',
-              }, dbLr);
+              }, getSettingsFast_(ssLr));
             }
           }
-          return makeResp_(200, { success: true, request: updLr.oldObj, serverTime: new Date().toISOString(), rev: getDataRevision_(), snapshot: buildDatabasePayload_() });
+          return makeResp_(200, {
+            success: true,
+            request: mappedLrPut,
+            serverTime: new Date().toISOString(),
+            deltaApplied: true,
+            rev: revLrPut.rev,
+            seq: revLrPut.seq,
+          });
         } finally {
           lockLrPut.releaseLock();
         }

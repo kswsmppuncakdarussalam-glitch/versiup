@@ -59,6 +59,7 @@ export interface OfflineAttendanceScan {
   notes?: string;
   method?: string;
   manualOverride?: boolean;
+  upsert?: boolean;
   photoBase64?: string;
   photoFileName?: string;
   queuedAt: string;
@@ -67,9 +68,11 @@ export interface OfflineAttendanceScan {
 const OFFLINE_SCANS_KEY = 'dkb_offline_attendance_scans';
 const DB_CACHE_KEY = 'dkb_db_cache_v1';
 const SYNC_BROADCAST_CHANNEL = 'dkb_sync_channel';
-const REALTIME_SYNC_COOLDOWN_MS = 350;
+const REALTIME_SYNC_COOLDOWN_MS = 120;
+const REALTIME_BURST_COOLDOWN_MS = 60;
 const FULL_RECONCILE_INTERVAL_MS = 15000;
-const SCAN_BATCH_WINDOW_MS = 3000;
+const SCAN_IDLE_FLUSH_MS = 280;
+const SCAN_MAX_BATCH_WAIT_MS = 3000;
 
 export interface EnvConfigStatus {
   configured: boolean;
@@ -183,6 +186,7 @@ interface AppContextType {
     error?: string;
     isDuplicate?: boolean;
     offlineQueued?: boolean;
+    syncedFromExisting?: boolean;
   }>;
   updateAttendance: (id: string, updates: Partial<AttendanceRecord>, reason: string) => Promise<boolean>;
   deleteAttendance: (id: string, reason: string) => Promise<boolean>;
@@ -319,6 +323,7 @@ function writeOfflineScans(list: OfflineAttendanceScan[]): void {
 
 interface CachedDbPayload {
   rev?: string;
+  seq?: number;
   serverTime?: string;
   data?: Record<string, any>;
 }
@@ -354,31 +359,13 @@ function writeLocalDbCache(payload: CachedDbPayload): void {
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [session, setSession] = useState<AuthSession | null>(() => {
     try {
-      const saved = localStorage.getItem('dkb_session');
-      return saved ? JSON.parse(saved) : null;
-    } catch {
-      return null;
-    }
+      localStorage.removeItem('dkb_session');
+      localStorage.removeItem('dkb_active_tab');
+    } catch {}
+    return null;
   });
 
-  const [activeTab, setActiveTabState] = useState<ActiveTab>(() => {
-    try {
-      const savedTab = localStorage.getItem('dkb_active_tab') as ActiveTab | null;
-      const savedSessionRaw = localStorage.getItem('dkb_session');
-      const savedSession: AuthSession | null = savedSessionRaw ? JSON.parse(savedSessionRaw) : null;
-      if (
-        savedTab &&
-        savedTab !== 'system_check' &&
-        ['dashboard', 'attendance', 'out_of_class', 'violations', 'homeroom', 'student_affairs', 'admin'].includes(savedTab)
-      ) {
-        if (['homeroom', 'student_affairs', 'admin'].includes(savedTab) && savedSession?.lockedMenuRole !== savedTab) {
-          return 'attendance';
-        }
-        return savedTab;
-      }
-    } catch {}
-    return 'attendance';
-  });
+  const [activeTab, setActiveTabState] = useState<ActiveTab>('attendance');
 
   const setActiveTab = useCallback((newTab: ActiveTab) => {
     try {
@@ -453,6 +440,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   } | null>(null);
   const prevLiveSessionIdRef = useRef<string | null>(null);
   const prevLiveSessionNameRef = useRef<string | null>(null);
+  const pendingAdminSetupPasswordRef = useRef<string | null>(null);
 
   // Domain States (Hydrated synchronously from local snapshot cache, reconciled with Google Sheets)
   const [settings, setSettings] = useState<AppSettings>(() =>
@@ -503,6 +491,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const latestModifiedByEntityKeyRef = useRef<Record<string, string>>({});
   const hasHydratedConfigRef = useRef<boolean>(false);
   const lastKnownRevRef = useRef<string>(String(initialDbCacheRef.current?.rev || ''));
+  const lastKnownSeqRef = useRef<number>(Number(initialDbCacheRef.current?.seq || 0));
+  const burstSyncNextRef = useRef<boolean>(false);
   const lastFullSyncAtRef = useRef<number>(0);
   const consecutiveSyncErrorsRef = useRef<number>(0);
   const inFlightOptimisticIdsRef = useRef<Set<string>>(new Set());
@@ -516,6 +506,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       type:
         | 'DATA_MUTATED'
         | 'DATA_SNAPSHOT'
+        | 'DATA_DELTA'
         | 'DATA_OPTIMISTIC_ATTENDANCE'
         | 'DATA_OPTIMISTIC_OUT_OF_CLASS'
         | 'DATA_OPTIMISTIC_VIOLATION'
@@ -534,7 +525,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     []
   );
 
-  // 3-second batch scan collector for consecutive scans
+  // Smart scan batch collector: flush at 280ms idle for sub-second speed, or max 3s during rapid bursts
   interface BatchItem {
     params: OfflineAttendanceScan;
     optimisticId?: string;
@@ -543,6 +534,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }
   const scanBatchQueueRef = useRef<BatchItem[]>([]);
   const scanBatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scanBatchMaxTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -630,7 +622,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (Array.isArray(data?.missingConfig)) {
           setMissingEnv(data.missingConfig);
         }
-        showToast(msg, 'error');
+        if (sessionRef.current?.lockedMenuRole === 'admin') {
+          showToast(msg, 'error');
+        }
         return true;
       }
       return false;
@@ -652,13 +646,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const applyDatabaseSnapshot = useCallback((d: any, serverTime?: string, rev?: string) => {
+  const applyDatabaseSnapshot = useCallback((d: any, serverTime?: string, rev?: string, seq?: number) => {
     if (serverTime) {
       setServerClockOffset(serverTime);
       setCurrentServerTime(getServerNow());
     }
     if (rev) {
       lastKnownRevRef.current = String(rev);
+    }
+    if (typeof seq === 'number' && seq > 0) {
+      lastKnownSeqRef.current = seq;
     }
     if (!d || typeof d !== 'object') return;
     if (Array.isArray(d.students)) setStudents(d.students);
@@ -701,8 +698,127 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (Array.isArray(d.audit_logs)) setAuditLogs(d.audit_logs);
     setLastSyncTime(new Date());
     setSyncStatus('synced');
-    writeLocalDbCache({ rev: rev || lastKnownRevRef.current, serverTime, data: d });
+    writeLocalDbCache({
+      rev: rev || lastKnownRevRef.current,
+      seq: typeof seq === 'number' && seq > 0 ? seq : lastKnownSeqRef.current,
+      serverTime,
+      data: d,
+    });
   }, []);
+
+  const applyDeltaEvents = useCallback(
+    (events: any[], serverTime?: string, rev?: string, seq?: number) => {
+      if (serverTime) {
+        setServerClockOffset(serverTime);
+        setCurrentServerTime(getServerNow());
+      }
+      if (rev) {
+        lastKnownRevRef.current = String(rev);
+      }
+      if (typeof seq === 'number' && seq > 0) {
+        lastKnownSeqRef.current = seq;
+      }
+      if (!Array.isArray(events) || events.length === 0) return;
+
+      const attUpserts: AttendanceRecord[] = [];
+      const attDeletes = new Set<string>();
+      const oocUpserts: OutOfClassRecord[] = [];
+      const vioUpserts: ViolationRecord[] = [];
+      const vioDeletes = new Set<string>();
+      const lrUpserts: LeaveRequest[] = [];
+
+      for (const ev of events) {
+        if (!ev || !ev.op) continue;
+        if (ev.op === 'attendance_upsert' && ev.record) attUpserts.push(ev.record);
+        else if (ev.op === 'attendance_delete' && ev.id) attDeletes.add(String(ev.id));
+        else if (ev.op === 'ooc_upsert' && ev.record) oocUpserts.push(ev.record);
+        else if (ev.op === 'violation_upsert' && ev.record) vioUpserts.push(ev.record);
+        else if (ev.op === 'violation_delete' && ev.id) vioDeletes.add(String(ev.id));
+        else if (ev.op === 'leave_upsert' && ev.record) lrUpserts.push(ev.record);
+      }
+
+      if (attUpserts.length > 0 || attDeletes.size > 0) {
+        setAttendance((prev) => {
+          let next = prev.filter((item) => !attDeletes.has(item.id));
+          for (const rec of attUpserts) {
+            next = [
+              rec,
+              ...next.filter(
+                (p) =>
+                  p.id !== rec.id &&
+                  !(
+                    p.id.startsWith('opt_') &&
+                    p.student_id === rec.student_id &&
+                    p.session_id === rec.session_id &&
+                    p.date === rec.date
+                  )
+              ),
+            ];
+          }
+          return next;
+        });
+      }
+
+      if (oocUpserts.length > 0) {
+        setOutOfClass((prev) => {
+          let next = prev;
+          for (const rec of oocUpserts) {
+            next = [
+              rec,
+              ...next.filter(
+                (p) =>
+                  p.id !== rec.id &&
+                  !(
+                    p.id.startsWith('opt_') &&
+                    p.student_id === rec.student_id &&
+                    p.status === 'active'
+                  )
+              ),
+            ];
+          }
+          return next;
+        });
+      }
+
+      if (vioUpserts.length > 0 || vioDeletes.size > 0) {
+        setViolations((prev) => {
+          let next = prev.filter((item) => !vioDeletes.has(item.id));
+          for (const rec of vioUpserts) {
+            next = [
+              rec,
+              ...next.filter(
+                (p) =>
+                  p.id !== rec.id &&
+                  !(
+                    p.id.startsWith('opt_') &&
+                    p.student_id === rec.student_id &&
+                    p.violation_type_id === rec.violation_type_id
+                  )
+              ),
+            ];
+          }
+          return next;
+        });
+      }
+
+      if (lrUpserts.length > 0) {
+        setLeaveRequests((prev) => {
+          let next = prev;
+          for (const rec of lrUpserts) {
+            const exists = next.some((p) => p.id === rec.id);
+            next = exists
+              ? next.map((p) => (p.id === rec.id ? { ...p, ...rec } : p))
+              : [rec, ...next];
+          }
+          return next;
+        });
+      }
+
+      setLastSyncTime(new Date());
+      setSyncStatus('synced');
+    },
+    []
+  );
 
   const clearExpiredAppSession = useCallback(
     (message = 'Sesi login telah berakhir atau sandi diubah. Silakan masuk kembali.') => {
@@ -953,13 +1069,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           nowMs - lastFullSyncAtRef.current >= FULL_RECONCILE_INTERVAL_MS;
         const needsFullReconcile =
           Boolean(options?.forceFull) ||
-          Boolean(options?.afterWrite) ||
           !lastKnownRevRef.current ||
           isPeriodicReconcile;
 
         const syncParams = new URLSearchParams();
         if (!needsFullReconcile && lastKnownRevRef.current) {
           syncParams.set('rev', lastKnownRevRef.current);
+          if (lastKnownSeqRef.current > 0) {
+            syncParams.set('seq', String(lastKnownSeqRef.current));
+          }
         } else {
           syncParams.set('full', '1');
           if (isPeriodicReconcile) {
@@ -1037,8 +1155,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (data.rev) {
           lastKnownRevRef.current = String(data.rev);
         }
+        if (typeof data.seq === 'number' && data.seq > 0) {
+          lastKnownSeqRef.current = data.seq;
+        }
 
         if (data.unchanged) {
+          burstSyncNextRef.current = false;
           if (data.serverTime) {
             setServerClockOffset(data.serverTime);
             setCurrentServerTime(getServerNow());
@@ -1048,6 +1170,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           return;
         }
 
+        if (data.delta && Array.isArray(data.events)) {
+          burstSyncNextRef.current = true;
+          setEnvStatus((prev) => ({
+            ...prev,
+            configured: Boolean(data.configured),
+            sheetsConfigured: Boolean(data.sheetsConfigured),
+            driveConfigured: Boolean(data.driveConfigured),
+            spreadsheetConfigured: Boolean(data.spreadsheetConfigured),
+            driveFolderConfigured: Boolean(data.driveFolderConfigured),
+            authMode: 'apps_script',
+            emailConnected: Boolean(data.emailConnected),
+            emailTransport: data.emailTransport || 'apps_script_gmail',
+            missingEnv: missingList,
+          }));
+          applyDeltaEvents(data.events, data.serverTime, data.rev, data.seq);
+          broadcastSyncEvent('DATA_DELTA', {
+            events: data.events,
+            serverTime: data.serverTime,
+            rev: data.rev,
+            seq: data.seq,
+          });
+          return;
+        }
+
+        burstSyncNextRef.current = false;
         lastFullSyncAtRef.current = nowMs;
 
         setEnvStatus({
@@ -1064,11 +1211,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
 
         if (data.data) {
-          applyDatabaseSnapshot(data.data, data.serverTime, data.rev);
+          applyDatabaseSnapshot(data.data, data.serverTime, data.rev, data.seq);
           broadcastSyncEvent('DATA_SNAPSHOT', {
             snapshot: data.data,
             serverTime: data.serverTime,
             rev: data.rev,
+            seq: data.seq,
           });
         } else {
           if (data.serverTime) {
@@ -1089,12 +1237,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setIsInitialLoading(false);
         if (pendingRefreshAfterWriteRef.current) {
           pendingRefreshAfterWriteRef.current = false;
-          void refreshFromSheets(true, { forceFull: true });
+          void refreshFromSheets(true);
         }
       }
     },
     [
       applyDatabaseSnapshot,
+      applyDeltaEvents,
       broadcastSyncEvent,
       buildApiHeaders,
       handleAppsScriptUnauthorized,
@@ -1125,7 +1274,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setMissingEnv(missingList);
 
         if (result.data?.data) {
-          applyDatabaseSnapshot(result.data.data, result.data.serverTime, result.data.rev);
+          applyDatabaseSnapshot(result.data.data, result.data.serverTime, result.data.rev, result.data.seq);
           lastFullSyncAtRef.current = Date.now();
           setEnvStatus({
             configured: Boolean(result.data.configured ?? true),
@@ -1148,6 +1297,44 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (activeAppToken) {
           const refreshed = await refreshAuthSessionIfNeeded(true);
           activeAppToken = refreshed || '';
+        } else if (sessionRef.current?.lockedMenuRole === 'admin') {
+          try {
+            const setupPw = pendingAdminSetupPasswordRef.current || 'admin123';
+            const authRes = await apiFetch('/api/auth?action=unlock_admin', {
+              method: 'POST',
+              headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
+              body: JSON.stringify({ password: setupPw }),
+            });
+            const authData = await authRes.json().catch(() => ({}));
+            pendingAdminSetupPasswordRef.current = null;
+            if (authRes.ok && authData.token) {
+              const payload = decodeJwtPayload(authData.token);
+              const upgradedSess: AuthSession = {
+                token: authData.token,
+                userId: payload.userId || 'user_admin_main',
+                role: 'admin',
+                name: payload.name || 'Administrator Sekolah',
+                label: payload.label || 'Admin Sistem',
+                tokenVersion: payload.tokenVersion || 1,
+                lockedMenuRole: 'admin',
+              };
+              sessionRef.current = upgradedSess;
+              setSession(upgradedSess);
+              localStorage.setItem('dkb_session', JSON.stringify(upgradedSess));
+              activeAppToken = authData.token;
+            } else {
+              sessionRef.current = null;
+              setSession(null);
+              localStorage.removeItem('dkb_session');
+              localStorage.removeItem('dkb_active_tab');
+              setActiveTabState('attendance');
+              showToast(
+                'Apps Script berhasil diaktifkan & dikunci! Silakan masuk sebagai Admin dengan password sekolah Anda.',
+                'info'
+              );
+              return { ok: true, message: result.message };
+            }
+          } catch {}
         }
 
         if (activeAppToken) {
@@ -1212,60 +1399,93 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (queued.length === 0) return;
 
     setSavingState();
-    try {
-      const sendQueued = async (tokOverride?: string) => {
-        const res = await apiFetch('/api/attendance', {
-          method: 'POST',
-          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, tokOverride),
-          body: JSON.stringify({ scans: queued }),
-        });
-        const data = await res.json().catch(() => ({}));
-        return { res, data };
-      };
+    pendingWriteCountRef.current += 1;
+    writeQueueRef.current = writeQueueRef.current
+      .catch(() => {})
+      .then(async () => {
+        const latestQueued = readOfflineScans();
+        if (latestQueued.length === 0) {
+          setPendingOfflineScansCount(0);
+          return;
+        }
+        try {
+          const sendQueued = async (tokOverride?: string) => {
+            const res = await apiFetch('/api/attendance', {
+              method: 'POST',
+              headers: buildApiHeaders({ 'Content-Type': 'application/json' }, tokOverride),
+              body: JSON.stringify({ scans: latestQueued }),
+            });
+            const data = await res.json().catch(() => ({}));
+            return { res, data };
+          };
 
-      let { res, data } = await sendQueued();
-      if (handleAppsScriptUnauthorized(res.status, data)) {
-        return;
-      }
-      if (res.status === 401 && sessionRef.current?.token) {
-        const refreshedTok = await refreshAuthSessionIfNeeded(true);
-        if (refreshedTok) {
-          const retried = await sendQueued(refreshedTok);
-          res = retried.res;
-          data = retried.data;
-        }
-      }
+          let { res, data } = await sendQueued();
+          if (handleAppsScriptUnauthorized(res.status, data)) {
+            return;
+          }
+          if (res.status === 401 && sessionRef.current?.token) {
+            const refreshedTok = await refreshAuthSessionIfNeeded(true);
+            if (refreshedTok) {
+              const retried = await sendQueued(refreshedTok);
+              res = retried.res;
+              data = retried.data;
+            }
+          }
 
-      if (res.ok) {
-        writeOfflineScans([]);
-        setPendingOfflineScansCount(0);
-        setSavedState('Tersimpan');
-        if (data.rejectedCount > 0) {
-          showToast(`${data.savedCount} scan offline terkirim, ${data.rejectedCount} duplikat ditolak.`, 'info');
-        } else {
-          showToast(`${queued.length} data presensi offline berhasil disinkronkan ke Google Sheets.`, 'success');
+          if (res.ok) {
+            writeOfflineScans([]);
+            setPendingOfflineScansCount(0);
+            setSavedState('Tersimpan');
+            if (data.rejectedCount > 0) {
+              showToast(`${data.savedCount} scan offline terkirim, ${data.rejectedCount} duplikat ditolak.`, 'info');
+            } else {
+              showToast(`${latestQueued.length} data presensi offline berhasil disinkronkan ke Google Sheets.`, 'success');
+            }
+            if (data.rev) {
+              lastKnownRevRef.current = String(data.rev);
+            }
+            if (typeof data.seq === 'number' && data.seq > 0) {
+              lastKnownSeqRef.current = data.seq;
+            }
+            if (data.snapshot) {
+              applyDatabaseSnapshot(data.snapshot, data.serverTime, data.rev, data.seq);
+              broadcastSyncEvent('DATA_SNAPSHOT', {
+                snapshot: data.snapshot,
+                serverTime: data.serverTime,
+                rev: data.rev,
+                seq: data.seq,
+              });
+            } else if (data.deltaApplied) {
+              const savedOff = Array.isArray(data.results) ? data.results.map((r: any) => ({ op: 'attendance_upsert', record: r.record })) : [];
+              if (savedOff.length > 0) {
+                applyDeltaEvents(savedOff, data.serverTime, data.rev, data.seq);
+                broadcastSyncEvent('DATA_DELTA', {
+                  events: savedOff,
+                  serverTime: data.serverTime,
+                  rev: data.rev,
+                  seq: data.seq,
+                });
+              }
+            } else {
+              await refreshFromSheets(true, { afterWrite: true });
+              broadcastSyncEvent('DATA_MUTATED');
+            }
+          } else if (res.status < 500 && res.status !== 429 && res.status !== 401) {
+            writeOfflineScans([]);
+            setPendingOfflineScansCount(0);
+            setSaveErrorState(data.error || 'Gagal mengirim scan offline.');
+          }
+        } catch {
+          setSyncStatus('offline');
         }
-        if (data.snapshot) {
-          applyDatabaseSnapshot(data.snapshot, data.serverTime, data.rev);
-          broadcastSyncEvent('DATA_SNAPSHOT', {
-            snapshot: data.snapshot,
-            serverTime: data.serverTime,
-            rev: data.rev,
-          });
-        } else {
-          await refreshFromSheets(true, { afterWrite: true, forceFull: true });
-          broadcastSyncEvent('DATA_MUTATED');
-        }
-      } else if (res.status < 500 && res.status !== 429 && res.status !== 401) {
-        writeOfflineScans([]);
-        setPendingOfflineScansCount(0);
-        setSaveErrorState(data.error || 'Gagal mengirim scan offline.');
-      }
-    } catch {
-      setSyncStatus('offline');
-    }
+      })
+      .finally(() => {
+        pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1);
+      });
+    await writeQueueRef.current;
   }, [
     applyDatabaseSnapshot,
+    applyDeltaEvents,
     buildApiHeaders,
     broadcastSyncEvent,
     handleAppsScriptUnauthorized,
@@ -1277,7 +1497,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     showToast,
   ]);
 
-  // Muat awal + verifikasi sesi + sinkronisasi otomatis real-time (cooldown 350ms + lintas-tab <1ms + saat tab aktif)
+  // Muat awal + verifikasi sesi + sinkronisasi otomatis sub-detik (120ms/60ms delta + lintas-tab <1ms + saat tab aktif)
   useEffect(() => {
     let cancelled = false;
     let syncLoopTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1288,7 +1508,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const errCount = consecutiveSyncErrorsRef.current;
       const delay =
         errCount === 0
-          ? REALTIME_SYNC_COOLDOWN_MS
+          ? (burstSyncNextRef.current ? REALTIME_BURST_COOLDOWN_MS : REALTIME_SYNC_COOLDOWN_MS)
           : Math.min(8000, 1500 * Math.pow(2, errCount - 1));
 
       syncLoopTimer = setTimeout(async () => {
@@ -1328,7 +1548,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             setIsAppsScriptLockedState(isAppsScriptConfigLocked());
             void refreshFromSheets(true, { afterWrite: true, forceFull: true });
           } else if (msg.type === 'DATA_SNAPSHOT' && msg.payload?.snapshot) {
-            applyDatabaseSnapshot(msg.payload.snapshot, msg.payload.serverTime, msg.payload.rev);
+            applyDatabaseSnapshot(msg.payload.snapshot, msg.payload.serverTime, msg.payload.rev, msg.payload.seq);
+          } else if (msg.type === 'DATA_DELTA' && Array.isArray(msg.payload?.events)) {
+            applyDeltaEvents(msg.payload.events, msg.payload.serverTime, msg.payload.rev, msg.payload.seq);
           } else if (msg.type === 'DATA_OPTIMISTIC_ATTENDANCE' && msg.payload?.record) {
             const optRec = msg.payload.record as AttendanceRecord;
             setAttendance((prev) =>
@@ -1345,7 +1567,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               prev.some((v) => v.id === optVio.id) ? prev : [optVio, ...prev]
             );
           } else if (msg.type === 'DATA_MUTATED') {
-            void refreshFromSheets(true, { afterWrite: true, forceFull: true });
+            void refreshFromSheets(true, { afterWrite: true });
           }
         };
       }
@@ -1364,7 +1586,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     const handleVisibilityOrFocus = () => {
       if (document.visibilityState === 'visible') {
-        void refreshFromSheets(true, { forceFull: true });
+        void refreshFromSheets(true);
         void flushOfflineAttendanceScans();
       }
     };
@@ -1373,7 +1595,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       consecutiveSyncErrorsRef.current = 0;
       setSyncStatus('syncing');
       void flushOfflineAttendanceScans();
-      void refreshFromSheets(true, { afterWrite: true, forceFull: true });
+      void refreshFromSheets(true, { afterWrite: true });
     };
 
     const handleOffline = () => {
@@ -1417,17 +1639,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [
     applyDatabaseSnapshot,
+    applyDeltaEvents,
     refreshFromSheets,
     flushOfflineAttendanceScans,
     handleAppsScriptUnauthorized,
     refreshAuthSessionIfNeeded,
   ]);
 
-  // Flush the 3-second batch of scans to POST /api/attendance
+  // Flush batch of scans to POST /api/attendance
   const flushScanBatch = useCallback(async () => {
     if (scanBatchTimerRef.current) {
       clearTimeout(scanBatchTimerRef.current);
       scanBatchTimerRef.current = null;
+    }
+    if (scanBatchMaxTimerRef.current) {
+      clearTimeout(scanBatchMaxTimerRef.current);
+      scanBatchMaxTimerRef.current = null;
     }
 
     const items = scanBatchQueueRef.current.splice(0, scanBatchQueueRef.current.length);
@@ -1442,192 +1669,230 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setSavingState();
 
+    pendingWriteCountRef.current += 1;
     try {
-      const sendBatch = async (tokOverride?: string) => {
-        const res = await apiFetch('/api/attendance', {
-          method: 'POST',
-          headers: buildApiHeaders({ 'Content-Type': 'application/json' }, tokOverride),
-          body: JSON.stringify({
-            scans: items.map((it) => it.params),
-          }),
-        });
-        const data = await res.json().catch(() => ({}));
-        return { res, data };
-      };
+      await (writeQueueRef.current = writeQueueRef.current
+        .catch(() => {})
+        .then(async () => {
+          try {
+            const sendBatch = async (tokOverride?: string) => {
+              const res = await apiFetch('/api/attendance', {
+                method: 'POST',
+                headers: buildApiHeaders({ 'Content-Type': 'application/json' }, tokOverride),
+                body: JSON.stringify({
+                  scans: items.map((it) => it.params),
+                }),
+              });
+              const data = await res.json().catch(() => ({}));
+              return { res, data };
+            };
 
-      let { res, data } = await sendBatch();
-      if (handleAppsScriptUnauthorized(res.status, data)) {
-        const msg = data.error || 'Token rahasia Apps Script ditolak.';
-        clearInFlightOptimistic();
-        if (batchOptimisticIds.length > 0) {
-          setAttendance((prev) => prev.filter((a) => !batchOptimisticIds.includes(a.id)));
-        }
-        setSaveErrorState(msg);
-        items.forEach((it) => it.resolve?.({ success: false, error: msg }));
-        return;
+            let { res, data } = await sendBatch();
+            if (handleAppsScriptUnauthorized(res.status, data)) {
+              const msg = data.error || 'Token rahasia Apps Script ditolak.';
+              clearInFlightOptimistic();
+              if (batchOptimisticIds.length > 0) {
+                setAttendance((prev) => prev.filter((a) => !batchOptimisticIds.includes(a.id)));
+              }
+              setSaveErrorState(msg);
+              items.forEach((it) => it.resolve?.({ success: false, error: msg }));
+              return;
+            }
+
+            if (res.status === 401 && sessionRef.current?.token) {
+              const refreshedTok = await refreshAuthSessionIfNeeded(true);
+              if (refreshedTok) {
+                const retried = await sendBatch(refreshedTok);
+                res = retried.res;
+                data = retried.data;
+              }
+            }
+
+            if (data.serverTime) {
+              setServerClockOffset(data.serverTime);
+            }
+
+            if (!res.ok) {
+              if (res.status >= 500 || res.status === 429) {
+                clearInFlightOptimistic();
+                const existingOffline = readOfflineScans();
+                const newOffline = [...existingOffline, ...items.map((i) => i.params)];
+                writeOfflineScans(newOffline);
+                setPendingOfflineScansCount(newOffline.length);
+                const msg = data.error || 'Server/kuota sibuk, scan disimpan sementara di perangkat.';
+                setSaveErrorState(msg);
+                items.forEach((it) => it.resolve?.({ success: false, error: msg, offlineQueued: true }));
+                return;
+              }
+              clearInFlightOptimistic();
+              if (batchOptimisticIds.length > 0) {
+                setAttendance((prev) => prev.filter((a) => !batchOptimisticIds.includes(a.id)));
+              }
+              soundEffects.playErrorBeep();
+              const errMsg = data.error || 'Presensi gagal disimpan.';
+              setSaveErrorState(errMsg);
+              showToast(errMsg, 'error');
+              items.forEach((it) =>
+                it.resolve?.({
+                  success: false,
+                  error: errMsg,
+                  isDuplicate: data.isDuplicate,
+                  student: data.student,
+                })
+              );
+              return;
+            }
+
+            const savedResults: any[] = Array.isArray(data.results) ? data.results : [];
+            const rejectedList: any[] = Array.isArray(data.rejectedDuplicates) ? data.rejectedDuplicates : [];
+
+            clearInFlightOptimistic();
+
+            if (savedResults.length > 0) {
+              const hadNonOptimistic = items.some((it) => Boolean(it.resolve));
+              if (hadNonOptimistic) {
+                soundEffects.playSuccessBeep();
+              }
+              setAttendance((prev) => [
+                ...savedResults.map((r) => r.record),
+                ...prev.filter(
+                  (p) =>
+                    !batchOptimisticIds.includes(p.id) &&
+                    !savedResults.some((sr) => sr.record.id === p.id)
+                ),
+              ]);
+              if (pendingWriteCountRef.current <= 1) {
+                setSavedState('Tersimpan');
+              }
+            } else {
+              if (batchOptimisticIds.length > 0) {
+                setAttendance((prev) => prev.filter((a) => !batchOptimisticIds.includes(a.id)));
+              }
+              soundEffects.playErrorBeep();
+              const rejMsg = rejectedList[0]?.message || 'Presensi ditolak.';
+              setSaveErrorState(rejMsg);
+              if (items.some((it) => !it.resolve)) {
+                showToast(rejMsg, 'error');
+              }
+            }
+
+            if (rejectedList.length > 0 && savedResults.length > 0) {
+              const hasOptimisticRejected = items.some(
+                (it) =>
+                  !it.resolve &&
+                  rejectedList.some(
+                    (r) =>
+                      (it.targetStudent && r.studentId === it.targetStudent.nis) ||
+                      (it.params.studentId && r.studentId === it.params.studentId)
+                  )
+              );
+              if (hasOptimisticRejected) {
+                showToast(rejectedList[0]?.message || 'Sebagian scan ditolak server.', 'error');
+              }
+            }
+
+            items.forEach((it) => {
+              if (!it.resolve) return;
+              const targetStudent =
+                it.targetStudent ||
+                students.find(
+                  (s) =>
+                    (it.params.studentId && s.nis === it.params.studentId) ||
+                    (it.params.code &&
+                      (s.nis.toLowerCase() === it.params.code.trim().toLowerCase() ||
+                        s.rfid_uid.toLowerCase() === it.params.code.trim().toLowerCase() ||
+                        s.card_code.toLowerCase() === it.params.code.trim().toLowerCase()))
+                );
+
+              const matchSaved = savedResults.find(
+                (r) =>
+                  (targetStudent && r.record.student_id === targetStudent.nis) ||
+                  (it.params.studentId && r.record.student_id === it.params.studentId)
+              );
+
+              if (matchSaved) {
+                it.resolve({
+                  success: true,
+                  record: matchSaved.record,
+                  student: matchSaved.student,
+                  session: matchSaved.session,
+                });
+                return;
+              }
+
+              const matchRejected = rejectedList.find(
+                (r) =>
+                  (targetStudent && r.studentId === targetStudent.nis) ||
+                  (it.params.studentId && r.studentId === it.params.studentId) ||
+                  (it.params.code && r.code === it.params.code)
+              );
+
+              it.resolve({
+                success: false,
+                error: matchRejected?.message || rejectedList[0]?.message || 'Presensi gagal atau duplikat hari ini.',
+                isDuplicate: Boolean(matchRejected?.isDuplicate),
+                student: targetStudent,
+                record: matchRejected?.existingRecord,
+              });
+            });
+
+            if (data.rev) {
+              lastKnownRevRef.current = String(data.rev);
+            }
+            if (typeof data.seq === 'number' && data.seq > 0) {
+              lastKnownSeqRef.current = data.seq;
+            }
+
+            if (pendingWriteCountRef.current <= 1) {
+              if (data.snapshot) {
+                applyDatabaseSnapshot(data.snapshot, data.serverTime, data.rev, data.seq);
+                broadcastSyncEvent('DATA_SNAPSHOT', {
+                  snapshot: data.snapshot,
+                  serverTime: data.serverTime,
+                  rev: data.rev,
+                  seq: data.seq,
+                });
+              } else if (data.deltaApplied) {
+                const deltaEvs = savedResults.map((r: any) => ({
+                  op: 'attendance_upsert',
+                  record: r.record,
+                }));
+                if (deltaEvs.length > 0) {
+                  broadcastSyncEvent('DATA_DELTA', {
+                    events: deltaEvs,
+                    serverTime: data.serverTime,
+                    rev: data.rev,
+                    seq: data.seq,
+                  });
+                }
+              } else {
+                await refreshFromSheets(true, { afterWrite: true });
+                broadcastSyncEvent('DATA_MUTATED');
+              }
+            }
+          } catch {
+            clearInFlightOptimistic();
+            const existingOffline = readOfflineScans();
+            const newOffline = [...existingOffline, ...items.map((i) => i.params)];
+            writeOfflineScans(newOffline);
+            setPendingOfflineScansCount(newOffline.length);
+            setSyncStatus('offline');
+            setSaveErrorState('Offline: scan tersimpan sementara di perangkat.');
+            items.forEach((it) =>
+              it.resolve?.({
+                success: false,
+                error: 'Tidak ada koneksi internet. Scan disimpan di perangkat & dikirim otomatis saat online.',
+                offlineQueued: true,
+              })
+            );
+          }
+        }));
+    } finally {
+      pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1);
+      if (pendingWriteCountRef.current === 0 && pendingRefreshAfterWriteRef.current) {
+        pendingRefreshAfterWriteRef.current = false;
+        void refreshFromSheets(true);
       }
-
-      if (res.status === 401 && sessionRef.current?.token) {
-        const refreshedTok = await refreshAuthSessionIfNeeded(true);
-        if (refreshedTok) {
-          const retried = await sendBatch(refreshedTok);
-          res = retried.res;
-          data = retried.data;
-        }
-      }
-
-      if (data.serverTime) {
-        setServerClockOffset(data.serverTime);
-      }
-
-      if (!res.ok) {
-        if (res.status >= 500 || res.status === 429) {
-          clearInFlightOptimistic();
-          const existingOffline = readOfflineScans();
-          const newOffline = [...existingOffline, ...items.map((i) => i.params)];
-          writeOfflineScans(newOffline);
-          setPendingOfflineScansCount(newOffline.length);
-          const msg = data.error || 'Server/kuota sibuk, scan disimpan sementara di perangkat.';
-          setSaveErrorState(msg);
-          items.forEach((it) => it.resolve?.({ success: false, error: msg, offlineQueued: true }));
-          return;
-        }
-        clearInFlightOptimistic();
-        if (batchOptimisticIds.length > 0) {
-          setAttendance((prev) => prev.filter((a) => !batchOptimisticIds.includes(a.id)));
-        }
-        soundEffects.playErrorBeep();
-        const errMsg = data.error || 'Presensi gagal disimpan.';
-        setSaveErrorState(errMsg);
-        showToast(errMsg, 'error');
-        items.forEach((it) =>
-          it.resolve?.({
-            success: false,
-            error: errMsg,
-            isDuplicate: data.isDuplicate,
-            student: data.student,
-          })
-        );
-        return;
-      }
-
-      const savedResults: any[] = Array.isArray(data.results) ? data.results : [];
-      const rejectedList: any[] = Array.isArray(data.rejectedDuplicates) ? data.rejectedDuplicates : [];
-
-      clearInFlightOptimistic();
-
-      if (savedResults.length > 0) {
-        // Jika ada item yang sudah ter-resolusi optimistik, jangan bunyikan beep ganda jika semua sukses
-        const hadNonOptimistic = items.some((it) => Boolean(it.resolve));
-        if (hadNonOptimistic) {
-          soundEffects.playSuccessBeep();
-        }
-        setAttendance((prev) => [
-          ...savedResults.map((r) => r.record),
-          ...prev.filter(
-            (p) =>
-              !batchOptimisticIds.includes(p.id) &&
-              !savedResults.some((sr) => sr.record.id === p.id)
-          ),
-        ]);
-        setSavedState('Tersimpan');
-      } else {
-        if (batchOptimisticIds.length > 0) {
-          setAttendance((prev) => prev.filter((a) => !batchOptimisticIds.includes(a.id)));
-        }
-        soundEffects.playErrorBeep();
-        const rejMsg = rejectedList[0]?.message || 'Presensi ditolak.';
-        setSaveErrorState(rejMsg);
-        if (items.some((it) => !it.resolve)) {
-          showToast(rejMsg, 'error');
-        }
-      }
-
-      if (rejectedList.length > 0 && savedResults.length > 0) {
-        const hasOptimisticRejected = items.some(
-          (it) =>
-            !it.resolve &&
-            rejectedList.some(
-              (r) =>
-                (it.targetStudent && r.studentId === it.targetStudent.nis) ||
-                (it.params.studentId && r.studentId === it.params.studentId)
-            )
-        );
-        if (hasOptimisticRejected) {
-          showToast(rejectedList[0]?.message || 'Sebagian scan ditolak server.', 'error');
-        }
-      }
-
-      items.forEach((it) => {
-        if (!it.resolve) return;
-        const targetStudent =
-          it.targetStudent ||
-          students.find(
-            (s) =>
-              (it.params.studentId && s.nis === it.params.studentId) ||
-              (it.params.code &&
-                (s.nis.toLowerCase() === it.params.code.trim().toLowerCase() ||
-                  s.rfid_uid.toLowerCase() === it.params.code.trim().toLowerCase() ||
-                  s.card_code.toLowerCase() === it.params.code.trim().toLowerCase()))
-          );
-
-        const matchSaved = savedResults.find(
-          (r) =>
-            (targetStudent && r.record.student_id === targetStudent.nis) ||
-            (it.params.studentId && r.record.student_id === it.params.studentId)
-        );
-
-        if (matchSaved) {
-          it.resolve({
-            success: true,
-            record: matchSaved.record,
-            student: matchSaved.student,
-            session: matchSaved.session,
-          });
-          return;
-        }
-
-        const matchRejected = rejectedList.find(
-          (r) =>
-            (targetStudent && r.studentId === targetStudent.nis) ||
-            (it.params.studentId && r.studentId === it.params.studentId) ||
-            (it.params.code && r.code === it.params.code)
-        );
-
-        it.resolve({
-          success: false,
-          error: matchRejected?.message || rejectedList[0]?.message || 'Presensi gagal atau duplikat hari ini.',
-          isDuplicate: Boolean(matchRejected?.isDuplicate),
-          student: targetStudent,
-        });
-      });
-
-      if (data.snapshot) {
-        applyDatabaseSnapshot(data.snapshot, data.serverTime, data.rev);
-        broadcastSyncEvent('DATA_SNAPSHOT', {
-          snapshot: data.snapshot,
-          serverTime: data.serverTime,
-          rev: data.rev,
-        });
-      } else {
-        await refreshFromSheets(true, { afterWrite: true, forceFull: true });
-        broadcastSyncEvent('DATA_MUTATED');
-      }
-    } catch {
-      clearInFlightOptimistic();
-      const existingOffline = readOfflineScans();
-      const newOffline = [...existingOffline, ...items.map((i) => i.params)];
-      writeOfflineScans(newOffline);
-      setPendingOfflineScansCount(newOffline.length);
-      setSyncStatus('offline');
-      setSaveErrorState('Offline: scan tersimpan sementara di perangkat.');
-      items.forEach((it) =>
-        it.resolve?.({
-          success: false,
-          error: 'Tidak ada koneksi internet. Scan disimpan di perangkat & dikirim otomatis saat online.',
-          offlineQueued: true,
-        })
-      );
     }
   }, [
     applyDatabaseSnapshot,
@@ -1779,13 +2044,56 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
           const isLastQueuedWrite = pendingWriteCountRef.current <= 1;
 
+          if (data.rev) {
+            lastKnownRevRef.current = String(data.rev);
+          }
+          if (typeof data.seq === 'number' && data.seq > 0) {
+            lastKnownSeqRef.current = data.seq;
+          }
+
           if (data.snapshot && isLastQueuedWrite) {
-            applyDatabaseSnapshot(data.snapshot, data.serverTime, data.rev);
+            applyDatabaseSnapshot(data.snapshot, data.serverTime, data.rev, data.seq);
             broadcastSyncEvent('DATA_SNAPSHOT', {
               snapshot: data.snapshot,
               serverTime: data.serverTime,
               rev: data.rev,
+              seq: data.seq,
             });
+          } else if (data.deltaApplied) {
+            const deltaEvents: any[] = [];
+            if (params.url.startsWith('/api/attendance')) {
+              if (Array.isArray(data.results)) {
+                data.results.forEach((r: any) => {
+                  if (r?.record) deltaEvents.push({ op: 'attendance_upsert', record: r.record });
+                });
+              } else if (data.record) {
+                deltaEvents.push({ op: 'attendance_upsert', record: data.record });
+              } else if (params.method === 'DELETE' && data.deletedId) {
+                deltaEvents.push({ op: 'attendance_delete', id: data.deletedId });
+              }
+            } else if (params.url.startsWith('/api/out-of-class') && data.record) {
+              deltaEvents.push({ op: 'ooc_upsert', record: data.record });
+            } else if (params.url.startsWith('/api/violations')) {
+              if (data.violation) {
+                deltaEvents.push({ op: 'violation_upsert', record: data.violation });
+              } else if (params.method === 'DELETE' && data.deletedId) {
+                deltaEvents.push({ op: 'violation_delete', id: data.deletedId });
+              }
+            } else if (params.url.startsWith('/api/leave-requests') && data.request) {
+              deltaEvents.push({ op: 'leave_upsert', record: data.request });
+            }
+
+            if (deltaEvents.length > 0) {
+              applyDeltaEvents(deltaEvents, data.serverTime, data.rev, data.seq);
+              if (isLastQueuedWrite) {
+                broadcastSyncEvent('DATA_DELTA', {
+                  events: deltaEvents,
+                  serverTime: data.serverTime,
+                  rev: data.rev,
+                  seq: data.seq,
+                });
+              }
+            }
           } else if (!data.snapshot) {
             if (params.url === '/api/settings' && data.settings) {
               setSettings((prev) => ({ ...prev, ...data.settings }));
@@ -1804,8 +2112,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           if (params.successMessage && !params.silentToast) {
             showToast(params.successMessage, 'success');
           }
-          if (!data.snapshot && isLastQueuedWrite) {
-            await refreshFromSheets(true, { afterWrite: true, forceFull: true });
+          if (!data.snapshot && !data.deltaApplied && isLastQueuedWrite) {
+            await refreshFromSheets(true, { afterWrite: true });
           }
           return { ok: true, data };
         } catch (err: any) {
@@ -1829,7 +2137,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1);
             if (pendingWriteCountRef.current === 0 && pendingRefreshAfterWriteRef.current) {
               pendingRefreshAfterWriteRef.current = false;
-              void refreshFromSheets(true, { forceFull: true });
+              void refreshFromSheets(true);
             }
           });
         return { ok: true, optimistic: true, data: params.optimisticData };
@@ -1844,6 +2152,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     },
     [
       applyDatabaseSnapshot,
+      applyDeltaEvents,
       buildApiHeaders,
       broadcastSyncEvent,
       handleAppsScriptUnauthorized,
@@ -1859,6 +2168,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // ==================== AUTH ACTIONS ====================
 
   const loginDuty = async (password: string) => {
+    if (!hasCompleteAppsScriptConfig()) {
+      return {
+        success: false,
+        error: 'Koneksi server belum diaktifkan. Silakan masuk sebagai Admin untuk mengatur aktivasi, URL Script & Token.',
+      };
+    }
     try {
       const res = await apiFetch('/api/auth?action=login_duty', {
         method: 'POST',
@@ -1886,6 +2201,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         label: payload.label,
         tokenVersion: payload.tokenVersion,
       };
+      sessionRef.current = authSess;
       setSession(authSess);
       localStorage.setItem('dkb_session', JSON.stringify(authSess));
       refreshFromSheets(true);
@@ -1896,6 +2212,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const unlockHomeroom = async (name: string, password: string, classId?: string) => {
+    if (!hasCompleteAppsScriptConfig()) {
+      return {
+        success: false,
+        error: 'Koneksi server belum diaktifkan. Silakan masuk sebagai Admin untuk mengatur aktivasi, URL Script & Token.',
+      };
+    }
     try {
       const res = await apiFetch('/api/auth?action=unlock_homeroom', {
         method: 'POST',
@@ -1918,6 +2240,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         lockedMenuRole: 'homeroom',
         lockedMenuClassId: data.classId || payload.lockedMenuClassId,
       };
+      sessionRef.current = authSess;
       setSession(authSess);
       localStorage.setItem('dkb_session', JSON.stringify(authSess));
       setActiveTab('homeroom');
@@ -1929,6 +2252,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const unlockStudentAffairs = async (password: string) => {
+    if (!hasCompleteAppsScriptConfig()) {
+      return {
+        success: false,
+        error: 'Koneksi server belum diaktifkan. Silakan masuk sebagai Admin untuk mengatur aktivasi, URL Script & Token.',
+      };
+    }
     try {
       const res = await apiFetch('/api/auth?action=unlock_student_affairs', {
         method: 'POST',
@@ -1950,6 +2279,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         tokenVersion: payload.tokenVersion || 1,
         lockedMenuRole: 'student_affairs',
       };
+      sessionRef.current = authSess;
       setSession(authSess);
       localStorage.setItem('dkb_session', JSON.stringify(authSess));
       setActiveTab('student_affairs');
@@ -1961,6 +2291,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const unlockAdmin = async (password: string) => {
+    const enterAdminSetupSession = (setupPass: string) => {
+      pendingAdminSetupPasswordRef.current = setupPass;
+      const setupSess: AuthSession = {
+        token: '',
+        userId: 'user_admin_main',
+        role: 'admin',
+        name: 'Administrator Sekolah',
+        label: 'Admin Sistem',
+        tokenVersion: 1,
+        lockedMenuRole: 'admin',
+      };
+      sessionRef.current = setupSess;
+      setSession(setupSess);
+      localStorage.setItem('dkb_session', JSON.stringify(setupSess));
+      setActiveTab('admin');
+    };
+
+    if (!hasCompleteAppsScriptConfig()) {
+      if (password === 'admin123') {
+        enterAdminSetupSession(password);
+        return { success: true };
+      }
+      return { success: false, error: 'Password admin salah.' };
+    }
+
     try {
       const res = await apiFetch('/api/auth?action=unlock_admin', {
         method: 'POST',
@@ -1968,8 +2323,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         body: JSON.stringify({ password }),
       });
       const data = await res.json().catch(() => ({}));
-      if (handleAppsScriptUnauthorized(res.status, data)) {
-        return { success: false, error: data.error };
+      if (
+        (res.status === 401 && (data?.unauthorizedToken || data?.googleDeploymentUnauthorized)) ||
+        res.status === 503
+      ) {
+        if (password === 'admin123') {
+          enterAdminSetupSession(password);
+          handleAppsScriptUnauthorized(res.status, data);
+          return { success: true };
+        }
+        handleAppsScriptUnauthorized(res.status, data);
+        return { success: false, error: data.error || 'Konfigurasi Apps Script bermasalah.' };
       }
       if (!res.ok) return { success: false, error: data.error || 'Password admin salah' };
       const payload = decodeJwtPayload(data.token);
@@ -1982,17 +2346,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         tokenVersion: payload.tokenVersion || 1,
         lockedMenuRole: 'admin',
       };
+      pendingAdminSetupPasswordRef.current = null;
+      sessionRef.current = authSess;
       setSession(authSess);
       localStorage.setItem('dkb_session', JSON.stringify(authSess));
       setActiveTab('admin');
       refreshFromSheets(true);
       return { success: true };
     } catch {
+      if (password === 'admin123') {
+        enterAdminSetupSession(password);
+        showToast('Apps Script tidak terjangkau. Silakan periksa URL Script & Token di Menu Admin.', 'error');
+        return { success: true };
+      }
       return { success: false, error: 'Gagal menghubungi Google Apps Script.' };
     }
   };
 
   const logout = () => {
+    sessionRef.current = null;
     setSession(null);
     localStorage.removeItem('dkb_session');
     localStorage.removeItem('dkb_active_tab');
@@ -2051,31 +2423,154 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             s.card_code.toLowerCase() === params.code.trim().toLowerCase()))
     );
 
+    const isManual = params.method === 'manual';
+
     if (targetStudent) {
-      const multiSession = sessions.filter((s) => s.is_active).length > 1;
-      const alreadyRecorded = attendance.some(
+      // Setiap sesi berdiri sendiri (Sesi 1 & Sesi 2 tidak pernah dicampur)
+      const existingInSession = attendance.find(
         (a) =>
           a.student_id === targetStudent.nis &&
           a.date === todayStr &&
-          (multiSession ? a.session_id === targetSessionId : true)
+          a.session_id === targetSessionId
       );
-      if (alreadyRecorded) {
+
+      if (existingInSession) {
+        if (isManual) {
+          const nextStatus = (params.status || existingInSession.status) as AttendanceRecord['status'];
+          const nextLate = nextStatus === 'Terlambat' ? existingInSession.late_minutes : 0;
+          const nextNotes = params.notes !== undefined ? params.notes : existingInSession.notes;
+          const syncedRec: AttendanceRecord = {
+            ...existingInSession,
+            status: nextStatus,
+            late_minutes: nextLate,
+            notes: nextNotes,
+            method: 'manual',
+            updated_at: serverNow.toISOString(),
+          };
+
+          if (existingInSession.id.startsWith('opt_')) {
+            const queuedMatch = scanBatchQueueRef.current.find(
+              (b) => b.optimisticId === existingInSession.id
+            );
+            setAttendance((prev) =>
+              prev.map((a) => (a.id === existingInSession.id ? syncedRec : a))
+            );
+            soundEffects.playSuccessBeep();
+            if (queuedMatch) {
+              queuedMatch.params = {
+                ...queuedMatch.params,
+                status: nextStatus,
+                notes: nextNotes,
+                method: 'manual',
+                upsert: true,
+                manualOverride: true,
+              };
+            } else {
+              void runWriteRequest({
+                url: '/api/attendance',
+                method: 'POST',
+                body: {
+                  scans: [
+                    {
+                      studentId: targetStudent.nis,
+                      sessionId: targetSessionId,
+                      status: nextStatus,
+                      notes: nextNotes,
+                      method: 'manual',
+                      manualOverride: true,
+                      upsert: true,
+                    },
+                  ],
+                },
+                silentToast: true,
+              });
+            }
+          } else {
+            await updateAttendance(
+              existingInSession.id,
+              {
+                status: nextStatus,
+                late_minutes: nextLate,
+                notes: nextNotes,
+                method: 'manual',
+              },
+              'Sinkronisasi presensi manual'
+            );
+            soundEffects.playSuccessBeep();
+          }
+
+          return {
+            success: true,
+            record: syncedRec,
+            student: targetStudent,
+            session: targetSessionObj,
+            syncedFromExisting: true,
+          };
+        }
+
         soundEffects.playErrorBeep();
-        const err = `Presensi ganda ditolak: ${targetStudent.name} sudah tercatat presensi hari ini (${todayStr}).`;
-        return { success: false, error: err, isDuplicate: true, student: targetStudent };
+        const methodText = existingInSession.method === 'manual' ? 'Manual' : 'Scan';
+        const sessName = targetSessionObj?.name || targetSessionId || '';
+        const err = `Presensi ganda ditolak: ${targetStudent.name} sudah tercatat ${existingInSession.status} (${methodText}) pada sesi ${sessName} hari ini (${todayStr}).`;
+        return {
+          success: false,
+          error: err,
+          isDuplicate: true,
+          student: targetStudent,
+          record: existingInSession,
+        };
       }
 
-      const alreadyInBatch = scanBatchQueueRef.current.some(
+      const alreadyInBatch = scanBatchQueueRef.current.find(
         (b) =>
-          (b.params.studentId && b.params.studentId === targetStudent.nis) ||
-          (b.targetStudent && b.targetStudent.nis === targetStudent.nis) ||
-          (params.code && b.params.code && b.params.code.trim().toLowerCase() === params.code.trim().toLowerCase())
+          b.params.sessionId === targetSessionId &&
+          ((b.params.studentId && b.params.studentId === targetStudent.nis) ||
+            (b.targetStudent && b.targetStudent.nis === targetStudent.nis) ||
+            (params.code && b.params.code && b.params.code.trim().toLowerCase() === params.code.trim().toLowerCase()))
       );
       if (alreadyInBatch) {
+        if (isManual) {
+          const nextStatus = (params.status || 'Hadir') as AttendanceRecord['status'];
+          const nextNotes = params.notes ?? alreadyInBatch.params.notes ?? '';
+          alreadyInBatch.params = {
+            ...alreadyInBatch.params,
+            status: nextStatus,
+            notes: nextNotes,
+            method: 'manual',
+            upsert: true,
+            manualOverride: true,
+          };
+          const optRec = attendance.find((a) => a.id === alreadyInBatch.optimisticId);
+          if (optRec) {
+            setAttendance((prev) =>
+              prev.map((a) =>
+                a.id === optRec.id
+                  ? {
+                      ...a,
+                      status: nextStatus,
+                      late_minutes: nextStatus === 'Terlambat' ? a.late_minutes : 0,
+                      notes: nextNotes,
+                      method: 'manual',
+                    }
+                  : a
+              )
+            );
+          }
+          soundEffects.playSuccessBeep();
+          return {
+            success: true,
+            record: optRec
+              ? { ...optRec, status: nextStatus, notes: nextNotes, method: 'manual' }
+              : undefined,
+            student: targetStudent,
+            session: targetSessionObj,
+            syncedFromExisting: true,
+          };
+        }
         soundEffects.playErrorBeep();
         return {
           success: false,
-          error: `Presensi ganda dalam antrean 3 detik untuk ${targetStudent.name}.`,
+          error: `Presensi ganda dalam antrean 3 detik untuk ${targetStudent.name} di sesi ${targetSessionObj?.name || ''}.`,
           isDuplicate: true,
           student: targetStudent,
         };
@@ -2123,7 +2618,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     // Jika siswa & sesi ditemukan di state lokal, tampilkan & sinkronkan optimistik permili detik (0ms),
-    // sembari tetap mengumpulkan batch scan selama 3 detik di latar belakang ke Apps Script!
+    // sembari tetap menyimpan/mengumpulkan ke Apps Script di latar belakang!
     if (targetStudent && targetSessionObj) {
       let optStatus = (params.status || 'Hadir') as AttendanceRecord['status'];
       let optLateMinutes = 0;
@@ -2164,15 +2659,53 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setSavingState();
       broadcastSyncEvent('DATA_OPTIMISTIC_ATTENDANCE', { record: optimisticRecord });
 
-      scanBatchQueueRef.current.push({
-        params: scanObj,
-        optimisticId: optimisticRecord.id,
-        targetStudent,
-      });
-      if (!scanBatchTimerRef.current) {
+      if (isManual) {
+        // Presensi manual langsung disinkronkan melalui antrean penulisan berseri (tanpa bertabrakan) agar cepat & langsung masuk ke scan/sheet sesi terkait
+        const manualTempId = optimisticRecord.id;
+        void runWriteRequest({
+          url: '/api/attendance',
+          method: 'POST',
+          body: {
+            scans: [
+              {
+                studentId: targetStudent.nis,
+                sessionId: targetSessionObj.id,
+                status: optStatus,
+                notes: params.notes || '',
+                method: 'manual',
+                manualOverride: true,
+                upsert: true,
+              },
+            ],
+          },
+          silentToast: true,
+          onSuccess: (data) => {
+            const savedRec = data?.results?.[0]?.record;
+            if (savedRec) {
+              setAttendance((prev) => [
+                savedRec,
+                ...prev.filter((p) => p.id !== manualTempId && p.id !== savedRec.id),
+              ]);
+            }
+          },
+        });
+      } else {
+        scanBatchQueueRef.current.push({
+          params: scanObj,
+          optimisticId: optimisticRecord.id,
+          targetStudent,
+        });
+        if (scanBatchTimerRef.current) {
+          clearTimeout(scanBatchTimerRef.current);
+        }
         scanBatchTimerRef.current = setTimeout(() => {
           void flushScanBatch();
-        }, SCAN_BATCH_WINDOW_MS);
+        }, SCAN_IDLE_FLUSH_MS);
+        if (!scanBatchMaxTimerRef.current) {
+          scanBatchMaxTimerRef.current = setTimeout(() => {
+            void flushScanBatch();
+          }, SCAN_MAX_BATCH_WAIT_MS);
+        }
       }
 
       return {
@@ -2183,14 +2716,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       };
     }
 
-    // Fallback (kartu tidak ditemukan di state lokal): tunggu verifikasi server lewat batch 3 detik
+    // Fallback (kartu tidak ditemukan di state lokal): tunggu verifikasi server lewat batch
     return await new Promise<any>((resolve) => {
       setSavingState();
       scanBatchQueueRef.current.push({ params: scanObj, resolve });
-      if (!scanBatchTimerRef.current) {
-        scanBatchTimerRef.current = setTimeout(() => {
+      if (scanBatchTimerRef.current) {
+        clearTimeout(scanBatchTimerRef.current);
+      }
+      scanBatchTimerRef.current = setTimeout(() => {
+        void flushScanBatch();
+      }, SCAN_IDLE_FLUSH_MS);
+      if (!scanBatchMaxTimerRef.current) {
+        scanBatchMaxTimerRef.current = setTimeout(() => {
           void flushScanBatch();
-        }, SCAN_BATCH_WINDOW_MS);
+        }, SCAN_MAX_BATCH_WAIT_MS);
       }
     });
   };
@@ -2454,6 +2993,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       onOptimisticBroadcast: () => {
         broadcastSyncEvent('DATA_OPTIMISTIC_VIOLATION', { violation: optimisticViolation });
       },
+      onSuccess: (data) => {
+        if (data?.violation) {
+          setViolations((prev) => [
+            data.violation,
+            ...prev.filter((p) => p.id !== optimisticViolation.id && p.id !== data.violation.id),
+          ]);
+        }
+      },
       optimisticData: { violation: optimisticViolation, studentTotalPoints },
       silentToast: true,
     });
@@ -2667,6 +3214,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         let lastSnapshot: any = null;
         let lastServerTime: string | undefined;
         let lastRev: string | undefined;
+        let lastSeq: number | undefined;
 
         try {
           for (let i = 0; i < newStudents.length; i += CHUNK_SIZE) {
@@ -2714,15 +3262,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             if (data.snapshot) lastSnapshot = data.snapshot;
             if (data.serverTime) lastServerTime = data.serverTime;
             if (data.rev) lastRev = String(data.rev);
+            if (typeof data.seq === 'number' && data.seq > 0) lastSeq = data.seq;
           }
 
           if (pendingWriteCountRef.current <= 1) {
             if (lastSnapshot) {
-              applyDatabaseSnapshot(lastSnapshot, lastServerTime, lastRev);
+              applyDatabaseSnapshot(lastSnapshot, lastServerTime, lastRev, lastSeq);
               broadcastSyncEvent('DATA_SNAPSHOT', {
                 snapshot: lastSnapshot,
                 serverTime: lastServerTime,
                 rev: lastRev,
+                seq: lastSeq,
               });
             } else {
               await refreshFromSheets(true, { afterWrite: true, forceFull: true });
@@ -2743,7 +3293,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1);
         if (pendingWriteCountRef.current === 0 && pendingRefreshAfterWriteRef.current) {
           pendingRefreshAfterWriteRef.current = false;
-          void refreshFromSheets(true, { forceFull: true });
+          void refreshFromSheets(true);
         }
       });
 

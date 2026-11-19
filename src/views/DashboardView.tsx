@@ -27,12 +27,50 @@ const DashboardAttendanceCharts = React.lazy(
 );
 import { useApp } from '../context/AppContext.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
-import { Student, SchoolClass } from '../types/index.js';
+import { Student, SchoolClass, AttendanceStatus } from '../types/index.js';
 import { exportToExcel, exportSessionRecapToExcel } from '../utils/excel.js';
 import { buildSessionRecapData } from '../utils/sessionHelper.js';
 import { formatIndonesianDate } from '../utils/time.js';
 
 type DateFilter = 'today' | 'week' | 'month' | 'semester';
+
+const MANUAL_STATUS_OPTIONS: {
+  status: AttendanceStatus;
+  shortLabel: string;
+  activeClass: string;
+  idleClass: string;
+}[] = [
+  {
+    status: 'Hadir',
+    shortLabel: 'Hadir',
+    activeClass: 'bg-emerald-600 text-white border-emerald-600 shadow-xs',
+    idleClass: 'bg-white dark:bg-slate-900 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60 hover:bg-emerald-50 dark:hover:bg-emerald-950/40',
+  },
+  {
+    status: 'Terlambat',
+    shortLabel: 'Terlambat',
+    activeClass: 'bg-amber-500 text-white border-amber-500 shadow-xs',
+    idleClass: 'bg-white dark:bg-slate-900 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800/60 hover:bg-amber-50 dark:hover:bg-amber-950/40',
+  },
+  {
+    status: 'Izin',
+    shortLabel: 'Izin',
+    activeClass: 'bg-blue-600 text-white border-blue-600 shadow-xs',
+    idleClass: 'bg-white dark:bg-slate-900 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-800/60 hover:bg-blue-50 dark:hover:bg-blue-950/40',
+  },
+  {
+    status: 'Sakit',
+    shortLabel: 'Sakit',
+    activeClass: 'bg-yellow-500 text-white border-yellow-500 shadow-xs',
+    idleClass: 'bg-white dark:bg-slate-900 text-yellow-700 dark:text-yellow-400 border-yellow-200 dark:border-yellow-800/60 hover:bg-yellow-50 dark:hover:bg-yellow-950/40',
+  },
+  {
+    status: 'Alpha',
+    shortLabel: 'Alpha',
+    activeClass: 'bg-rose-600 text-white border-rose-600 shadow-xs',
+    idleClass: 'bg-white dark:bg-slate-900 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-800/60 hover:bg-rose-50 dark:hover:bg-rose-950/40',
+  },
+];
 
 export const DashboardView: React.FC = () => {
   const {
@@ -47,13 +85,16 @@ export const DashboardView: React.FC = () => {
     currentServerTime,
     isInitialLoading,
     initialLoadError,
+    recordAttendance,
     showToast,
   } = useApp();
 
   const [dateFilter, setDateFilter] = useState<DateFilter>('today');
   const [selectedRecapSessionId, setSelectedRecapSessionId] = useState<string>('all');
+  const [selectedOverviewSessionId, setSelectedOverviewSessionId] = useState<string>('');
   const [recapDate, setRecapDate] = useState<string>(() => currentServerTime.toISOString().split('T')[0]);
   const [profileStudent, setProfileStudent] = useState<Student | null>(null);
+  const [savingStudentNis, setSavingStudentNis] = useState<string | null>(null);
 
   // Drilldown state: breadcrumb path
   // null = overview, { level: 'class', classId } = list of students in class
@@ -64,6 +105,55 @@ export const DashboardView: React.FC = () => {
   const [classDetailStatusFilter, setClassDetailStatusFilter] = useState<'all' | 'hadir' | 'izin' | 'sakit' | 'alpha'>('all');
   const [classStudentSearch, setClassStudentSearch] = useState('');
   const [classGridSearch, setClassGridSearch] = useState('');
+
+  const effectiveOverviewSessionId =
+    selectedOverviewSessionId || activeSession?.id || sessions.find((s) => s.is_active)?.id || sessions[0]?.id || 'all';
+
+  const modalTargetSessionId =
+    effectiveOverviewSessionId !== 'all'
+      ? effectiveOverviewSessionId
+      : activeSession?.id || sessions.find((s) => s.is_active)?.id || sessions[0]?.id || '';
+
+  const modalTargetSessionObj = useMemo(
+    () => sessions.find((s) => s.id === modalTargetSessionId) || null,
+    [sessions, modalTargetSessionId]
+  );
+
+  const handleQuickManualAttendance = async (
+    student: Student,
+    nextStatus: AttendanceStatus,
+    currentStatus?: AttendanceStatus,
+    hasAttended?: boolean,
+    currentMethod?: string
+  ) => {
+    if (!modalTargetSessionId) {
+      showToast('Belum ada sesi presensi yang aktif/dipilih.', 'error');
+      return;
+    }
+    if (hasAttended && currentStatus === nextStatus && currentMethod === 'manual') {
+      return;
+    }
+    setSavingStudentNis(student.nis);
+    try {
+      const res = await recordAttendance({
+        studentId: student.nis,
+        sessionId: modalTargetSessionId,
+        status: nextStatus,
+        method: 'manual',
+      });
+      if (res.success) {
+        const sessName = modalTargetSessionObj?.name || 'sesi aktif';
+        showToast(
+          `${res.syncedFromExisting ? 'Sinkron' : 'Tersimpan'}: ${student.name} → ${nextStatus} (${sessName}).`,
+          'success'
+        );
+      } else if (!res.offlineQueued) {
+        showToast(res.error || 'Gagal menyimpan presensi manual.', 'error');
+      }
+    } finally {
+      setSavingStudentNis((prev) => (prev === student.nis ? null : prev));
+    }
+  };
 
   // Date filtering logic
   const filteredAttendance = useMemo(() => {
@@ -162,7 +252,12 @@ export const DashboardView: React.FC = () => {
       let alpha = 0;
 
       classStudents.forEach((st) => {
-        const att = attendance.find((a) => a.student_id === st.nis && a.date === todayStr);
+        const att = attendance.find(
+          (a) =>
+            a.student_id === st.nis &&
+            a.date === todayStr &&
+            (effectiveOverviewSessionId === 'all' || a.session_id === effectiveOverviewSessionId)
+        );
         if (!att) {
           alpha++;
         } else if (att.status === 'Hadir') {
@@ -193,7 +288,7 @@ export const DashboardView: React.FC = () => {
         pctHadir,
       };
     });
-  }, [classes, students, attendance, todayStr]);
+  }, [classes, students, attendance, todayStr, effectiveOverviewSessionId]);
 
   const filteredClassSummaries = useMemo(() => {
     if (!classGridSearch.trim()) return classSummaries;
@@ -211,7 +306,12 @@ export const DashboardView: React.FC = () => {
     const classStds = students.filter((s) => s.class_id === selectedClassForInspection.id);
 
     return classStds.map((st) => {
-      const att = attendance.find((a) => a.student_id === st.nis && a.date === todayStr);
+      const att = attendance.find(
+        (a) =>
+          a.student_id === st.nis &&
+          a.date === todayStr &&
+          (!modalTargetSessionId || a.session_id === modalTargetSessionId)
+      );
       let status: 'Hadir' | 'Terlambat' | 'Izin' | 'Sakit' | 'Alpha' = 'Alpha';
       let checkInTime = '-';
       let lateMinutes = 0;
@@ -238,7 +338,7 @@ export const DashboardView: React.FC = () => {
         hasAttended: Boolean(att),
       };
     });
-  }, [selectedClassForInspection, students, attendance, todayStr]);
+  }, [selectedClassForInspection, students, attendance, todayStr, modalTargetSessionId]);
 
   const displayedInspectedStudents = useMemo(() => {
     return inspectedStudents.filter((item) => {
@@ -482,21 +582,43 @@ export const DashboardView: React.FC = () => {
           )}
 
           {drilldown.level === 'students' && (
-            <div>
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-100 dark:border-slate-800 text-xs">
+                <span className="text-slate-500">
+                  Pilih status presensi manual per siswa untuk sesi aktif agar langsung sinkron dengan Scan/RFID &amp; Google Sheets:
+                </span>
+                <select
+                  value={modalTargetSessionId}
+                  onChange={(e) => setSelectedOverviewSessionId(e.target.value)}
+                  className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-white font-medium"
+                >
+                  {sessions.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      Sesi: {s.name} ({s.start_time}-{s.end_time}){activeSession?.id === s.id ? ' • Aktif' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
               <div className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
                 {students
                   .filter((s) => s.class_id === drilldown.classId)
                   .map((s) => {
-                    const sAtt = filteredAttendance.filter((a) => a.student_id === s.nis);
-                    const lastStatus = sAtt[0]?.status || 'Belum Presensi';
+                    const sessionAtt = attendance.find(
+                      (a) =>
+                        a.student_id === s.nis &&
+                        a.date === todayStr &&
+                        (!modalTargetSessionId || a.session_id === modalTargetSessionId)
+                    );
+                    const lastStatus = sessionAtt?.status || 'Belum Presensi';
+                    const isRowSaving = savingStudentNis === s.nis;
                     return (
                       <div
                         key={s.nis}
                         onClick={() => setProfileStudent(s)}
-                        className="py-3 flex items-center justify-between hover:bg-slate-50/50 dark:hover:bg-slate-800/30 px-2 cursor-pointer rounded"
+                        className="py-3 flex flex-col lg:flex-row lg:items-center justify-between gap-3 hover:bg-slate-50/50 dark:hover:bg-slate-800/30 px-2 cursor-pointer rounded"
                       >
                         <div className="flex items-center gap-3">
-                          <div className="w-8 h-8 rounded-full bg-slate-200 dark:bg-slate-700 flex items-center justify-center font-bold text-slate-800 dark:text-slate-200">
+                          <div className="w-8 h-8 rounded-full bg-slate-200 dark:bg-slate-700 flex items-center justify-center font-bold text-slate-800 dark:text-slate-200 shrink-0">
                             {s.name.slice(0, 2).toUpperCase()}
                           </div>
                           <div>
@@ -505,15 +627,53 @@ export const DashboardView: React.FC = () => {
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-3">
+                        <div
+                          className="flex flex-wrap items-center gap-2"
+                          onClick={(e) => e.stopPropagation()}
+                        >
                           <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
-                            lastStatus === 'Hadir' ? 'bg-emerald-100 text-emerald-800' :
-                            lastStatus === 'Terlambat' ? 'bg-amber-100 text-amber-800' :
-                            lastStatus === 'Alpha' ? 'bg-rose-100 text-rose-800' : 'bg-slate-100 text-slate-700'
+                            lastStatus === 'Hadir' ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300' :
+                            lastStatus === 'Terlambat' ? 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300' :
+                            lastStatus === 'Izin' ? 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300' :
+                            lastStatus === 'Sakit' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-950 dark:text-yellow-300' :
+                            lastStatus === 'Alpha' ? 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300' :
+                            'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
                           }`}>
-                            {lastStatus}
+                            {lastStatus}{sessionAtt?.method ? ` (${sessionAtt.method.toUpperCase()})` : ''}
                           </span>
-                          <span className="text-slate-400 text-[11px]">Buka Profil →</span>
+                          <div className="inline-flex flex-wrap items-center gap-1">
+                            {MANUAL_STATUS_OPTIONS.map((opt) => {
+                              const isSelected = Boolean(sessionAtt && sessionAtt.status === opt.status);
+                              return (
+                                <button
+                                  key={opt.status}
+                                  type="button"
+                                  disabled={isRowSaving}
+                                  onClick={() =>
+                                    void handleQuickManualAttendance(
+                                      s,
+                                      opt.status,
+                                      sessionAtt?.status,
+                                      Boolean(sessionAtt),
+                                      sessionAtt?.method
+                                    )
+                                  }
+                                  className={`px-2 py-1 rounded border text-[10px] font-semibold transition-colors disabled:opacity-50 ${
+                                    isSelected ? opt.activeClass : opt.idleClass
+                                  }`}
+                                >
+                                  {opt.shortLabel}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setProfileStudent(s)}
+                            className="text-slate-500 hover:text-slate-900 dark:hover:text-white text-[11px] font-medium ml-1"
+                          >
+                            Profil →
+                          </button>
                         </div>
                       </div>
                     );
@@ -595,16 +755,30 @@ export const DashboardView: React.FC = () => {
                 </p>
               </div>
 
-              {/* Class search */}
-              <div className="relative w-full sm:w-64">
-                <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input
-                  type="text"
-                  value={classGridSearch}
-                  onChange={(e) => setClassGridSearch(e.target.value)}
-                  placeholder="Cari kelas atau jurusan..."
-                  className="w-full pl-8 pr-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-white focus:ring-2 focus:ring-slate-900"
-                />
+              {/* Session filter & Class search */}
+              <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+                <select
+                  value={effectiveOverviewSessionId}
+                  onChange={(e) => setSelectedOverviewSessionId(e.target.value)}
+                  className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-white font-medium"
+                >
+                  {sessions.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      Sesi: {s.name} ({s.start_time}-{s.end_time})
+                    </option>
+                  ))}
+                  <option value="all">Gabungan Semua Sesi</option>
+                </select>
+                <div className="relative flex-1 sm:w-56">
+                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                  <input
+                    type="text"
+                    value={classGridSearch}
+                    onChange={(e) => setClassGridSearch(e.target.value)}
+                    placeholder="Cari kelas atau jurusan..."
+                    className="w-full pl-8 pr-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-white focus:ring-2 focus:ring-slate-900"
+                  />
+                </div>
               </div>
             </div>
 
@@ -1074,26 +1248,28 @@ export const DashboardView: React.FC = () => {
       {/* MODAL PEMERIKSAAN KEHADIRAN SISWA PER KELAS */}
       {selectedClassForInspection && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-4xl max-h-[90vh] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-2xl flex flex-col overflow-hidden text-xs">
+          <div className="w-full max-w-6xl max-h-[90vh] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-2xl flex flex-col overflow-hidden text-xs">
             {/* Header Modal */}
             <div className="p-4 sm:p-5 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3 bg-slate-50 dark:bg-slate-800/50">
               <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-lg bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 flex items-center justify-center font-bold text-sm">
+                <div className="w-10 h-10 rounded-lg bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 flex items-center justify-center font-bold text-sm shrink-0">
                   <GraduationCap className="w-5 h-5" />
                 </div>
                 <div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <h3 className="text-base font-bold text-slate-900 dark:text-white">
-                      Rincian Presensi Kelas: {selectedClassForInspection.name}
+                      Rincian &amp; Presensi Manual Kelas: {selectedClassForInspection.name}
                     </h3>
                     <span className="text-[10px] px-2 py-0.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 font-semibold uppercase">
                       {selectedClassForInspection.major}
                     </span>
                   </div>
-                  <p className="text-xs text-slate-500 mt-0.5 flex items-center gap-2">
+                  <p className="text-xs text-slate-500 mt-0.5 flex flex-wrap items-center gap-2">
                     <span>Wali Kelas: <strong>{selectedClassForInspection.homeroom_teacher_name || 'Belum ditentukan'}</strong></span>
                     <span>•</span>
                     <span>Tanggal: <strong>{formatIndonesianDate(currentServerTime)}</strong></span>
+                    <span>•</span>
+                    <span>Perubahan presensi manual langsung sinkron ke Scan/RFID &amp; sheet sesi</span>
                   </p>
                 </div>
               </div>
@@ -1107,7 +1283,7 @@ export const DashboardView: React.FC = () => {
               </button>
             </div>
 
-            {/* Filter Pills & Summary Counter Bar */}
+            {/* Filter Pills, Target Session Selector & Search Bar */}
             <div className="p-4 border-b border-slate-100 dark:border-slate-800 space-y-3 bg-white dark:bg-slate-900">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 {/* Status Filter Tabs */}
@@ -1171,16 +1347,30 @@ export const DashboardView: React.FC = () => {
                   </button>
                 </div>
 
-                {/* Search input in modal */}
-                <div className="relative w-full sm:w-60">
-                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
-                  <input
-                    type="text"
-                    value={classStudentSearch}
-                    onChange={(e) => setClassStudentSearch(e.target.value)}
-                    placeholder="Cari siswa atau NIS..."
-                    className="w-full pl-8 pr-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-white focus:ring-2 focus:ring-slate-900"
-                  />
+                <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+                  <select
+                    value={modalTargetSessionId}
+                    onChange={(e) => setSelectedOverviewSessionId(e.target.value)}
+                    className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-white font-medium"
+                  >
+                    {sessions.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        Sesi: {s.name} ({s.start_time}-{s.end_time}){activeSession?.id === s.id ? ' • Aktif' : ''}
+                      </option>
+                    ))}
+                  </select>
+
+                  {/* Search input in modal */}
+                  <div className="relative flex-1 sm:w-56">
+                    <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="text"
+                      value={classStudentSearch}
+                      onChange={(e) => setClassStudentSearch(e.target.value)}
+                      placeholder="Cari siswa atau NIS..."
+                      className="w-full pl-8 pr-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-white focus:ring-2 focus:ring-slate-900"
+                    />
+                  </div>
                 </div>
               </div>
             </div>
@@ -1193,86 +1383,118 @@ export const DashboardView: React.FC = () => {
                   <span className="text-[11px] text-slate-500">Coba ubah filter status atau kata kunci pencarian.</span>
                 </div>
               ) : (
-                <div className="border border-slate-200 dark:border-slate-800 rounded-lg overflow-hidden">
+                <div className="border border-slate-200 dark:border-slate-800 rounded-lg overflow-x-auto">
                   <table className="w-full text-xs text-left">
                     <thead className="bg-slate-50 dark:bg-slate-800/80 text-slate-600 dark:text-slate-300 border-b border-slate-200 dark:border-slate-700 font-semibold">
                       <tr>
                         <th className="px-3 py-2 w-10 text-center">No</th>
-                        <th className="px-3 py-2 w-28">NIS / NISN</th>
-                        <th className="px-3 py-2">Nama Siswa</th>
-                        <th className="px-3 py-2 w-16 text-center">L/P</th>
-                        <th className="px-3 py-2 w-40 text-center">Status Kehadiran</th>
-                        <th className="px-3 py-2 w-32">Waktu Scan</th>
-                        <th className="px-3 py-2">Keterangan</th>
+                        <th className="px-3 py-2 min-w-[180px]">Siswa &amp; NIS</th>
+                        <th className="px-3 py-2 min-w-[175px]">Status &amp; Waktu Sesi</th>
+                        <th className="px-3 py-2 min-w-[300px]">Presensi Manual (Sinkron)</th>
                         <th className="px-3 py-2 text-right w-20">Profil</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-slate-800 bg-white dark:bg-slate-900">
-                      {displayedInspectedStudents.map((item, index) => (
-                        <tr
-                          key={item.student.nis}
-                          className="hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors"
-                        >
-                          <td className="px-3 py-2.5 text-center font-mono text-slate-400">
-                            {index + 1}
-                          </td>
-                          <td className="px-3 py-2.5 font-mono text-slate-600 dark:text-slate-400">
-                            {item.student.nis}
-                          </td>
-                          <td className="px-3 py-2.5 font-bold text-slate-900 dark:text-white">
-                            {item.student.name}
-                          </td>
-                          <td className="px-3 py-2.5 text-center font-medium">
-                            <span className={`px-1.5 py-0.5 rounded text-[10px] ${
-                              item.student.gender === 'L' ? 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300' : 'bg-pink-100 text-pink-800 dark:bg-pink-950 dark:text-pink-300'
-                            }`}>
-                              {item.student.gender || 'L'}
-                            </span>
-                          </td>
-                          <td className="px-3 py-2.5 text-center">
-                            {item.status === 'Hadir' ? (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
-                                <CheckCircle2 className="w-3 h-3" /> Hadir Tepat Waktu
-                              </span>
-                            ) : item.status === 'Terlambat' ? (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300">
-                                <Clock className="w-3 h-3" /> Terlambat ({item.lateMinutes}m)
-                              </span>
-                            ) : item.status === 'Izin' ? (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300">
-                                Izin
-                              </span>
-                            ) : item.status === 'Sakit' ? (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-yellow-100 text-yellow-800 dark:bg-yellow-950 dark:text-yellow-300">
-                                Sakit
-                              </span>
-                            ) : (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300">
-                                <AlertCircle className="w-3 h-3" /> Alpha / Belum Presensi
-                              </span>
-                            )}
-                          </td>
-                          <td className="px-3 py-2.5 font-mono text-slate-600 dark:text-slate-400">
-                            {item.checkInTime !== '-' ? (
-                              <span>{item.checkInTime} <span className="text-[10px] text-slate-400 uppercase">({item.method})</span></span>
-                            ) : (
-                              <span className="text-slate-400">-</span>
-                            )}
-                          </td>
-                          <td className="px-3 py-2.5 text-slate-500 truncate max-w-xs">
-                            {item.notes || '-'}
-                          </td>
-                          <td className="px-3 py-2.5 text-right">
-                            <button
-                              type="button"
-                              onClick={() => setProfileStudent(item.student)}
-                              className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-[11px] font-medium text-slate-700 dark:text-slate-300"
-                            >
-                              Detail
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
+                      {displayedInspectedStudents.map((item, index) => {
+                        const isRowSaving = savingStudentNis === item.student.nis;
+                        return (
+                          <tr
+                            key={item.student.nis}
+                            className="hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors"
+                          >
+                            <td className="px-3 py-2.5 text-center font-mono text-slate-400">
+                              {index + 1}
+                            </td>
+                            <td className="px-3 py-2.5">
+                              <div className="font-bold text-slate-900 dark:text-white">
+                                {item.student.name}
+                              </div>
+                              <div className="flex items-center gap-1.5 mt-0.5">
+                                <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400">
+                                  {item.student.nis}
+                                </span>
+                                <span className={`px-1.5 py-0.2 rounded text-[9px] font-semibold ${
+                                  item.student.gender === 'L' ? 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300' : 'bg-pink-100 text-pink-800 dark:bg-pink-950 dark:text-pink-300'
+                                }`}>
+                                  {item.student.gender || 'L'}
+                                </span>
+                              </div>
+                            </td>
+                            <td className="px-3 py-2.5">
+                              <div>
+                                {item.status === 'Hadir' ? (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
+                                    <CheckCircle2 className="w-3 h-3" /> Hadir Tepat Waktu
+                                  </span>
+                                ) : item.status === 'Terlambat' ? (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300">
+                                    <Clock className="w-3 h-3" /> Terlambat {item.lateMinutes > 0 ? `(${item.lateMinutes}m)` : ''}
+                                  </span>
+                                ) : item.status === 'Izin' ? (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300">
+                                    Izin
+                                  </span>
+                                ) : item.status === 'Sakit' ? (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-yellow-100 text-yellow-800 dark:bg-yellow-950 dark:text-yellow-300">
+                                    Sakit
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300">
+                                    <AlertCircle className="w-3 h-3" /> {item.hasAttended ? 'Alpha' : 'Alpha / Belum Presensi'}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="mt-1 text-[10px] text-slate-500 dark:text-slate-400 font-mono">
+                                {item.hasAttended ? (
+                                  <span>
+                                    {item.checkInTime} <span className="uppercase text-slate-400">({item.method})</span>
+                                    {item.notes ? <span className="font-sans text-slate-400"> • {item.notes}</span> : null}
+                                  </span>
+                                ) : (
+                                  <span className="font-sans text-slate-400">Belum ada catatan sesi ini</span>
+                                )}
+                              </div>
+                            </td>
+                            <td className="px-3 py-2.5">
+                              <div className="inline-flex flex-wrap items-center gap-1">
+                                {MANUAL_STATUS_OPTIONS.map((opt) => {
+                                  const isSelected = item.hasAttended && item.status === opt.status;
+                                  return (
+                                    <button
+                                      key={opt.status}
+                                      type="button"
+                                      disabled={isRowSaving}
+                                      onClick={() =>
+                                        void handleQuickManualAttendance(
+                                          item.student,
+                                          opt.status,
+                                          item.status,
+                                          item.hasAttended,
+                                          item.method
+                                        )
+                                      }
+                                      className={`px-2 py-1 rounded border text-[11px] font-semibold transition-colors disabled:opacity-50 ${
+                                        isSelected ? opt.activeClass : opt.idleClass
+                                      }`}
+                                    >
+                                      {opt.shortLabel}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </td>
+                            <td className="px-3 py-2.5 text-right">
+                              <button
+                                type="button"
+                                onClick={() => setProfileStudent(item.student)}
+                                className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-[11px] font-medium text-slate-700 dark:text-slate-300"
+                              >
+                                Detail
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

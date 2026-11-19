@@ -4,7 +4,7 @@ import { Sidebar } from './components/layout/Sidebar.js';
 import { Header } from './components/layout/Header.js';
 import { OfflineIndicatorBanner } from './components/pwa/OfflineIndicatorBanner.js';
 import { DutyLoginScreen } from './components/modals/AuthLoginModal.js';
-import { CheckCircle2, AlertCircle, Info, X, Lock, AlertTriangle, RefreshCw, Trash2, ShieldCheck } from 'lucide-react';
+import { CheckCircle2, AlertCircle, Info, X, Lock, AlertTriangle, RefreshCw, Trash2 } from 'lucide-react';
 
 const DashboardView = React.lazy(() => import('./views/DashboardView.js').then((m) => ({ default: m.DashboardView })));
 const AttendanceView = React.lazy(() => import('./views/AttendanceView.js').then((m) => ({ default: m.AttendanceView })));
@@ -71,14 +71,9 @@ const MainAppContent: React.FC = () => {
   const {
     session,
     activeTab,
-    setActiveTab,
     logout,
     toasts,
     dismissToast,
-    isInitialLoading,
-    configError,
-    appsScriptUrl,
-    appsScriptSecretConfigured,
     confirmDialog,
     saveStatus,
     conflictPrompt,
@@ -98,28 +93,6 @@ const MainAppContent: React.FC = () => {
       <div className="flex-1 flex flex-col min-w-0 lg:pl-64">
         <Header onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)} />
 
-        {!isInitialLoading && (configError || !appsScriptUrl || !appsScriptSecretConfigured) && (
-          <div className="bg-rose-600 text-white px-4 py-2.5 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 border-b border-rose-700">
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 shrink-0" />
-              <span>
-                <strong>Koneksi Apps Script Perlu Diperiksa:</strong>{' '}
-                {configError || 'URL Web App atau SECRET_TOKEN belum diatur di perangkat ini.'}
-              </span>
-            </div>
-            {session?.lockedMenuRole === 'admin' && activeTab !== 'system_check' && (
-              <button
-                type="button"
-                onClick={() => setActiveTab('system_check')}
-                className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-white text-rose-700 font-bold hover:bg-rose-50 shrink-0 self-start sm:self-center"
-              >
-                <ShieldCheck className="w-3.5 h-3.5" />
-                <span>Buka Cek Sistem</span>
-              </button>
-            )}
-          </div>
-        )}
-
         <OfflineIndicatorBanner />
 
         <main className="flex-1 pb-12">
@@ -128,7 +101,12 @@ const MainAppContent: React.FC = () => {
             {activeTab === 'attendance' && <AttendanceView />}
             {activeTab === 'out_of_class' && <OutOfClassView />}
             {activeTab === 'violations' && <ViolationsView />}
-            {activeTab === 'system_check' && <SystemCheckView />}
+            {activeTab === 'system_check' &&
+              (session?.lockedMenuRole === 'admin' ? (
+                <SystemCheckView />
+              ) : (
+                <LockedRolePlaceholder role="admin" onGoToLogin={logout} />
+              ))}
             {activeTab === 'homeroom' &&
               (session?.lockedMenuRole === 'homeroom' ? (
                 <HomeroomView />

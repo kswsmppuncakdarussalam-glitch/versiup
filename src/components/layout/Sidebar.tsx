@@ -49,7 +49,9 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, onClose }) => {
     { id: 'attendance' as ActiveTab, label: '2. Presensi Siswa', icon: UserCheck },
     { id: 'out_of_class' as ActiveTab, label: '3. Izin Keluar Kelas', icon: DoorOpen },
     { id: 'violations' as ActiveTab, label: '4. Pelanggaran', icon: AlertTriangle },
-    { id: 'system_check' as ActiveTab, label: '5. Cek Sistem', icon: ShieldCheck },
+    ...(session?.lockedMenuRole === 'admin'
+      ? [{ id: 'system_check' as ActiveTab, label: '5. Cek Sistem', icon: ShieldCheck }]
+      : []),
   ];
 
   const lockedRoleLabel =
