@@ -17,8 +17,10 @@ import {
   EyeOff,
   Lock,
   Unlock,
+  Share2,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
+import { buildShareableDeviceConfigUrl, copyTextSafe } from '../../utils/apiClient.js';
 import appsScriptSource from '../../../apps-script/Code.gs?raw';
 
 interface AppsScriptPanelProps {
@@ -64,14 +66,32 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
     }
   }, [isConnected]);
 
+  const [copiedDeviceLink, setCopiedDeviceLink] = useState(false);
+
   const handleCopyCode = async () => {
-    try {
-      await navigator.clipboard.writeText(appsScriptSource);
+    const ok = await copyTextSafe(appsScriptSource);
+    if (ok) {
       setCopied(true);
       showToast('Kode Google Apps Script (Code.gs) berhasil disalin ke clipboard.', 'success');
       setTimeout(() => setCopied(false), 2500);
-    } catch {
+    } else {
       showToast('Gagal menyalin otomatis. Gunakan tombol Unduh Code.gs.', 'error');
+    }
+  };
+
+  const handleCopyDeviceLink = async () => {
+    const shareUrl = buildShareableDeviceConfigUrl();
+    if (!shareUrl) {
+      showToast('URL dan Token belum lengkap.', 'error');
+      return;
+    }
+    const ok = await copyTextSafe(shareUrl);
+    if (ok) {
+      setCopiedDeviceLink(true);
+      showToast('Link koneksi perangkat lain tersalin. Buka sekali di HP/Laptop lain untuk mengunci koneksi otomatis.', 'success');
+      setTimeout(() => setCopiedDeviceLink(false), 3000);
+    } else {
+      showToast('Gagal menyalin link otomatis. Pastikan izin clipboard aktif.', 'error');
     }
   };
 
@@ -236,16 +256,27 @@ export const AppsScriptPanel: React.FC<AppsScriptPanelProps> = ({ compact = fals
 
       {/* Ringkasan status tersimpan (TANPA menampilkan nilai URL atau token) */}
       {isConnected && !showUrlEditor && (
-        <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-white/80 dark:bg-slate-900/80 border border-emerald-200 dark:border-emerald-800/80 text-[11px]">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-3 py-2 rounded-lg bg-white/80 dark:bg-slate-900/80 border border-emerald-200 dark:border-emerald-800/80 text-[11px]">
           <div className="flex items-center gap-2 min-w-0">
             <Lock className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
             <span className="font-semibold text-slate-700 dark:text-slate-300">
               URL Web App &amp; SECRET_TOKEN Terkunci (Nilai Disembunyikan)
             </span>
           </div>
-          <span className="text-[10px] font-semibold text-emerald-700 dark:text-emerald-300 shrink-0">
-            Sinkron Real-Time (ms)
-          </span>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleCopyDeviceLink}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-[10px] transition-colors"
+              title="Salin tautan khusus agar HP / Laptop lain langsung terhubung tanpa ketik URL & Token"
+            >
+              {copiedDeviceLink ? <CheckCircle2 className="w-3 h-3" /> : <Share2 className="w-3 h-3" />}
+              <span>{copiedDeviceLink ? 'Link Perangkat Tersalin' : 'Salin Link Perangkat Lain'}</span>
+            </button>
+            <span className="text-[10px] font-semibold text-emerald-700 dark:text-emerald-300 hidden md:inline">
+              Sinkron Real-Time (ms)
+            </span>
+          </div>
         </div>
       )}
 

@@ -2488,6 +2488,51 @@ function resolveSessionSchedule_(sessions, now, autoSwitchEnabled, manualOverrid
   return { activeSession: smartFallback, liveWindowSession: null };
 }
 
+function checkSessionAttendanceOpen_(sess, now) {
+  if (!sess) {
+    return {
+      open: false,
+      reason: 'no_session',
+      message: 'Presensi ditutup: tidak ada sesi presensi yang tersedia.',
+    };
+  }
+  if (sess.is_active === false) {
+    return {
+      open: false,
+      reason: 'inactive',
+      message: 'Presensi ditutup: sesi "' + sess.name + '" sedang dinonaktifkan.',
+    };
+  }
+  var clock = getLocalClockParts_(now || new Date());
+  if (Array.isArray(sess.active_days) && sess.active_days.length > 0 && sess.active_days.indexOf(clock.dayOfWeek) === -1) {
+    return {
+      open: false,
+      reason: 'wrong_day',
+      message: 'Presensi ditutup: sesi "' + sess.name + '" tidak dijadwalkan aktif hari ini.',
+    };
+  }
+  var startMin = parseTimeToMinutes_(sess.start_time);
+  var endMin = parseTimeToMinutes_(sess.end_time);
+  if (!isTimeInWindow_(clock.totalMinutes, startMin, endMin)) {
+    var isUpcoming = (endMin >= startMin)
+      ? (clock.totalMinutes < startMin)
+      : (clock.totalMinutes > endMin && clock.totalMinutes < startMin);
+    if (isUpcoming) {
+      return {
+        open: false,
+        reason: 'upcoming',
+        message: 'Presensi ditutup: sesi "' + sess.name + '" belum dimulai (jadwal ' + sess.start_time + ' - ' + sess.end_time + ').',
+      };
+    }
+    return {
+      open: false,
+      reason: 'closed',
+      message: 'Presensi ditutup: batas waktu sesi "' + sess.name + '" (' + sess.start_time + ' - ' + sess.end_time + ') telah berakhir.',
+    };
+  }
+  return { open: true, reason: 'open', message: '' };
+}
+
 function syncSessionRecapSheet_(ss, targetDate, dbOpt) {
   var studentsList = (dbOpt && dbOpt.students) || getStudentsFast_(ss);
   var sessionsList = (dbOpt && dbOpt.sessions) || getSessionsFast_(ss);
@@ -4051,14 +4096,23 @@ function dispatchRoute_(req) {
 
             var sched = resolveSessionSchedule_(sessionsAtt, serverNow, autoSwitch, manualOverride ? sessionId : null);
             var matchedSess = null;
-            if (manualOverride && sessionId) {
-              matchedSess = sessionsAtt.filter(function (s) { return s.id === sessionId; })[0];
+            if (sessionId) {
+              matchedSess = sessionsAtt.filter(function (s) { return s.id === sessionId; })[0] || null;
             } else if (autoSwitch && sched.liveWindowSession) {
               matchedSess = sched.liveWindowSession;
-            } else if (sessionId) {
-              matchedSess = sessionsAtt.filter(function (s) { return s.id === sessionId && s.is_active; })[0];
             }
-            var activeSess = matchedSess || sched.activeSession || sessionsAtt.filter(function (s) { return s.is_active; })[0] || sessionsAtt[0];
+            var activeSess = sessionId ? matchedSess : (matchedSess || sched.activeSession || null);
+
+            var winCheck = checkSessionAttendanceOpen_(activeSess, serverNow);
+            if (!winCheck.open) {
+              immedRejections.push({
+                code: code,
+                studentId: student.nis,
+                sessionClosed: true,
+                message: winCheck.message,
+              });
+              return;
+            }
 
             var activeLeave = leaveAtt.filter(function (l) {
               return l.student_id === student.nis && l.status === 'approved' && curDateStr >= l.start_date && curDateStr <= l.end_date;
@@ -4144,6 +4198,7 @@ function dispatchRoute_(req) {
             if (batchRes.saved.length === 0 && allRej.length > 0) {
               return makeResp_(400, {
                 error: allRej[0].message,
+                sessionClosed: Boolean(allRej[0].sessionClosed),
                 isDuplicate: Boolean(allRej[0].isDuplicate),
                 existingRecord: allRej[0].existingRecord,
                 student: prepared[0] ? stuByRec[prepared[0].id] : undefined,
@@ -4159,6 +4214,15 @@ function dispatchRoute_(req) {
               deltaApplied: true,
               rev: revVal,
               seq: seqVal,
+            });
+          }
+
+          if (batchRes.saved.length === 0 && allRej.length > 0 && allRej.every(function (r) { return Boolean(r.sessionClosed); })) {
+            return makeResp_(400, {
+              error: allRej[0].message,
+              sessionClosed: true,
+              rejectedDuplicates: allRej,
+              serverTime: serverNow.toISOString(),
             });
           }
 
@@ -4205,6 +4269,16 @@ function dispatchRoute_(req) {
 
           var sessionsPut = getSessionsFast_(ssAtt);
           var targetTabPut = findAttendanceTabForId_(ssAtt, body.id, sessionsPut) || SHEET_TABS.PRESENSI;
+          if (body.enforceSessionWindow) {
+            var existingRowsPut = readTabWithRowNumbers_(ssAtt, targetTabPut);
+            var existingPutRow = existingRowsPut.filter(function (r) { return r.data && r.data.id === body.id; })[0];
+            var sessIdPut = existingPutRow && existingPutRow.data && existingPutRow.data.session_id;
+            var sessObjPut = sessionsPut.filter(function (s) { return s.id === sessIdPut; })[0] || null;
+            var putWinCheck = checkSessionAttendanceOpen_(sessObjPut, new Date());
+            if (!putWinCheck.open) {
+              return makeResp_(400, { error: putWinCheck.message, sessionClosed: true });
+            }
+          }
           var updRes = updateRowPartial_(ssAtt, {
             tabName: targetTabPut,
             id: body.id,

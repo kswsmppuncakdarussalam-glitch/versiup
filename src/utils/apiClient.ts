@@ -23,6 +23,27 @@ const SESSION_STORAGE_KEY = 'dkb_session';
 let memoryAppsScriptUrl = '';
 let memoryAppsScriptSecret = '';
 let memoryConfigLocked = false;
+let hashConfigChecked = false;
+
+function encodeBase64UrlUtf8(str: string): string {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    bin += String.fromCharCode(bytes[i]);
+  }
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function decodeBase64UrlUtf8(b64u: string): string {
+  const b64 = b64u.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4);
+  const bin = atob(padded);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) {
+    bytes[i] = bin.charCodeAt(i);
+  }
+  return new TextDecoder().decode(bytes);
+}
 
 function getBuildEnvAppsScriptUrl(): string {
   try {
@@ -471,11 +492,93 @@ export async function clearServerAppsScriptUrl(): Promise<void> {
   }
 }
 
+export function readAndApplyHashConfig(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    const hash = window.location.hash || '';
+    if (!hash.startsWith('#dkb_cfg=')) {
+      hashConfigChecked = true;
+      return false;
+    }
+    const rawEncoded = hash.slice('#dkb_cfg='.length).split('&')[0];
+    if (!rawEncoded) return false;
+    const decoded = JSON.parse(decodeBase64UrlUtf8(rawEncoded));
+    const url = normalizeAppsScriptUrl(decoded?.u);
+    const secret = String(decoded?.s || '').trim();
+    if (isValidAppsScriptUrl(url) && !isAppsScriptDevUrl(url) && secret) {
+      setAppsScriptUrl(url);
+      setAppsScriptSecretToken(secret);
+      setAppsScriptConfigLocked(true);
+      hashConfigChecked = true;
+      try {
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+      } catch {}
+      void persistServerAppsScriptConfig(url, secret);
+      return true;
+    }
+  } catch {
+    // Abaikan hash rusak
+  }
+  hashConfigChecked = true;
+  return false;
+}
+
+if (typeof window !== 'undefined') {
+  readAndApplyHashConfig();
+}
+
+export function buildShareableDeviceConfigUrl(): string {
+  if (typeof window === 'undefined') return '';
+  const url = getAppsScriptUrl();
+  const secret = getAppsScriptSecretToken();
+  if (!url || !secret) return '';
+  try {
+    const encoded = encodeBase64UrlUtf8(JSON.stringify({ u: url, s: secret }));
+    return `${window.location.origin}/#dkb_cfg=${encoded}`;
+  } catch {
+    return '';
+  }
+}
+
+export async function copyTextSafe(text: string): Promise<boolean> {
+  if (!text) return false;
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Lanjut ke fallback textarea
+  }
+  try {
+    if (typeof document !== 'undefined') {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.top = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return Boolean(ok);
+    }
+  } catch {
+    // Ignore
+  }
+  return false;
+}
+
 export async function hydrateAppsScriptConfig(): Promise<{
   appsScriptUrl: string;
   secretToken: string;
   locked: boolean;
 }> {
+  if (!hashConfigChecked) {
+    readAndApplyHashConfig();
+  }
   let currentUrl = getAppsScriptUrl();
   let currentSecret = getAppsScriptSecretToken();
 
@@ -633,17 +736,35 @@ export async function apiFetch(
     body: parsedBody,
   };
 
-  const res = await fetch(scriptUrl, {
-    method: 'POST',
-    mode: 'cors',
-    credentials: 'omit',
-    cache: 'no-store',
-    redirect: 'follow',
-    headers: {
-      'Content-Type': 'text/plain;charset=utf-8',
-    },
-    body: JSON.stringify(envelope),
-  });
+  const timeoutController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timeoutTimer = timeoutController
+    ? setTimeout(() => {
+        timeoutController.abort();
+      }, 30000)
+    : null;
+
+  let res: Response;
+  try {
+    res = await fetch(scriptUrl, {
+      method: 'POST',
+      mode: 'cors',
+      credentials: 'omit',
+      cache: 'no-store',
+      redirect: 'follow',
+      headers: {
+        'Content-Type': 'text/plain;charset=utf-8',
+      },
+      body: JSON.stringify(envelope),
+      ...(timeoutController ? { signal: timeoutController.signal } : {}),
+    });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Koneksi ke Google Apps Script terlalu lama (timeout). Periksa internet perangkat Anda.');
+    }
+    throw err;
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+  }
 
   const rawText = await res.text();
   let jsonData: any = null;

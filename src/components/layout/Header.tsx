@@ -5,6 +5,7 @@ import {
   Maximize2,
   Minimize2,
   Lock,
+  LogOut,
   Volume2,
   VolumeX,
   Calendar,
@@ -33,6 +34,7 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
     activeTab,
     setActiveTab,
     lockCurrentMenu,
+    logout,
     settings,
     updateSettings,
     saveStatus,
@@ -46,30 +48,30 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
   };
 
   return (
-    <header className="sticky top-0 z-30 flex items-center justify-between h-14 px-4 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800">
+    <header className="sticky top-0 z-30 flex items-center justify-between gap-2 h-14 px-2.5 sm:px-4 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800">
       {/* Left: Mobile menu & School info */}
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-2 sm:gap-3 min-w-0">
         <button
           onClick={onToggleSidebar}
-          className="p-1.5 -ml-1 text-slate-500 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 lg:hidden"
+          className="p-1.5 -ml-1 text-slate-500 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 lg:hidden shrink-0"
         >
           <Menu className="w-5 h-5" />
         </button>
 
         {/* Mobile School Logo & Title */}
-        <div className="flex items-center gap-2 lg:hidden">
+        <div className="flex items-center gap-1.5 sm:gap-2 lg:hidden min-w-0">
           {logoSrc ? (
             <img
               src={logoSrc}
               alt="Logo"
-              className="w-6 h-6 rounded object-contain bg-white dark:bg-slate-800 p-0.5 border border-slate-200 dark:border-slate-700"
+              className="w-6 h-6 rounded object-contain bg-white dark:bg-slate-800 p-0.5 border border-slate-200 dark:border-slate-700 shrink-0"
             />
           ) : (
-            <div className="w-6 h-6 rounded bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 font-bold text-[10px] flex items-center justify-center">
+            <div className="w-6 h-6 rounded bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 font-bold text-[10px] flex items-center justify-center shrink-0">
               DKB
             </div>
           )}
-          <span className="text-xs font-semibold text-slate-800 dark:text-slate-200 truncate max-w-[130px]" title={settings.school_name}>
+          <span className="text-xs font-semibold text-slate-800 dark:text-slate-200 truncate max-w-[85px] sm:max-w-[130px]" title={settings.school_name}>
             {settings.school_name || 'DKB'}
           </span>
         </div>
@@ -107,9 +109,9 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
         )}
 
         {/* Active Multi-User Role Badge */}
-        <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs text-slate-700 dark:text-slate-300">
-          <User className="w-3.5 h-3.5 text-indigo-500" />
-          <span className="font-semibold text-slate-800 dark:text-slate-200">
+        <div className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs text-slate-700 dark:text-slate-300 min-w-0">
+          <User className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+          <span className="font-semibold text-slate-800 dark:text-slate-200 truncate max-w-[90px] sm:max-w-none">
             {session?.lockedMenuRole === 'admin'
               ? 'Administrator'
               : session?.lockedMenuRole === 'student_affairs'
@@ -125,7 +127,7 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
             <button
               type="button"
               onClick={() => session.lockedMenuRole && setActiveTab(session.lockedMenuRole)}
-              className="ml-1 px-1.5 py-0.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 text-[10px] font-semibold hover:opacity-90 transition-opacity"
+              className="ml-1 px-1.5 py-0.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 text-[10px] font-semibold hover:opacity-90 transition-opacity shrink-0"
             >
               Buka Portal
             </button>
@@ -134,7 +136,7 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
       </div>
 
       {/* Right: Read-only Write/Sheets Status, Server Clock, Kiosk mode, Audio toggle */}
-      <div className="flex items-center gap-2 sm:gap-3">
+      <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
         <PWAInstallButton compact={true} />
 
         {/* Read-only Write Status Pill ('Menyimpan...' / 'Tersimpan' / Error) */}
@@ -188,8 +190,8 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
           {isKioskFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
         </button>
 
-        {/* "Kunci & Keluar" button if logged in with elevated role */}
-        {isLockedMenuOpen && (
+        {/* Direct Logout button from any menu back to Login screen */}
+        {isLockedMenuOpen ? (
           <button
             onClick={lockCurrentMenu}
             title="Kunci sesi dan kembali ke Menu Awal Login"
@@ -197,6 +199,15 @@ export const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
           >
             <Lock className="w-3.5 h-3.5" />
             <span className="hidden sm:inline">Kunci &amp; Keluar</span>
+          </button>
+        ) : (
+          <button
+            onClick={logout}
+            title="Keluar dan kembali ke Menu Awal Login"
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded hover:bg-rose-100 transition-colors"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Keluar</span>
           </button>
         )}
       </div>

@@ -29,7 +29,7 @@ import { useApp } from '../context/AppContext.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { Student, SchoolClass, AttendanceStatus } from '../types/index.js';
 import { exportToExcel, exportSessionRecapToExcel } from '../utils/excel.js';
-import { buildSessionRecapData } from '../utils/sessionHelper.js';
+import { buildSessionRecapData, checkSessionAttendanceOpen } from '../utils/sessionHelper.js';
 import { formatIndonesianDate } from '../utils/time.js';
 
 type DateFilter = 'today' | 'week' | 'month' | 'semester';
@@ -119,6 +119,11 @@ export const DashboardView: React.FC = () => {
     [sessions, modalTargetSessionId]
   );
 
+  const modalSessionWindow = useMemo(
+    () => checkSessionAttendanceOpen(modalTargetSessionObj, currentServerTime),
+    [modalTargetSessionObj, currentServerTime]
+  );
+
   const handleQuickManualAttendance = async (
     student: Student,
     nextStatus: AttendanceStatus,
@@ -128,6 +133,10 @@ export const DashboardView: React.FC = () => {
   ) => {
     if (!modalTargetSessionId) {
       showToast('Belum ada sesi presensi yang aktif/dipilih.', 'error');
+      return;
+    }
+    if (!modalSessionWindow.open) {
+      showToast(modalSessionWindow.message, 'error');
       return;
     }
     if (hasAttended && currentStatus === nextStatus && currentMethod === 'manual') {
@@ -142,11 +151,7 @@ export const DashboardView: React.FC = () => {
         method: 'manual',
       });
       if (res.success) {
-        const sessName = modalTargetSessionObj?.name || 'sesi aktif';
-        showToast(
-          `${res.syncedFromExisting ? 'Sinkron' : 'Tersimpan'}: ${student.name} → ${nextStatus} (${sessName}).`,
-          'success'
-        );
+        showToast('Tersimpan', 'success');
       } else if (!res.offlineQueued) {
         showToast(res.error || 'Gagal menyimpan presensi manual.', 'error');
       }
@@ -584,21 +589,45 @@ export const DashboardView: React.FC = () => {
           {drilldown.level === 'students' && (
             <div className="space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-100 dark:border-slate-800 text-xs">
-                <span className="text-slate-500">
-                  Pilih status presensi manual per siswa untuk sesi aktif agar langsung sinkron dengan Scan/RFID &amp; Google Sheets:
-                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-slate-500">
+                    Pilih status presensi manual per siswa agar langsung sinkron dengan Scan/RFID &amp; Google Sheets:
+                  </span>
+                  <span
+                    className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                      modalSessionWindow.open
+                        ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                        : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300'
+                    }`}
+                  >
+                    {modalSessionWindow.open ? 'Sesi Dibuka' : 'Presensi Ditutup'}
+                  </span>
+                </div>
                 <select
                   value={modalTargetSessionId}
                   onChange={(e) => setSelectedOverviewSessionId(e.target.value)}
                   className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-white font-medium"
                 >
-                  {sessions.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      Sesi: {s.name} ({s.start_time}-{s.end_time}){activeSession?.id === s.id ? ' • Aktif' : ''}
-                    </option>
-                  ))}
+                  {sessions.map((s) => {
+                    const win = checkSessionAttendanceOpen(s, currentServerTime);
+                    const tag = win.open ? ' • Dibuka' : win.reason === 'upcoming' ? ' • Belum Mulai' : ' • Ditutup';
+                    return (
+                      <option key={s.id} value={s.id}>
+                        Sesi: {s.name} ({s.start_time}-{s.end_time}){tag}
+                      </option>
+                    );
+                  })}
                 </select>
               </div>
+              {!modalSessionWindow.open && (
+                <div className="px-3 py-2 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-200 flex items-start gap-2 text-xs">
+                  <AlertTriangle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-bold">Presensi Manual Ditutup</p>
+                    <p className="text-[11px]">{modalSessionWindow.message}</p>
+                  </div>
+                </div>
+              )}
               <div className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
                 {students
                   .filter((s) => s.class_id === drilldown.classId)
@@ -648,7 +677,7 @@ export const DashboardView: React.FC = () => {
                                 <button
                                   key={opt.status}
                                   type="button"
-                                  disabled={isRowSaving}
+                                  disabled={isRowSaving || !modalSessionWindow.open}
                                   onClick={() =>
                                     void handleQuickManualAttendance(
                                       s,
@@ -1348,16 +1377,29 @@ export const DashboardView: React.FC = () => {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+                  <span
+                    className={`px-2 py-1 rounded text-[10px] font-bold ${
+                      modalSessionWindow.open
+                        ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                        : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300'
+                    }`}
+                  >
+                    {modalSessionWindow.open ? 'Sesi Dibuka' : 'Ditutup'}
+                  </span>
                   <select
                     value={modalTargetSessionId}
                     onChange={(e) => setSelectedOverviewSessionId(e.target.value)}
                     className="px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs text-slate-900 dark:text-white font-medium"
                   >
-                    {sessions.map((s) => (
-                      <option key={s.id} value={s.id}>
-                        Sesi: {s.name} ({s.start_time}-{s.end_time}){activeSession?.id === s.id ? ' • Aktif' : ''}
-                      </option>
-                    ))}
+                    {sessions.map((s) => {
+                      const win = checkSessionAttendanceOpen(s, currentServerTime);
+                      const tag = win.open ? ' • Dibuka' : win.reason === 'upcoming' ? ' • Belum Mulai' : ' • Ditutup';
+                      return (
+                        <option key={s.id} value={s.id}>
+                          Sesi: {s.name} ({s.start_time}-{s.end_time}){tag}
+                        </option>
+                      );
+                    })}
                   </select>
 
                   {/* Search input in modal */}
@@ -1373,6 +1415,15 @@ export const DashboardView: React.FC = () => {
                   </div>
                 </div>
               </div>
+              {!modalSessionWindow.open && (
+                <div className="px-3 py-2 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-200 flex items-start gap-2 text-xs">
+                  <AlertTriangle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-bold">Presensi Manual Ditutup Untuk Sesi Ini</p>
+                    <p className="text-[11px]">{modalSessionWindow.message}</p>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Students Table */}
@@ -1463,7 +1514,7 @@ export const DashboardView: React.FC = () => {
                                     <button
                                       key={opt.status}
                                       type="button"
-                                      disabled={isRowSaving}
+                                      disabled={isRowSaving || !modalSessionWindow.open}
                                       onClick={() =>
                                         void handleQuickManualAttendance(
                                           item.student,

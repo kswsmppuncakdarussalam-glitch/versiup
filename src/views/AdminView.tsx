@@ -136,6 +136,7 @@ export const AdminView: React.FC = () => {
 
   // Student CRUD & Import states
   const [editingStudent, setEditingStudent] = useState<Partial<Student> | null>(null);
+  const [isSavingStudent, setIsSavingStudent] = useState(false);
   const [importRows, setImportRows] = useState<StudentImportRow[] | null>(null);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isImportingStudents, setIsImportingStudents] = useState(false);
@@ -156,9 +157,11 @@ export const AdminView: React.FC = () => {
 
   // Session CRUD state
   const [editingSession, setEditingSession] = useState<Partial<AttendanceSession> | null>(null);
+  const [isSavingSession, setIsSavingSession] = useState(false);
 
   // Class CRUD state
   const [editingClass, setEditingClass] = useState<Partial<SchoolClass> | null>(null);
+  const [isSavingClass, setIsSavingClass] = useState(false);
 
   // Violation Type CRUD state
   const [editingVType, setEditingVType] = useState<Partial<ViolationType> | null>(null);
@@ -174,6 +177,9 @@ export const AdminView: React.FC = () => {
   const [targetConfirmPassword, setTargetConfirmPassword] = useState('');
   const [showPasswordText, setShowPasswordText] = useState(false);
   const [updatingPassword, setUpdatingPassword] = useState(false);
+  const updatingPasswordRef = useRef(false);
+  updatingPasswordRef.current = updatingPassword;
+  const isMountedRef = useRef(true);
 
   // New account form state
   const [isNewAccountModalOpen, setIsNewAccountModalOpen] = useState(false);
@@ -244,12 +250,20 @@ export const AdminView: React.FC = () => {
   }, [notificationSettings.weekly_recap_day, notificationSettings.weekly_recap_time]);
 
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
       if (schoolNameTimerRef.current) clearTimeout(schoolNameTimerRef.current);
       const pendingPatch = pendingDebouncedPatchRef.current;
-      if (Object.keys(pendingPatch).length > 0) {
-        pendingDebouncedPatchRef.current = {};
+      pendingDebouncedPatchRef.current = {};
+      let hasActiveSession = false;
+      try {
+        hasActiveSession = Boolean(localStorage.getItem('dkb_session'));
+      } catch {
+        hasActiveSession = false;
+      }
+      if (Object.keys(pendingPatch).length > 0 && hasActiveSession) {
         void updateSettingsRef.current(pendingPatch, { silent: true });
       }
     };
@@ -273,11 +287,15 @@ export const AdminView: React.FC = () => {
     };
   };
 
-  const fetchAdminWithRetry = async (url: string, options: RequestInit & { extraHeaders?: Record<string, string> } = {}) => {
-    const { extraHeaders, ...rest } = options;
+  const fetchAdminWithRetry = async (
+    url: string,
+    options: RequestInit & { extraHeaders?: Record<string, string>; isBackgroundPoll?: boolean } = {}
+  ) => {
+    const { extraHeaders, isBackgroundPoll = false, ...rest } = options;
+    const sentToken = session?.token || '';
     let res = await apiFetch(url, {
       ...rest,
-      headers: getAdminHeaders(extraHeaders),
+      headers: getAdminHeaders(extraHeaders, sentToken),
     });
     let data = await safeReadJson(res);
 
@@ -286,9 +304,15 @@ export const AdminView: React.FC = () => {
         window.dispatchEvent(new CustomEvent('dkb-apps-script-unauthorized', { detail: data }));
         return { res, data };
       }
-      if (session?.token) {
-        const refreshedTok = await refreshAuthSession(true);
-        if (refreshedTok) {
+      let hasActiveSession = false;
+      try {
+        hasActiveSession = Boolean(localStorage.getItem('dkb_session'));
+      } catch {
+        hasActiveSession = false;
+      }
+      if (sentToken && isMountedRef.current && hasActiveSession) {
+        const refreshedTok = await refreshAuthSession(!isBackgroundPoll, sentToken);
+        if (refreshedTok && isMountedRef.current) {
           res = await apiFetch(url, {
             ...rest,
             headers: getAdminHeaders(extraHeaders, refreshedTok),
@@ -303,22 +327,30 @@ export const AdminView: React.FC = () => {
   // Fetch all user accounts from server (with automatic 401 session renewal)
   const fetchUsers = async () => {
     if (!session?.token || configError || !appsScriptUrl || !appsScriptSecretConfigured) return;
-    setLoadingUsers(true);
+    if (isMountedRef.current) setLoadingUsers(true);
     try {
-      const { res, data } = await fetchAdminWithRetry('/api/auth?action=manage_accounts');
-      if (res.ok && Array.isArray(data.users)) {
+      const { res, data } = await fetchAdminWithRetry('/api/auth?action=manage_accounts', {
+        isBackgroundPoll: true,
+      });
+      if (isMountedRef.current && res.ok && Array.isArray(data.users)) {
         setUsersList(data.users);
       }
     } catch {
       // Abaikan gangguan jaringan sementara; pembaruan otomatis berjalan di latar belakang.
     } finally {
-      setLoadingUsers(false);
+      if (isMountedRef.current) setLoadingUsers(false);
     }
   };
 
   useEffect(() => {
-    if ((activeSection === 'accounts' || !usersList.length) && !configError && Boolean(appsScriptUrl) && appsScriptSecretConfigured) {
-      fetchUsers();
+    if (
+      session?.token &&
+      (activeSection === 'accounts' || !usersList.length) &&
+      !configError &&
+      Boolean(appsScriptUrl) &&
+      appsScriptSecretConfigured
+    ) {
+      void fetchUsers();
     }
   }, [activeSection, session?.token, configError, appsScriptUrl, appsScriptSecretConfigured]);
 
@@ -327,7 +359,10 @@ export const AdminView: React.FC = () => {
       return;
     }
     const timer = window.setInterval(() => {
-      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+      if (
+        !updatingPasswordRef.current &&
+        (typeof document === 'undefined' || document.visibilityState === 'visible')
+      ) {
         void fetchUsers();
       }
     }, 1500);
@@ -361,10 +396,8 @@ export const AdminView: React.FC = () => {
 
       if (data.refreshedToken) {
         updateSessionToken(data.refreshedToken);
-        showToast('Password Administrator sendiri berhasil diperbarui! Sesi browser ini diperbarui otomatis, perangkat lain telah dikeluarkan.', 'success');
-      } else {
-        showToast(`Password untuk "${targetUser.name}" berhasil diperbarui. Sesi perangkat lain otomatis dikeluarkan.`, 'success');
       }
+      showToast('Tersimpan', 'success');
 
       setTargetNewPassword('');
       setTargetConfirmPassword('');
@@ -407,20 +440,8 @@ export const AdminView: React.FC = () => {
 
       if (data.refreshedToken) {
         updateSessionToken(data.refreshedToken);
-        showToast('Password Administrator berhasil diperbarui! Sesi browser Anda tetap aktif tanpa terputus.', 'success');
-      } else {
-        const roleLabel =
-          targetRole === 'admin'
-            ? 'Administrator'
-            : targetRole === 'student_affairs'
-            ? 'Kesiswaan'
-            : targetRole === 'homeroom'
-            ? classId && classId !== 'all'
-              ? `Wali Kelas ${classId}`
-              : 'Seluruh Wali Kelas (Sandi Bersama)'
-            : 'Petugas Piket';
-        showToast(`Kata sandi ${roleLabel} berhasil diperbarui langsung tanpa perlu menambah akun!`, 'success');
       }
+      showToast('Tersimpan', 'success');
 
       await fetchUsers();
       void refreshFromSheets(true, { afterWrite: true });
@@ -466,7 +487,7 @@ export const AdminView: React.FC = () => {
         return;
       }
 
-      showToast(`Akun ${payload.name} berhasil dibuat.`, 'success');
+      showToast('Tersimpan', 'success');
       setIsNewAccountModalOpen(false);
       setNewAccountName('');
       setNewAccountLabel('');
@@ -601,13 +622,7 @@ export const AdminView: React.FC = () => {
 
       setIsImportModalOpen(false);
       setImportRows(null);
-
-      const parts: string[] = [];
-      if (res.added > 0) parts.push(`${res.added} siswa baru`);
-      if (res.updated > 0) parts.push(`${res.updated} siswa diperbarui`);
-      if ((res.classesCreated || 0) > 0) parts.push(`${res.classesCreated} kelas baru otomatis dibuat`);
-      const summaryText = parts.length > 0 ? parts.join(', ') : `${studentsToSave.length} siswa tersimpan`;
-      showToast(`Impor sukses & tersinkron: ${summaryText}.`, 'success');
+      showToast('Tersimpan', 'success');
     } finally {
       setIsImportingStudents(false);
     }
@@ -2402,9 +2417,10 @@ export const AdminView: React.FC = () => {
                   setIsUploadingLogo(true);
                   try {
                     const driveFileId = await uploadPhotoToBackend(file, `logo_sekolah_${Date.now()}.jpg`);
-                    setLogoUrlInput(driveFileId);
-                    await updateSettings({ logo_url: driveFileId });
-                    showToast('Logo sekolah berhasil dikompresi, diunggah ke Drive & disimpan ke Sheets!', 'success');
+                    const ok = await updateSettings({ logo_url: driveFileId });
+                    if (ok) {
+                      setLogoUrlInput(driveFileId);
+                    }
                   } catch (err: any) {
                     showToast(err.message || 'Gagal mengunggah logo ke Google Drive.', 'error');
                   } finally {
@@ -2476,9 +2492,10 @@ export const AdminView: React.FC = () => {
                       setIsUploadingLogo(true);
                       try {
                         const driveFileId = await uploadPhotoToBackend(file, `logo_sekolah_${Date.now()}.jpg`);
-                        setLogoUrlInput(driveFileId);
-                        await updateSettings({ logo_url: driveFileId });
-                        showToast('Logo berhasil dikompresi, diunggah ke Drive & disimpan!', 'success');
+                        const ok = await updateSettings({ logo_url: driveFileId });
+                        if (ok) {
+                          setLogoUrlInput(driveFileId);
+                        }
                       } catch (err: any) {
                         showToast(err.message || 'Gagal mengunggah logo ke Google Drive.', 'error');
                       } finally {
@@ -2529,9 +2546,10 @@ export const AdminView: React.FC = () => {
                             onClick={async () => {
                               setIsSavingLogo(true);
                               try {
-                                setLogoUrlInput(preset.dataUrl);
-                                await updateSettings({ logo_url: preset.dataUrl });
-                                showToast(`Logo template "${preset.name}" berhasil dipasang!`, 'success');
+                                const ok = await updateSettings({ logo_url: preset.dataUrl });
+                                if (ok) {
+                                  setLogoUrlInput(preset.dataUrl);
+                                }
                               } finally {
                                 setIsSavingLogo(false);
                               }
@@ -2731,20 +2749,22 @@ export const AdminView: React.FC = () => {
                   </button>
                   <button
                     type="button"
+                    disabled={isSavingName}
                     onClick={async () => {
                       setIsSavingName(true);
                       try {
-                        setSchoolNameInput('');
-                        await updateSettings({ school_name: '' });
-                        showToast('Nama sekolah berhasil dikosongkan.', 'success');
-                        setShowClearNameConfirm(false);
+                        const ok = await updateSettings({ school_name: '' });
+                        if (ok) {
+                          setSchoolNameInput('');
+                          setShowClearNameConfirm(false);
+                        }
                       } finally {
                         setIsSavingName(false);
                       }
                     }}
-                    className="px-3.5 py-1.5 rounded-md bg-red-600 hover:bg-red-700 text-white font-medium"
+                    className="px-3.5 py-1.5 rounded-md bg-red-600 hover:bg-red-700 text-white font-medium disabled:opacity-50"
                   >
-                    Ya, Hapus Nama
+                    {isSavingName ? 'Menyimpan...' : 'Ya, Hapus Nama'}
                   </button>
                 </div>
               </div>
@@ -2778,20 +2798,22 @@ export const AdminView: React.FC = () => {
                   </button>
                   <button
                     type="button"
+                    disabled={isSavingLogo}
                     onClick={async () => {
                       setIsSavingLogo(true);
                       try {
-                        setLogoUrlInput('');
-                        await updateSettings({ logo_url: '' });
-                        showToast('Logo sekolah berhasil dihapus. Kembali menggunakan monogram DKB.', 'success');
-                        setShowClearLogoConfirm(false);
+                        const ok = await updateSettings({ logo_url: '' });
+                        if (ok) {
+                          setLogoUrlInput('');
+                          setShowClearLogoConfirm(false);
+                        }
                       } finally {
                         setIsSavingLogo(false);
                       }
                     }}
-                    className="px-3.5 py-1.5 rounded-md bg-red-600 hover:bg-red-700 text-white font-medium"
+                    className="px-3.5 py-1.5 rounded-md bg-red-600 hover:bg-red-700 text-white font-medium disabled:opacity-50"
                   >
-                    Ya, Hapus Logo
+                    {isSavingLogo ? 'Menyimpan...' : 'Ya, Hapus Logo'}
                   </button>
                 </div>
               </div>
@@ -2983,8 +3005,10 @@ export const AdminView: React.FC = () => {
                 checked={settings.toggle_email_notifications && notificationSettings.email_enabled}
                 onChange={async (e) => {
                   const nextEnabled = e.target.checked;
-                  await updateSettings({ toggle_email_notifications: nextEnabled });
-                  await updateNotificationSettings({ email_enabled: nextEnabled }, { silent: true });
+                  const ok = await updateSettings({ toggle_email_notifications: nextEnabled }, { silent: true });
+                  if (ok) {
+                    await updateNotificationSettings({ email_enabled: nextEnabled });
+                  }
                 }}
                 className="w-4 h-4 rounded text-slate-900"
               />
@@ -3840,7 +3864,7 @@ export const AdminView: React.FC = () => {
                         `siswa_${(editingStudent.nis || Date.now()).toString()}.jpg`
                       );
                       setEditingStudent((prev) => (prev ? { ...prev, photo_url: fileId } : prev));
-                      showToast('Foto siswa diunggah ke Drive. Klik Simpan Data Siswa untuk menyimpan ke Sheet.', 'success');
+                      showToast('Foto siap. Klik Simpan Data Siswa.', 'info');
                     } catch (err: any) {
                       showToast(err.message || 'Gagal mengunggah foto siswa.', 'error');
                     } finally {
@@ -3880,7 +3904,9 @@ export const AdminView: React.FC = () => {
                 </button>
                 <button
                   type="button"
+                  disabled={isSavingStudent}
                   onClick={async () => {
+                    if (isSavingStudent) return;
                     const trimmedNis = (editingStudent.nis || '').trim();
                     const trimmedName = (editingStudent.name || '').trim();
                     const resolvedClassId = (editingStudent.class_id || classes[0]?.id || '').trim();
@@ -3888,18 +3914,25 @@ export const AdminView: React.FC = () => {
                       showToast('NIS, Nama Lengkap, dan Kelas wajib diisi.', 'error');
                       return;
                     }
-                    await saveStudent({
-                      ...(editingStudent as Student),
-                      nis: trimmedNis,
-                      name: trimmedName,
-                      class_id: resolvedClassId,
-                      card_code: (editingStudent.card_code || '').trim() || trimmedNis,
-                    });
-                    setEditingStudent(null);
+                    setIsSavingStudent(true);
+                    try {
+                      const ok = await saveStudent({
+                        ...(editingStudent as Student),
+                        nis: trimmedNis,
+                        name: trimmedName,
+                        class_id: resolvedClassId,
+                        card_code: (editingStudent.card_code || '').trim() || trimmedNis,
+                      });
+                      if (ok) {
+                        setEditingStudent(null);
+                      }
+                    } finally {
+                      setIsSavingStudent(false);
+                    }
                   }}
-                  className="px-4 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold transition-colors"
+                  className="px-4 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold transition-colors disabled:opacity-50"
                 >
-                  Simpan Data Siswa
+                  {isSavingStudent ? 'Menyimpan...' : 'Simpan Data Siswa'}
                 </button>
               </div>
             </div>
@@ -4019,7 +4052,7 @@ export const AdminView: React.FC = () => {
                     onChange={(e) => setEditingSession({ ...editingSession, end_time: e.target.value })}
                     className="w-full px-2.5 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-mono"
                   />
-                  <span className="text-[10px] text-slate-400 mt-0.5 block">Akhir sesi</span>
+                  <span className="text-[10px] text-slate-400 mt-0.5 block">Akhir sesi (lewat jam ini presensi ditutup)</span>
                 </div>
               </div>
 
@@ -4103,7 +4136,9 @@ export const AdminView: React.FC = () => {
               </button>
               <button
                 type="button"
+                disabled={isSavingSession}
                 onClick={async () => {
+                  if (isSavingSession) return;
                   if (!editingSession.name?.trim()) {
                     showToast('Nama sesi presensi wajib diisi.', 'error');
                     return;
@@ -4124,12 +4159,19 @@ export const AdminView: React.FC = () => {
                     created_at: editingSession.created_at || new Date().toISOString(),
                     updated_at: new Date().toISOString(),
                   };
-                  await saveSession(sessionToSave);
-                  setEditingSession(null);
+                  setIsSavingSession(true);
+                  try {
+                    const ok = await saveSession(sessionToSave);
+                    if (ok) {
+                      setEditingSession(null);
+                    }
+                  } finally {
+                    setIsSavingSession(false);
+                  }
                 }}
-                className="px-4 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold hover:bg-slate-800"
+                className="px-4 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold hover:bg-slate-800 disabled:opacity-50"
               >
-                Simpan Sesi Presensi
+                {isSavingSession ? 'Menyimpan...' : 'Simpan Sesi Presensi'}
               </button>
             </div>
           </div>
@@ -4270,7 +4312,9 @@ export const AdminView: React.FC = () => {
               </button>
               <button
                 type="button"
+                disabled={isSavingClass}
                 onClick={async () => {
+                  if (isSavingClass) return;
                   if (!editingClass.id?.trim() || !editingClass.name?.trim()) {
                     showToast('Kode ID dan Nama kelas wajib diisi.', 'error');
                     return;
@@ -4290,12 +4334,19 @@ export const AdminView: React.FC = () => {
                     created_at: editingClass.created_at || new Date().toISOString(),
                     updated_at: new Date().toISOString(),
                   };
-                  await saveClass(classToSave);
-                  setEditingClass(null);
+                  setIsSavingClass(true);
+                  try {
+                    const ok = await saveClass(classToSave);
+                    if (ok) {
+                      setEditingClass(null);
+                    }
+                  } finally {
+                    setIsSavingClass(false);
+                  }
                 }}
-                className="px-4 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold hover:bg-slate-800"
+                className="px-4 py-1.5 rounded bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900 font-semibold hover:bg-slate-800 disabled:opacity-50"
               >
-                Simpan Data Kelas & Email
+                {isSavingClass ? 'Menyimpan...' : 'Simpan Data Kelas & Email'}
               </button>
             </div>
           </div>

@@ -113,7 +113,7 @@ export const OutOfClassView: React.FC = () => {
     if (res.success && res.record) {
       const msg = `${selectedStudent.name}, izin ${permissionType} selama ${customDuration} menit dimulai.`;
       speak(msg);
-      showToast(msg, 'success');
+      showToast('Tersimpan', 'success');
 
       // Clear search and selection ready for next student
       setSelectedStudent(null);
@@ -126,20 +126,9 @@ export const OutOfClassView: React.FC = () => {
 
   // Confirm return by clicking big checkmark icon
   const handleConfirmReturn = async (recordId: string) => {
-    const rec = outOfClass.find((o) => o.id === recordId);
-    const student = students.find((s) => s.nis === rec?.student_id);
-    const studentName = student?.name || 'Siswa';
-
     const res = await confirmOutOfClassReturn(recordId, 'click');
     if (res.success && res.record) {
-      if (res.record.late_return_minutes > 0) {
-        showToast(
-          `${studentName} kembali ke kelas terlambat ${res.record.late_return_minutes} menit.`,
-          'info'
-        );
-      } else {
-        showToast(`${studentName} telah kembali ke kelas tepat waktu.`, 'success');
-      }
+      showToast('Tersimpan', 'success');
     }
   };
 

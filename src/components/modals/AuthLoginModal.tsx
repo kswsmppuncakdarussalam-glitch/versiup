@@ -83,7 +83,7 @@ export const DutyLoginScreen: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950 p-4">
+    <div className="min-h-screen min-h-[100dvh] flex items-center justify-center bg-slate-50 dark:bg-slate-950 p-4">
       <div className="w-full max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 shadow-md">
         {/* Brand / Logo */}
         <div className="text-center mb-5">

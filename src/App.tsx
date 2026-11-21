@@ -85,7 +85,7 @@ const MainAppContent: React.FC = () => {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex">
+    <div className="min-h-screen min-h-[100dvh] bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex overflow-x-hidden">
       {/* Sidebar Navigation */}
       <Sidebar isOpen={isSidebarOpen} onClose={() => setIsSidebarOpen(false)} />
 
@@ -95,7 +95,7 @@ const MainAppContent: React.FC = () => {
 
         <OfflineIndicatorBanner />
 
-        <main className="flex-1 pb-12">
+        <main className="flex-1 pb-12 min-w-0">
           <Suspense fallback={<ViewLoadingSkeleton />}>
             {activeTab === 'dashboard' && <DashboardView />}
             {activeTab === 'attendance' && <AttendanceView />}

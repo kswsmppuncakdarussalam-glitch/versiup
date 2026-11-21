@@ -105,7 +105,7 @@ export const ViolationsView: React.FC = () => {
         : `Pelanggaran ${selectedStudent.name} berhasil dicatat (-${pointsToRecord} poin). Total akumulasi: ${res.studentTotalPoints} poin.`;
 
       speak(msg);
-      showToast(msg, isAchievement ? 'success' : 'error');
+      showToast('Tersimpan', 'success');
 
       // Check warning threshold
       if (!isAchievement && res.studentTotalPoints && res.studentTotalPoints >= 25) {

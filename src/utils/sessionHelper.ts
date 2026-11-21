@@ -60,6 +60,66 @@ export function formatActiveDaysLabel(days?: number[]): string {
   return ordered.map((d) => DAY_SHORT_LABELS[d]).join(', ');
 }
 
+export interface SessionWindowCheck {
+  open: boolean;
+  reason: 'open' | 'closed' | 'upcoming' | 'inactive' | 'wrong_day' | 'no_session';
+  message: string;
+}
+
+export function checkSessionAttendanceOpen(
+  session: AttendanceSession | null | undefined,
+  now: Date
+): SessionWindowCheck {
+  if (!session) {
+    return {
+      open: false,
+      reason: 'no_session',
+      message: 'Presensi ditutup: tidak ada sesi presensi yang tersedia.',
+    };
+  }
+  if (session.is_active === false) {
+    return {
+      open: false,
+      reason: 'inactive',
+      message: `Presensi ditutup: sesi "${session.name}" sedang dinonaktifkan.`,
+    };
+  }
+  const currentDay = now.getDay();
+  if (
+    Array.isArray(session.active_days) &&
+    session.active_days.length > 0 &&
+    !session.active_days.includes(currentDay)
+  ) {
+    return {
+      open: false,
+      reason: 'wrong_day',
+      message: `Presensi ditutup: sesi "${session.name}" tidak dijadwalkan aktif hari ini.`,
+    };
+  }
+  const currentMin = now.getHours() * 60 + now.getMinutes();
+  const startMin = parseTimeToMinutes(session.start_time);
+  const endMin = parseTimeToMinutes(session.end_time);
+  if (!isTimeInWindow(currentMin, startMin, endMin)) {
+    const isUpcoming =
+      endMin >= startMin
+        ? currentMin < startMin
+        : currentMin > endMin && currentMin < startMin;
+    if (isUpcoming) {
+      return {
+        open: false,
+        reason: 'upcoming',
+        message: `Presensi ditutup: sesi "${session.name}" belum dimulai (jadwal ${session.start_time} - ${session.end_time}).`,
+      };
+    }
+    return {
+      open: false,
+      reason: 'closed',
+      message: `Presensi ditutup: batas waktu sesi "${session.name}" (${session.start_time} - ${session.end_time}) telah berakhir.`,
+    };
+  }
+  return { open: true, reason: 'open', message: '' };
+}
+
 export function resolveSessionSchedule(
   sessions: AttendanceSession[],
   now: Date,

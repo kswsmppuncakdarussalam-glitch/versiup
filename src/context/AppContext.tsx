@@ -19,7 +19,11 @@ import {
   AuditLog,
 } from '../types/index.js';
 import { setServerClockOffset, getServerNow } from '../utils/time.js';
-import { resolveSessionSchedule, SessionScheduleState } from '../utils/sessionHelper.js';
+import {
+  resolveSessionSchedule,
+  checkSessionAttendanceOpen,
+  SessionScheduleState,
+} from '../utils/sessionHelper.js';
 import { soundEffects } from '../utils/audio.js';
 import { ttsService } from '../utils/tts.js';
 import {
@@ -71,8 +75,8 @@ const SYNC_BROADCAST_CHANNEL = 'dkb_sync_channel';
 const REALTIME_SYNC_COOLDOWN_MS = 120;
 const REALTIME_BURST_COOLDOWN_MS = 60;
 const FULL_RECONCILE_INTERVAL_MS = 15000;
-const SCAN_IDLE_FLUSH_MS = 280;
-const SCAN_MAX_BATCH_WAIT_MS = 3000;
+const SCAN_IDLE_FLUSH_MS = 180;
+const SCAN_MAX_BATCH_WAIT_MS = 2500;
 
 export interface EnvConfigStatus {
   configured: boolean;
@@ -162,10 +166,10 @@ interface AppContextType {
   lockCurrentMenu: () => void;
   logout: () => void;
   updateSessionToken: (newToken: string) => void;
-  refreshAuthSession: (forceLogoutOn401?: boolean) => Promise<string | null>;
+  refreshAuthSession: (forceLogoutOn401?: boolean, failedToken?: string) => Promise<string | null>;
   refreshFromSheets: (
     silent?: boolean,
-    options?: { afterWrite?: boolean }
+    options?: { afterWrite?: boolean; forceFull?: boolean }
   ) => Promise<void>;
 
   // Mutators (Direct to Google Sheets & Drive via Apps Script Web App)
@@ -185,10 +189,16 @@ interface AppContextType {
     session?: AttendanceSession;
     error?: string;
     isDuplicate?: boolean;
+    sessionClosed?: boolean;
     offlineQueued?: boolean;
     syncedFromExisting?: boolean;
   }>;
-  updateAttendance: (id: string, updates: Partial<AttendanceRecord>, reason: string) => Promise<boolean>;
+  updateAttendance: (
+    id: string,
+    updates: Partial<AttendanceRecord>,
+    reason: string,
+    options?: { enforceSessionWindow?: boolean; silentToast?: boolean }
+  ) => Promise<boolean>;
   deleteAttendance: (id: string, reason: string) => Promise<boolean>;
 
   startOutOfClass: (
@@ -499,6 +509,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const syncChannelRef = useRef<BroadcastChannel | null>(null);
   const sessionRef = useRef<AuthSession | null>(session);
   sessionRef.current = session;
+  const authEpochRef = useRef<number>(0);
+  const settingsRef = useRef<AppSettings>(settings);
+  settingsRef.current = settings;
+  const notificationSettingsRef = useRef<NotificationSettings>(notificationSettings);
+  notificationSettingsRef.current = notificationSettings;
+  const latestSnapshotDataRef = useRef<Record<string, any>>(
+    initialDbCacheRef.current?.data ? { ...initialDbCacheRef.current.data } : {}
+  );
   const tokenRefreshPromiseRef = useRef<Promise<string | null> | null>(null);
 
   const broadcastSyncEvent = useCallback(
@@ -603,13 +621,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       extra?: Record<string, string>,
       overrideAppToken?: string
     ): Record<string, string> => {
-      const appToken = overrideAppToken ?? session?.token ?? sessionRef.current?.token ?? '';
+      const appToken = overrideAppToken ?? sessionRef.current?.token ?? '';
       return {
         ...(appToken ? { Authorization: `Bearer ${appToken}` } : {}),
         ...(extra || {}),
       };
     },
-    [session?.token]
+    []
   );
 
   const handleAppsScriptUnauthorized = useCallback(
@@ -698,11 +716,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (Array.isArray(d.audit_logs)) setAuditLogs(d.audit_logs);
     setLastSyncTime(new Date());
     setSyncStatus('synced');
+    latestSnapshotDataRef.current = { ...latestSnapshotDataRef.current, ...d };
     writeLocalDbCache({
       rev: rev || lastKnownRevRef.current,
       seq: typeof seq === 'number' && seq > 0 ? seq : lastKnownSeqRef.current,
       serverTime,
-      data: d,
+      data: latestSnapshotDataRef.current,
     });
   }, []);
 
@@ -822,6 +841,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const clearExpiredAppSession = useCallback(
     (message = 'Sesi login telah berakhir atau sandi diubah. Silakan masuk kembali.') => {
+      authEpochRef.current += 1;
+      tokenRefreshPromiseRef.current = null;
+      pendingAdminSetupPasswordRef.current = null;
       sessionRef.current = null;
       setSession(null);
       try {
@@ -835,9 +857,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 
   const refreshAuthSessionIfNeeded = useCallback(
-    async (forceLogoutOn401 = false): Promise<string | null> => {
+    async (forceLogoutOn401 = false, failedToken?: string): Promise<string | null> => {
       const currentSess = sessionRef.current;
       if (!currentSess?.token) return null;
+      if (failedToken && failedToken !== currentSess.token) {
+        return currentSess.token;
+      }
+      const startEpoch = authEpochRef.current;
+      const startToken = currentSess.token;
 
       if (tokenRefreshPromiseRef.current) {
         return tokenRefreshPromiseRef.current;
@@ -847,25 +874,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         try {
           const res = await apiFetch('/api/auth?action=refresh_session', {
             method: 'POST',
-            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, currentSess.token),
+            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, startToken),
             body: JSON.stringify({}),
           });
           const data = await res.json().catch(() => ({}));
 
+          if (
+            authEpochRef.current !== startEpoch ||
+            !sessionRef.current?.token ||
+            sessionRef.current.token !== startToken
+          ) {
+            return sessionRef.current?.token || null;
+          }
+
           if (res.ok && data?.token) {
             const payload = decodeJwtPayload(data.token);
+            const activeSess = sessionRef.current;
             const updated: AuthSession = {
-              ...currentSess,
+              ...activeSess,
               token: data.token,
-              userId: payload.userId || currentSess.userId,
-              role: payload.role || currentSess.role,
-              name: payload.name || currentSess.name,
-              label: payload.label || currentSess.label,
-              tokenVersion: payload.tokenVersion ?? currentSess.tokenVersion,
+              userId: payload.userId || activeSess.userId,
+              role: payload.role || activeSess.role,
+              name: payload.name || activeSess.name,
+              label: payload.label || activeSess.label,
+              tokenVersion: payload.tokenVersion ?? activeSess.tokenVersion,
               lockedMenuClassId:
                 payload.lockedMenuClassId !== undefined
                   ? payload.lockedMenuClassId
-                  : currentSess.lockedMenuClassId,
+                  : activeSess.lockedMenuClassId,
             };
             sessionRef.current = updated;
             setSession(updated);
@@ -879,7 +915,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             res.status === 401 &&
             !data?.unauthorizedToken &&
             !data?.googleDeploymentUnauthorized &&
-            (forceLogoutOn401 || data?.sessionInvalidated)
+            (data?.sessionInvalidated || forceLogoutOn401)
           ) {
             clearExpiredAppSession(
               data?.error || 'Sesi login telah berakhir atau kata sandi diubah. Silakan masuk kembali.'
@@ -1104,7 +1140,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         if (res.status === 401 && sessionRef.current?.token) {
-          await refreshAuthSessionIfNeeded(true);
+          await refreshAuthSessionIfNeeded(false, sessionRef.current.token);
         }
 
         if (res.status === 503) {
@@ -1253,6 +1289,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const connectAppsScript = useCallback(
     async (rawUrl: string, rawSecretToken?: string): Promise<{ ok: boolean; message: string }> => {
+      const startEpoch = authEpochRef.current;
       setIsConnectingAppsScript(true);
       try {
         const resolvedSecret = String(rawSecretToken ?? getAppsScriptSecretToken()).trim();
@@ -1293,9 +1330,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         await persistServerAppsScriptConfig(saved, resolvedSecret);
         broadcastSyncEvent('APPS_SCRIPT_CHANGED', { appsScriptUrl: saved });
 
+        if (authEpochRef.current !== startEpoch) {
+          showToast('Tersimpan', 'success');
+          return { ok: true, message: result.message };
+        }
+
         let activeAppToken = sessionRef.current?.token || '';
         if (activeAppToken) {
-          const refreshed = await refreshAuthSessionIfNeeded(true);
+          const refreshed = await refreshAuthSessionIfNeeded(false, activeAppToken);
           activeAppToken = refreshed || '';
         } else if (sessionRef.current?.lockedMenuRole === 'admin') {
           try {
@@ -1307,6 +1349,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             });
             const authData = await authRes.json().catch(() => ({}));
             pendingAdminSetupPasswordRef.current = null;
+            if (authEpochRef.current !== startEpoch || !sessionRef.current) {
+              showToast('Tersimpan', 'success');
+              return { ok: true, message: result.message };
+            }
             if (authRes.ok && authData.token) {
               const payload = decodeJwtPayload(authData.token);
               const upgradedSess: AuthSession = {
@@ -1323,13 +1369,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               localStorage.setItem('dkb_session', JSON.stringify(upgradedSess));
               activeAppToken = authData.token;
             } else {
+              authEpochRef.current += 1;
               sessionRef.current = null;
               setSession(null);
               localStorage.removeItem('dkb_session');
               localStorage.removeItem('dkb_active_tab');
               setActiveTabState('attendance');
               showToast(
-                'Apps Script berhasil diaktifkan & dikunci! Silakan masuk sebagai Admin dengan password sekolah Anda.',
+                'Tersimpan. Silakan masuk sebagai Admin dengan password sekolah Anda.',
                 'info'
               );
               return { ok: true, message: result.message };
@@ -1337,7 +1384,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           } catch {}
         }
 
-        if (activeAppToken) {
+        if (activeAppToken && authEpochRef.current === startEpoch) {
           apiFetch('/api/settings', {
             method: 'POST',
             headers: buildApiHeaders({ 'Content-Type': 'application/json' }, activeAppToken),
@@ -1345,7 +1392,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }).catch(() => {});
         }
 
-        showToast(result.message, 'success');
+        showToast('Tersimpan', 'success');
         if (!result.data?.data) {
           await refreshFromSheets(false, { afterWrite: true, forceFull: true });
         }
@@ -1409,6 +1456,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           return;
         }
         try {
+          const sentToken = sessionRef.current?.token;
           const sendQueued = async (tokOverride?: string) => {
             const res = await apiFetch('/api/attendance', {
               method: 'POST',
@@ -1419,12 +1467,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             return { res, data };
           };
 
-          let { res, data } = await sendQueued();
+          let { res, data } = await sendQueued(sentToken);
           if (handleAppsScriptUnauthorized(res.status, data)) {
             return;
           }
           if (res.status === 401 && sessionRef.current?.token) {
-            const refreshedTok = await refreshAuthSessionIfNeeded(true);
+            const refreshedTok = await refreshAuthSessionIfNeeded(false, sentToken);
             if (refreshedTok) {
               const retried = await sendQueued(refreshedTok);
               res = retried.res;
@@ -1437,9 +1485,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             setPendingOfflineScansCount(0);
             setSavedState('Tersimpan');
             if (data.rejectedCount > 0) {
-              showToast(`${data.savedCount} scan offline terkirim, ${data.rejectedCount} duplikat ditolak.`, 'info');
+              showToast(`Tersimpan (${data.rejectedCount} duplikat ditolak)`, 'info');
             } else {
-              showToast(`${latestQueued.length} data presensi offline berhasil disinkronkan ke Google Sheets.`, 'success');
+              showToast('Tersimpan', 'success');
             }
             if (data.rev) {
               lastKnownRevRef.current = String(data.rev);
@@ -1675,6 +1723,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         .catch(() => {})
         .then(async () => {
           try {
+            const sentBatchTok = sessionRef.current?.token;
             const sendBatch = async (tokOverride?: string) => {
               const res = await apiFetch('/api/attendance', {
                 method: 'POST',
@@ -1687,7 +1736,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               return { res, data };
             };
 
-            let { res, data } = await sendBatch();
+            let { res, data } = await sendBatch(sentBatchTok);
             if (handleAppsScriptUnauthorized(res.status, data)) {
               const msg = data.error || 'Token rahasia Apps Script ditolak.';
               clearInFlightOptimistic();
@@ -1700,7 +1749,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             }
 
             if (res.status === 401 && sessionRef.current?.token) {
-              const refreshedTok = await refreshAuthSessionIfNeeded(true);
+              const refreshedTok = await refreshAuthSessionIfNeeded(false, sentBatchTok);
               if (refreshedTok) {
                 const retried = await sendBatch(refreshedTok);
                 res = retried.res;
@@ -1936,14 +1985,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       const rollbackOptimistic = params.applyOptimistic ? params.applyOptimistic() : undefined;
-      const shouldReturnOptimistic = Boolean(params.applyOptimistic) && params.optimisticReturn !== false;
 
       setSavingState();
       latestMutationSeqRef.current += 1;
-
-      if (shouldReturnOptimistic) {
-        params.onOptimisticBroadcast?.();
-      }
 
       const execute = async (
         forceOverwrite = false,
@@ -1965,9 +2009,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             };
           }
           const payload = forceOverwrite ? { ...baseBody, forceOverwrite: true } : baseBody;
+          const sentToken = overrideAppToken ?? sessionRef.current?.token ?? '';
           const res = await apiFetch(params.url, {
             method: params.method,
-            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, overrideAppToken),
+            headers: buildApiHeaders({ 'Content-Type': 'application/json' }, sentToken),
             body: JSON.stringify(payload),
           });
           const data = await res.json().catch(() => ({}));
@@ -1980,14 +2025,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           }
 
           if (res.status === 401 && !hasRetriedAuth && sessionRef.current?.token) {
-            const refreshedTok = await refreshAuthSessionIfNeeded(true);
+            const refreshedTok = await refreshAuthSessionIfNeeded(true, sentToken);
             if (refreshedTok) {
               return execute(forceOverwrite, true, refreshedTok);
             }
             rollbackOptimistic?.();
             const authErr = data.error || 'Sesi login telah berakhir. Silakan masuk kembali.';
             setSaveErrorState(authErr);
-            if (shouldReturnOptimistic) showToast(authErr, 'error');
+            if (!params.silentToast) showToast(authErr, 'error');
             return { ok: false, error: authErr, data };
           }
 
@@ -2018,12 +2063,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             });
           }
 
-          if (!res.ok) {
+          if (!res.ok || data?.success === false) {
             rollbackOptimistic?.();
             soundEffects.playErrorBeep();
             const errMsg = data.error || `Gagal menyimpan data (${res.status})`;
             setSaveErrorState(errMsg);
-            if (!params.silentToast || shouldReturnOptimistic) showToast(errMsg, 'error');
+            if (!params.silentToast) showToast(errMsg, 'error');
             return { ok: false, error: errMsg, data };
           }
 
@@ -2097,8 +2142,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           } else if (!data.snapshot) {
             if (params.url === '/api/settings' && data.settings) {
               setSettings((prev) => ({ ...prev, ...data.settings }));
+              latestSnapshotDataRef.current = {
+                ...latestSnapshotDataRef.current,
+                settings: { ...(latestSnapshotDataRef.current.settings || {}), ...data.settings },
+              };
+              writeLocalDbCache({
+                rev: lastKnownRevRef.current,
+                seq: lastKnownSeqRef.current,
+                serverTime: data.serverTime,
+                data: latestSnapshotDataRef.current,
+              });
             } else if (params.url === '/api/notifications' && data.settings) {
               setNotificationSettings((prev) => ({ ...prev, ...data.settings }));
+              latestSnapshotDataRef.current = {
+                ...latestSnapshotDataRef.current,
+                notification_settings: {
+                  ...(latestSnapshotDataRef.current.notification_settings || {}),
+                  ...data.settings,
+                },
+              };
+              writeLocalDbCache({
+                rev: lastKnownRevRef.current,
+                seq: lastKnownSeqRef.current,
+                serverTime: data.serverTime,
+                data: latestSnapshotDataRef.current,
+              });
             }
             if (isLastQueuedWrite) {
               broadcastSyncEvent('DATA_MUTATED');
@@ -2121,33 +2189,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           soundEffects.playErrorBeep();
           const errMsg = err?.message || 'Gagal terhubung ke Apps Script.';
           setSaveErrorState(errMsg);
-          if (!params.silentToast || shouldReturnOptimistic) showToast(errMsg, 'error');
+          if (!params.silentToast) showToast(errMsg, 'error');
           return { ok: false, error: errMsg };
         }
       };
 
-      if (shouldReturnOptimistic) {
-        pendingWriteCountRef.current += 1;
-        writeQueueRef.current = writeQueueRef.current
-          .catch(() => {})
-          .then(async () => {
-            await execute(false);
-          })
-          .finally(() => {
-            pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1);
-            if (pendingWriteCountRef.current === 0 && pendingRefreshAfterWriteRef.current) {
-              pendingRefreshAfterWriteRef.current = false;
-              void refreshFromSheets(true);
-            }
-          });
-        return { ok: true, optimistic: true, data: params.optimisticData };
-      }
-
+      // Semua penulisan diserialisasi lewat writeQueueRef dan DITUNGGU hingga server Apps Script benar-benar mengonfirmasi penyimpanan
       pendingWriteCountRef.current += 1;
+      const queuedResultPromise = writeQueueRef.current
+        .catch(() => {})
+        .then(() => execute(false));
+      writeQueueRef.current = queuedResultPromise.then(
+        () => {},
+        () => {}
+      );
       try {
-        return await execute(false);
+        return await queuedResultPromise;
       } finally {
         pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1);
+        if (pendingWriteCountRef.current === 0 && pendingRefreshAfterWriteRef.current) {
+          pendingRefreshAfterWriteRef.current = false;
+          void refreshFromSheets(true);
+        }
       }
     },
     [
@@ -2167,13 +2230,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // ==================== AUTH ACTIONS ====================
 
+  const ensureAppsScriptConfigReady = async (): Promise<boolean> => {
+    if (hasCompleteAppsScriptConfig()) return true;
+    const hydrated = await hydrateAppsScriptConfig();
+    if (hydrated.appsScriptUrl) setAppsScriptUrlState(hydrated.appsScriptUrl);
+    setAppsScriptSecretConfigured(Boolean(hydrated.secretToken));
+    setIsAppsScriptLockedState(hydrated.locked);
+    return hasCompleteAppsScriptConfig();
+  };
+
   const loginDuty = async (password: string) => {
-    if (!hasCompleteAppsScriptConfig()) {
+    const configReady = await ensureAppsScriptConfigReady();
+    if (!configReady) {
       return {
         success: false,
         error: 'Koneksi server belum diaktifkan. Silakan masuk sebagai Admin untuk mengatur aktivasi, URL Script & Token.',
       };
     }
+    authEpochRef.current += 1;
+    const myEpoch = authEpochRef.current;
     try {
       const res = await apiFetch('/api/auth?action=login_duty', {
         method: 'POST',
@@ -2181,6 +2256,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         body: JSON.stringify({ password }),
       });
       const data = await res.json().catch(() => ({}));
+      if (authEpochRef.current !== myEpoch) {
+        return { success: false, error: 'Permintaan login dibatalkan.' };
+      }
       if (handleAppsScriptUnauthorized(res.status, data)) {
         return { success: false, error: data.error };
       }
@@ -2204,6 +2282,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       sessionRef.current = authSess;
       setSession(authSess);
       localStorage.setItem('dkb_session', JSON.stringify(authSess));
+      setActiveTab('attendance');
       refreshFromSheets(true);
       return { success: true };
     } catch {
@@ -2212,12 +2291,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const unlockHomeroom = async (name: string, password: string, classId?: string) => {
-    if (!hasCompleteAppsScriptConfig()) {
+    const configReady = await ensureAppsScriptConfigReady();
+    if (!configReady) {
       return {
         success: false,
         error: 'Koneksi server belum diaktifkan. Silakan masuk sebagai Admin untuk mengatur aktivasi, URL Script & Token.',
       };
     }
+    authEpochRef.current += 1;
+    const myEpoch = authEpochRef.current;
     try {
       const res = await apiFetch('/api/auth?action=unlock_homeroom', {
         method: 'POST',
@@ -2225,6 +2307,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         body: JSON.stringify({ name, password, classId }),
       });
       const data = await res.json().catch(() => ({}));
+      if (authEpochRef.current !== myEpoch) {
+        return { success: false, error: 'Permintaan login dibatalkan.' };
+      }
       if (handleAppsScriptUnauthorized(res.status, data)) {
         return { success: false, error: data.error };
       }
@@ -2252,12 +2337,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const unlockStudentAffairs = async (password: string) => {
-    if (!hasCompleteAppsScriptConfig()) {
+    const configReady = await ensureAppsScriptConfigReady();
+    if (!configReady) {
       return {
         success: false,
         error: 'Koneksi server belum diaktifkan. Silakan masuk sebagai Admin untuk mengatur aktivasi, URL Script & Token.',
       };
     }
+    authEpochRef.current += 1;
+    const myEpoch = authEpochRef.current;
     try {
       const res = await apiFetch('/api/auth?action=unlock_student_affairs', {
         method: 'POST',
@@ -2265,6 +2353,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         body: JSON.stringify({ password }),
       });
       const data = await res.json().catch(() => ({}));
+      if (authEpochRef.current !== myEpoch) {
+        return { success: false, error: 'Permintaan login dibatalkan.' };
+      }
       if (handleAppsScriptUnauthorized(res.status, data)) {
         return { success: false, error: data.error };
       }
@@ -2291,7 +2382,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const unlockAdmin = async (password: string) => {
+    authEpochRef.current += 1;
+    const myEpoch = authEpochRef.current;
+
     const enterAdminSetupSession = (setupPass: string) => {
+      if (authEpochRef.current !== myEpoch) return;
       pendingAdminSetupPasswordRef.current = setupPass;
       const setupSess: AuthSession = {
         token: '',
@@ -2308,7 +2403,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setActiveTab('admin');
     };
 
-    if (!hasCompleteAppsScriptConfig()) {
+    const configReady = await ensureAppsScriptConfigReady();
+    if (authEpochRef.current !== myEpoch) {
+      return { success: false, error: 'Permintaan login dibatalkan.' };
+    }
+    if (!configReady) {
       if (password === 'admin123') {
         enterAdminSetupSession(password);
         return { success: true };
@@ -2323,6 +2422,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         body: JSON.stringify({ password }),
       });
       const data = await res.json().catch(() => ({}));
+      if (authEpochRef.current !== myEpoch) {
+        return { success: false, error: 'Permintaan login dibatalkan.' };
+      }
       if (
         (res.status === 401 && (data?.unauthorizedToken || data?.googleDeploymentUnauthorized)) ||
         res.status === 503
@@ -2354,6 +2456,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       refreshFromSheets(true);
       return { success: true };
     } catch {
+      if (authEpochRef.current !== myEpoch) {
+        return { success: false, error: 'Permintaan login dibatalkan.' };
+      }
       if (password === 'admin123') {
         enterAdminSetupSession(password);
         showToast('Apps Script tidak terjangkau. Silakan periksa URL Script & Token di Menu Admin.', 'error');
@@ -2363,15 +2468,22 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const logout = () => {
+  const logout = useCallback(() => {
+    authEpochRef.current += 1;
+    tokenRefreshPromiseRef.current = null;
+    pendingAdminSetupPasswordRef.current = null;
+    setConflictPrompt(null);
+    setConfirmDialog(null);
     sessionRef.current = null;
     setSession(null);
-    localStorage.removeItem('dkb_session');
-    localStorage.removeItem('dkb_active_tab');
+    try {
+      localStorage.removeItem('dkb_session');
+      localStorage.removeItem('dkb_active_tab');
+    } catch {}
     setActiveTabState('attendance');
-  };
+  }, []);
 
-  const lockCurrentMenu = () => logout();
+  const lockCurrentMenu = useCallback(() => logout(), [logout]);
 
   const updateSessionToken = (newToken: string) => {
     try {
@@ -2404,16 +2516,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const manualOverride = Boolean(
       manualSessionOverrideId || (params.sessionId && params.sessionId !== activeSession?.id)
     );
-    const targetSessionObj =
-      (params.sessionId && sessions.find((s) => s.id === params.sessionId)) ||
-      activeSession ||
-      sessions.find((s) => s.is_active) ||
-      sessions[0];
+    const targetSessionObj = params.sessionId
+      ? sessions.find((s) => s.id === params.sessionId) || null
+      : activeSession || sessions.find((s) => s.is_active) || sessions[0] || null;
     const targetSessionId = targetSessionObj?.id || params.sessionId;
     const serverNow = getServerNow();
     const todayStr = serverNow.toISOString().split('T')[0];
 
-    // Quick duplicate & card validation against current state (<1ms) before queueing 3s batch
+    // Quick duplicate & card validation against current state (<1ms)
     const targetStudent = students.find(
       (s) =>
         (params.studentId && s.nis === params.studentId) ||
@@ -2422,6 +2532,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             s.rfid_uid.toLowerCase() === params.code.trim().toLowerCase() ||
             s.card_code.toLowerCase() === params.code.trim().toLowerCase()))
     );
+
+    // Peraturan sesi tertib: di luar jam mulai - selesai sesi (atau hari nonaktif / sesi nonaktif),
+    // presensi ditutup total baik untuk Scan/RFID maupun Presensi Manual.
+    const windowCheck = checkSessionAttendanceOpen(targetSessionObj, serverNow);
+    if (!windowCheck.open) {
+      soundEffects.playErrorBeep();
+      return {
+        success: false,
+        sessionClosed: true,
+        error: windowCheck.message,
+        student: targetStudent,
+        session: targetSessionObj || undefined,
+      };
+    }
 
     const isManual = params.method === 'manual';
 
@@ -2452,10 +2576,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             const queuedMatch = scanBatchQueueRef.current.find(
               (b) => b.optimisticId === existingInSession.id
             );
+            const prevSnapshot = existingInSession;
             setAttendance((prev) =>
               prev.map((a) => (a.id === existingInSession.id ? syncedRec : a))
             );
-            soundEffects.playSuccessBeep();
             if (queuedMatch) {
               queuedMatch.params = {
                 ...queuedMatch.params,
@@ -2465,8 +2589,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 upsert: true,
                 manualOverride: true,
               };
+              const prevResolve = queuedMatch.resolve;
+              const batchResult = await new Promise<any>((resolve) => {
+                queuedMatch.resolve = (r: any) => {
+                  prevResolve?.(r);
+                  resolve(r);
+                };
+                void flushScanBatch();
+              });
+              if (!batchResult?.success) {
+                setAttendance((prev) =>
+                  prev.map((a) => (a.id === existingInSession.id ? prevSnapshot : a))
+                );
+                soundEffects.playErrorBeep();
+                return {
+                  success: false,
+                  error: batchResult?.error || 'Gagal menyimpan presensi ke Google Sheets.',
+                };
+              }
+              soundEffects.playSuccessBeep();
+              return {
+                success: true,
+                record: batchResult.record || syncedRec,
+                student: targetStudent,
+                session: targetSessionObj,
+                syncedFromExisting: true,
+              };
             } else {
-              void runWriteRequest({
+              const writeRes = await runWriteRequest({
                 url: '/api/attendance',
                 method: 'POST',
                 body: {
@@ -2484,9 +2634,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 },
                 silentToast: true,
               });
+              if (!writeRes.ok) {
+                setAttendance((prev) =>
+                  prev.map((a) => (a.id === existingInSession.id ? prevSnapshot : a))
+                );
+                soundEffects.playErrorBeep();
+                return {
+                  success: false,
+                  error: writeRes.error || 'Gagal menyimpan presensi ke Google Sheets.',
+                };
+              }
+              const savedRec = writeRes.data?.results?.[0]?.record || syncedRec;
+              soundEffects.playSuccessBeep();
+              return {
+                success: true,
+                record: savedRec,
+                student: targetStudent,
+                session: targetSessionObj,
+                syncedFromExisting: true,
+              };
             }
           } else {
-            await updateAttendance(
+            const ok = await updateAttendance(
               existingInSession.id,
               {
                 status: nextStatus,
@@ -2494,8 +2663,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
                 notes: nextNotes,
                 method: 'manual',
               },
-              'Sinkronisasi presensi manual'
+              'Sinkronisasi presensi manual',
+              { enforceSessionWindow: true, silentToast: true }
             );
+            if (!ok) {
+              soundEffects.playErrorBeep();
+              return {
+                success: false,
+                error: 'Gagal menyimpan pembaruan presensi ke Google Sheets.',
+              };
+            }
             soundEffects.playSuccessBeep();
           }
 
@@ -2556,12 +2733,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               )
             );
           }
+          const prevBatchResolve = alreadyInBatch.resolve;
+          const batchResult = await new Promise<any>((resolve) => {
+            alreadyInBatch.resolve = (r: any) => {
+              prevBatchResolve?.(r);
+              resolve(r);
+            };
+            void flushScanBatch();
+          });
+          if (!batchResult?.success) {
+            soundEffects.playErrorBeep();
+            return {
+              success: false,
+              error: batchResult?.error || 'Gagal menyimpan presensi ke Google Sheets.',
+            };
+          }
           soundEffects.playSuccessBeep();
           return {
             success: true,
-            record: optRec
-              ? { ...optRec, status: nextStatus, notes: nextNotes, method: 'manual' }
-              : undefined,
+            record:
+              batchResult.record ||
+              (optRec ? { ...optRec, status: nextStatus, notes: nextNotes, method: 'manual' } : undefined),
             student: targetStudent,
             session: targetSessionObj,
             syncedFromExisting: true,
@@ -2660,9 +2852,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       broadcastSyncEvent('DATA_OPTIMISTIC_ATTENDANCE', { record: optimisticRecord });
 
       if (isManual) {
-        // Presensi manual langsung disinkronkan melalui antrean penulisan berseri (tanpa bertabrakan) agar cepat & langsung masuk ke scan/sheet sesi terkait
+        // Presensi manual WAJIB ditunggu konfirmasi penyimpanan Google Sheets-nya sebelum menyatakan sukses
         const manualTempId = optimisticRecord.id;
-        void runWriteRequest({
+        let confirmedSavedRec: AttendanceRecord = optimisticRecord;
+        const writeRes = await runWriteRequest({
           url: '/api/attendance',
           method: 'POST',
           body: {
@@ -2682,6 +2875,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           onSuccess: (data) => {
             const savedRec = data?.results?.[0]?.record;
             if (savedRec) {
+              confirmedSavedRec = savedRec;
               setAttendance((prev) => [
                 savedRec,
                 ...prev.filter((p) => p.id !== manualTempId && p.id !== savedRec.id),
@@ -2689,6 +2883,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             }
           },
         });
+        if (!writeRes.ok) {
+          setAttendance((prev) => prev.filter((p) => p.id !== manualTempId));
+          soundEffects.playErrorBeep();
+          return {
+            success: false,
+            error: writeRes.error || 'Gagal menyimpan presensi ke Google Sheets.',
+            student: targetStudent,
+            session: targetSessionObj,
+          };
+        }
+        soundEffects.playSuccessBeep();
+        return {
+          success: true,
+          record: confirmedSavedRec,
+          student: targetStudent,
+          session: targetSessionObj,
+        };
       } else {
         scanBatchQueueRef.current.push({
           params: scanObj,
@@ -2734,7 +2945,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
   };
 
-  const updateAttendance = async (id: string, updates: Partial<AttendanceRecord>, reason: string) => {
+  const updateAttendance = async (
+    id: string,
+    updates: Partial<AttendanceRecord>,
+    reason: string,
+    options?: { enforceSessionWindow?: boolean; silentToast?: boolean }
+  ) => {
     const existing = attendance.find((a) => a.id === id);
     const res = await runWriteRequest({
       url: '/api/attendance',
@@ -2744,6 +2960,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         id,
         updates,
         reason,
+        enforceSessionWindow: Boolean(options?.enforceSessionWindow),
         expected_updated_at: existing?.diubah_pada || existing?.updated_at,
       },
       conflictTitle: 'Konflik Edit Presensi',
@@ -2754,7 +2971,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             return () => setAttendance(snapshot);
           }
         : undefined,
-      successMessage: 'Presensi berhasil diperbarui & disimpan ke Google Sheets.',
+      successMessage: 'Tersimpan',
+      silentToast: options?.silentToast,
     });
     return res.ok;
   };
@@ -2776,7 +2994,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setAttendance((prev) => prev.filter((a) => a.id !== id));
         return () => setAttendance(snapshot);
       },
-      successMessage: 'Presensi berhasil ditandai dihapus (soft delete) di Google Sheets.',
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3033,7 +3251,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setViolations((prev) => prev.filter((v) => v.id !== id));
         return () => setViolations(snapshot);
       },
-      successMessage: 'Catatan pelanggaran ditandai dihapus (soft delete) di Google Sheets.',
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3058,7 +3276,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         );
         return () => setStudents(snapshot);
       },
-      successMessage: `Data siswa ${student.name} tersimpan di Google Sheets.`,
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3081,7 +3299,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setStudents((prev) => prev.filter((s) => s.nis !== nis));
         return () => setStudents(snapshot);
       },
-      successMessage: 'Siswa ditandai dihapus di Google Sheets.',
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3104,7 +3322,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setStudents((prev) => prev.filter((s) => !nisSet.has(s.nis)));
         return () => setStudents(snapshot);
       },
-      successMessage: `${nisses.length} siswa ditandai dihapus di Google Sheets.`,
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3119,7 +3337,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setStudents([]);
         return () => setStudents(snapshot);
       },
-      successMessage: 'Seluruh data siswa ditandai dihapus di Google Sheets.',
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3207,20 +3425,30 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     latestMutationSeqRef.current += 1;
     pendingWriteCountRef.current += 1;
 
-    writeQueueRef.current = writeQueueRef.current
+    const queuedImportPromise = writeQueueRef.current
       .catch(() => {})
-      .then(async () => {
+      .then(async (): Promise<{
+        success: boolean;
+        added: number;
+        updated: number;
+        classesCreated: number;
+        error?: string;
+      }> => {
         const CHUNK_SIZE = 250;
         let lastSnapshot: any = null;
         let lastServerTime: string | undefined;
         let lastRev: string | undefined;
         let lastSeq: number | undefined;
+        let actualAdded = 0;
+        let actualUpdated = 0;
+        let actualClassesCreated = 0;
 
         try {
           for (let i = 0; i < newStudents.length; i += CHUNK_SIZE) {
             const chunk = newStudents.slice(i, i + CHUNK_SIZE);
             const skipSnapshot = i + CHUNK_SIZE < newStudents.length;
 
+            const sentChunkTok = sessionRef.current?.token;
             const sendChunk = async (tokOverride?: string) => {
               const res = await apiFetch('/api/students?action=batch_import', {
                 method: 'POST',
@@ -3231,17 +3459,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               return { res, data };
             };
 
-            let { res, data } = await sendChunk();
+            let { res, data } = await sendChunk(sentChunkTok);
             if (handleAppsScriptUnauthorized(res.status, data)) {
               setStudents(prevStudentsSnapshot);
               setClasses(prevClassesSnapshot);
               const msg = data.error || 'Token rahasia Apps Script ditolak.';
               setSaveErrorState(msg);
-              return;
+              return { success: false, added: 0, updated: 0, classesCreated: 0, error: msg };
             }
 
             if (res.status === 401 && sessionRef.current?.token) {
-              const refreshedTok = await refreshAuthSessionIfNeeded(true);
+              const refreshedTok = await refreshAuthSessionIfNeeded(true, sentChunkTok);
               if (refreshedTok) {
                 const retried = await sendChunk(refreshedTok);
                 res = retried.res;
@@ -3256,9 +3484,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
               const errMsg = data?.error || `Gagal mengimpor data siswa (HTTP ${res.status}).`;
               setSaveErrorState(errMsg);
               showToast(errMsg, 'error');
-              return;
+              return { success: false, added: 0, updated: 0, classesCreated: 0, error: errMsg };
             }
 
+            actualAdded += Number(data.inserted || 0);
+            actualUpdated += Number(data.updated || 0);
+            actualClassesCreated += Number(data.classesCreated || 0);
             if (data.snapshot) lastSnapshot = data.snapshot;
             if (data.serverTime) lastServerTime = data.serverTime;
             if (data.rev) lastRev = String(data.rev);
@@ -3280,6 +3511,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             }
             setSavedState('Tersimpan');
           }
+
+          return {
+            success: true,
+            added: actualAdded || expectedAdded,
+            updated: actualUpdated || expectedUpdated,
+            classesCreated: actualClassesCreated || newClassesList.length,
+          };
         } catch (err: any) {
           setStudents(prevStudentsSnapshot);
           setClasses(prevClassesSnapshot);
@@ -3287,22 +3525,24 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           const errMsg = err?.message || 'Gagal menghubungi server saat impor data siswa.';
           setSaveErrorState(errMsg);
           showToast(errMsg, 'error');
-        }
-      })
-      .finally(() => {
-        pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1);
-        if (pendingWriteCountRef.current === 0 && pendingRefreshAfterWriteRef.current) {
-          pendingRefreshAfterWriteRef.current = false;
-          void refreshFromSheets(true);
+          return { success: false, added: 0, updated: 0, classesCreated: 0, error: errMsg };
         }
       });
 
-    return {
-      success: true,
-      added: expectedAdded,
-      updated: expectedUpdated,
-      classesCreated: newClassesList.length,
-    };
+    writeQueueRef.current = queuedImportPromise.then(
+      () => {},
+      () => {}
+    );
+
+    try {
+      return await queuedImportPromise;
+    } finally {
+      pendingWriteCountRef.current = Math.max(0, pendingWriteCountRef.current - 1);
+      if (pendingWriteCountRef.current === 0 && pendingRefreshAfterWriteRef.current) {
+        pendingRefreshAfterWriteRef.current = false;
+        void refreshFromSheets(true);
+      }
+    }
   };
 
   const saveClass = async (cls: SchoolClass) => {
@@ -3323,7 +3563,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         );
         return () => setClasses(snapshot);
       },
-      successMessage: `Data kelas ${cls.name} tersimpan di Google Sheets.`,
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3346,7 +3586,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setClasses((prev) => prev.filter((c) => c.id !== id));
         return () => setClasses(snapshot);
       },
-      successMessage: 'Kelas berhasil dihapus (soft delete).',
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3369,7 +3609,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         );
         return () => setSessions(snapshot);
       },
-      successMessage: `Sesi ${sess.name} tersimpan di Google Sheets.`,
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3392,7 +3632,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setSessions((prev) => prev.filter((s) => s.id !== id));
         return () => setSessions(snapshot);
       },
-      successMessage: 'Sesi presensi berhasil dihapus (soft delete).',
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3415,7 +3655,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         );
         return () => setViolationTypes(snapshot);
       },
-      successMessage: `Jenis pelanggaran ${vt.name} tersimpan di Google Sheets.`,
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3438,7 +3678,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setViolationTypes((prev) => prev.filter((v) => v.id !== id));
         return () => setViolationTypes(snapshot);
       },
-      successMessage: 'Jenis pelanggaran berhasil dihapus (soft delete).',
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };
@@ -3451,16 +3691,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         entityKey: 'app_settings',
         body: updates,
         applyOptimistic: () => {
-          const snapshot = settings;
+          const snapshot = settingsRef.current;
           setSettings((prev) => ({ ...prev, ...updates }));
           return () => setSettings(snapshot);
         },
-        successMessage: 'Pengaturan aplikasi berhasil disimpan ke Google Sheets.',
+        successMessage: 'Tersimpan',
         silentToast: options?.silent,
       });
       return res.ok;
     },
-    [runWriteRequest, settings]
+    [runWriteRequest]
   );
 
   const updateNotificationSettings = useCallback(
@@ -3471,16 +3711,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         entityKey: 'notification_settings',
         body: updates,
         applyOptimistic: () => {
-          const snapshot = notificationSettings;
+          const snapshot = notificationSettingsRef.current;
           setNotificationSettings((prev) => ({ ...prev, ...updates }));
           return () => setNotificationSettings(snapshot);
         },
-        successMessage: 'Pengaturan notifikasi email tersimpan ke Google Sheets.',
+        successMessage: 'Tersimpan',
         silentToast: options?.silent,
       });
       return res.ok;
     },
-    [runWriteRequest, notificationSettings]
+    [runWriteRequest]
   );
 
   const sendTestEmail = async (email: string) => {
@@ -3608,7 +3848,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             return () => setLeaveRequests(snapshot);
           }
         : undefined,
-      successMessage: status === 'approved' ? 'Pengajuan izin disetujui.' : 'Pengajuan izin ditolak.',
+      successMessage: 'Tersimpan',
     });
     return res.ok;
   };

@@ -23,6 +23,7 @@ import { DriveImage } from '../components/common/DriveImage.js';
 import { AttendanceNotificationModal } from '../components/modals/AttendanceNotificationModal.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { Student, AttendanceRecord, AttendanceStatus } from '../types/index.js';
+import { checkSessionAttendanceOpen } from '../utils/sessionHelper.js';
 
 export const AttendanceView: React.FC = () => {
   const {
@@ -72,11 +73,13 @@ export const AttendanceView: React.FC = () => {
     synced: boolean;
   } | null>(null);
   const manualSearchInputRef = useRef<HTMLInputElement | null>(null);
+  const [isSubmittingManual, setIsSubmittingManual] = useState(false);
 
   // Edit / Delete Attendance Record state
   const [editingRecord, setEditingRecord] = useState<AttendanceRecord | null>(null);
   const [editReason, setEditReason] = useState('');
   const [editStatus, setEditStatus] = useState<AttendanceStatus>('Hadir');
+  const [isUpdatingRecord, setIsUpdatingRecord] = useState(false);
 
   // Drilldown Profile Modal
   const [profileStudent, setProfileStudent] = useState<Student | null>(null);
@@ -170,48 +173,60 @@ export const AttendanceView: React.FC = () => {
     }
   };
 
-  // Manual Attendance submission (tersimpan instan, tetap berada di modal, dan langsung kembali ke pencarian siswa berikutnya)
+  const activeSessionWindow = checkSessionAttendanceOpen(activeSession, currentServerTime);
+  const effectiveManualSessionId =
+    manualTargetSessionId || activeSession?.id || sessions.find((s) => s.is_active)?.id || sessions[0]?.id || '';
+  const manualSessionObj = sessions.find((s) => s.id === effectiveManualSessionId) || null;
+  const manualSessionWindow = checkSessionAttendanceOpen(manualSessionObj, currentServerTime);
+
+  // Manual Attendance submission (menunggu konfirmasi Google Sheets, tetap berada di modal, dan langsung kembali ke pencarian siswa berikutnya)
   const handleManualSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedStudent) return;
+    if (!selectedStudent || isSubmittingManual) return;
+    if (!manualSessionWindow.open) {
+      showToast(manualSessionWindow.message, 'error');
+      return;
+    }
 
     const chosenStudent = selectedStudent;
     const chosenStatus = manualStatus;
-    const chosenSessionId = manualTargetSessionId || activeSession?.id || sessions.find((s) => s.is_active)?.id || sessions[0]?.id;
-    const targetSessName = sessions.find((s) => s.id === chosenSessionId)?.name || activeSession?.name || 'presensi';
+    const chosenSessionId = effectiveManualSessionId;
+    const targetSessName = manualSessionObj?.name || activeSession?.name || 'presensi';
 
-    const res = await recordAttendance({
-      studentId: chosenStudent.nis,
-      sessionId: chosenSessionId,
-      status: chosenStatus,
-      notes: manualNotes,
-      method: 'manual',
-    });
-
-    if (res.success) {
-      const speechMsg = `${chosenStudent.name}, kelas ${chosenStudent.class_id}, Tercatat ${chosenStatus}.`;
-      setManualFeedback({
-        studentName: chosenStudent.name,
+    setIsSubmittingManual(true);
+    try {
+      const res = await recordAttendance({
+        studentId: chosenStudent.nis,
+        sessionId: chosenSessionId,
         status: chosenStatus,
-        sessionName: targetSessName,
-        synced: Boolean(res.syncedFromExisting),
+        notes: manualNotes,
+        method: 'manual',
       });
-      showToast(
-        `${res.syncedFromExisting ? 'Sinkron' : 'Tersimpan'}: ${chosenStudent.name} (${chosenStatus}) di sesi ${targetSessName}.`,
-        'success'
-      );
-      speak(speechMsg);
 
-      // Reset pilihan & langsung kembalikan fokus ke kolom pencarian nama siswa
-      setSelectedStudent(null);
-      setManualSearch('');
-      setManualNotes('');
-      setManualStatus('Hadir');
-      setTimeout(() => {
-        manualSearchInputRef.current?.focus();
-      }, 15);
-    } else {
-      showToast(res.error || 'Gagal menyimpan presensi manual', 'error');
+      if (res.success) {
+        const speechMsg = `${chosenStudent.name}, kelas ${chosenStudent.class_id}, Tercatat ${chosenStatus}.`;
+        setManualFeedback({
+          studentName: chosenStudent.name,
+          status: chosenStatus,
+          sessionName: targetSessName,
+          synced: Boolean(res.syncedFromExisting),
+        });
+        showToast('Tersimpan', 'success');
+        speak(speechMsg);
+
+        // Reset pilihan & langsung kembalikan fokus ke kolom pencarian nama siswa
+        setSelectedStudent(null);
+        setManualSearch('');
+        setManualNotes('');
+        setManualStatus('Hadir');
+        setTimeout(() => {
+          manualSearchInputRef.current?.focus();
+        }, 15);
+      } else {
+        showToast(res.error || 'Gagal menyimpan presensi manual', 'error');
+      }
+    } finally {
+      setIsSubmittingManual(false);
     }
   };
 
@@ -223,8 +238,6 @@ export const AttendanceView: React.FC = () => {
     : todayAttendanceAll;
   const scopedAttendance = counterScope === 'session' ? activeSessionAttendance : todayAttendanceAll;
 
-  const effectiveManualSessionId =
-    manualTargetSessionId || activeSession?.id || sessions.find((s) => s.is_active)?.id || sessions[0]?.id || '';
   const manualSessionAttendanceMap = new Map<string, AttendanceRecord>();
   todayAttendanceAll.forEach((a) => {
     if (!effectiveManualSessionId || a.session_id === effectiveManualSessionId) {
@@ -416,7 +429,7 @@ export const AttendanceView: React.FC = () => {
                       <span className="font-bold block leading-tight">{item.session.name}</span>
                       <span className={`font-mono text-[10px] ${isSelected ? 'opacity-85' : 'text-slate-400'}`}>
                         {item.session.start_time}-{item.session.end_time}
-                        {isLive ? ' • Aktif' : isDone ? ' • Selesai' : item.minutesUntilStart > 0 ? ` • ${item.minutesUntilStart}m lagi` : ''}
+                        {isLive ? ' • Aktif' : isDone ? ' • Ditutup' : item.minutesUntilStart > 0 ? ` • ${item.minutesUntilStart}m lagi` : ''}
                       </span>
                     </div>
                   </button>
@@ -504,23 +517,56 @@ export const AttendanceView: React.FC = () => {
 
       {/* Center Section: THE MAIN SCAN FRAME (Bagian 4 Poin 60) */}
       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 sm:p-10 shadow-sm text-center relative overflow-hidden">
-        {/* Pulsing indicator "Siap memindai" */}
-        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-700 dark:text-emerald-400 mb-6">
-          <span className="relative flex h-2.5 w-2.5">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
-          </span>
-          <span className="font-semibold">Siap Memindai (USB RFID / Barcode Scanner)</span>
-        </div>
+        {/* Session Open / Closed Indicator */}
+        {activeSessionWindow.open ? (
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-700 dark:text-emerald-400 mb-6">
+            <span className="relative flex h-2.5 w-2.5">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+            </span>
+            <span className="font-semibold">Siap Memindai (USB RFID / Barcode Scanner)</span>
+          </div>
+        ) : (
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 text-xs text-rose-700 dark:text-rose-400 mb-4">
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+            <span className="font-semibold">Presensi Ditutup — Di Luar Waktu Sesi</span>
+          </div>
+        )}
+
+        {!activeSessionWindow.open && (
+          <div className="max-w-xl mx-auto mb-5 px-4 py-3 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-200 text-xs text-left flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-bold">Presensi Scan/RFID &amp; Manual Sesi Ini Ditutup</p>
+              <p className="mt-0.5 text-[11px]">{activeSessionWindow.message}</p>
+            </div>
+          </div>
+        )}
 
         {/* Scan Icon & Instruction Frame */}
-        <div className="max-w-xl mx-auto p-8 rounded-lg border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-slate-400 dark:hover:border-slate-600 transition-colors bg-slate-50/50 dark:bg-slate-800/30">
-          <Scan className="w-16 h-16 mx-auto text-slate-400 dark:text-slate-500 mb-4 animate-pulse" />
+        <div
+          className={`max-w-xl mx-auto p-8 rounded-lg border-2 border-dashed transition-colors ${
+            activeSessionWindow.open
+              ? 'border-slate-300 dark:border-slate-700 hover:border-slate-400 dark:hover:border-slate-600 bg-slate-50/50 dark:bg-slate-800/30'
+              : 'border-rose-200 dark:border-rose-900/60 bg-rose-50/30 dark:bg-rose-950/10 opacity-85'
+          }`}
+        >
+          <Scan
+            className={`w-16 h-16 mx-auto mb-4 ${
+              activeSessionWindow.open
+                ? 'text-slate-400 dark:text-slate-500 animate-pulse'
+                : 'text-rose-300 dark:text-rose-700'
+            }`}
+          />
           <h2 className="text-base sm:text-lg font-bold text-slate-900 dark:text-white mb-2">
-            Tempelkan kartu RFID atau scan barcode/QR kartu siswa
+            {activeSessionWindow.open
+              ? 'Tempelkan kartu RFID atau scan barcode/QR kartu siswa'
+              : 'Pemindaian kartu ditutup di luar jam sesi'}
           </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
-            Pembaca kartu bekerja otomatis layaknya keyboard. Cukup tap kartu atau sorot barcode kartu ke alat scanner.
+            {activeSessionWindow.open
+              ? 'Pembaca kartu bekerja otomatis layaknya keyboard. Cukup tap kartu atau sorot barcode kartu ke alat scanner.'
+              : 'Menunggu sesi presensi berikutnya dibuka atau periksa pengaturan jadwal sesi pada menu Admin.'}
           </p>
 
           {/* SINGLE AUTOMATIC INPUT FIELD (Kursor bebas, tidak dikunci) */}
@@ -529,9 +575,16 @@ export const AttendanceView: React.FC = () => {
               ref={inputRef}
               type="text"
               value={scanInput}
+              disabled={!activeSessionWindow.open}
               onChange={(e) => setScanInput(e.target.value)}
-              placeholder={isProcessing ? 'Memproses scan...' : 'Menunggu pembaca kartu RFID / Barcode scanner...'}
-              className="w-full text-center px-4 py-3 rounded-md text-sm font-mono border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-inner focus:outline-none focus:ring-2 focus:ring-slate-900 dark:focus:ring-slate-400"
+              placeholder={
+                !activeSessionWindow.open
+                  ? 'Presensi ditutup — di luar waktu sesi'
+                  : isProcessing
+                  ? 'Memproses scan...'
+                  : 'Menunggu pembaca kartu RFID / Barcode scanner...'
+              }
+              className="w-full text-center px-4 py-3 rounded-md text-sm font-mono border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-inner focus:outline-none focus:ring-2 focus:ring-slate-900 dark:focus:ring-slate-400 disabled:bg-slate-100 dark:disabled:bg-slate-900 disabled:text-slate-400 disabled:cursor-not-allowed"
             />
           </form>
 
@@ -545,7 +598,9 @@ export const AttendanceView: React.FC = () => {
                 <button
                   key={s.nis}
                   type="button"
+                  disabled={!activeSessionWindow.open}
                   onClick={() => {
+                    if (!activeSessionWindow.open) return;
                     setScanInput(s.rfid_uid);
                     setTimeout(() => {
                       recordAttendance({ code: s.rfid_uid, sessionId: activeSession?.id }).then((res) => {
@@ -587,7 +642,7 @@ export const AttendanceView: React.FC = () => {
                       });
                     }, 50);
                   }}
-                  className="px-2.5 py-1 rounded text-[11px] font-medium bg-white dark:bg-slate-700 border border-slate-200 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-600"
+                  className="px-2.5 py-1 rounded text-[11px] font-medium bg-white dark:bg-slate-700 border border-slate-200 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-600 disabled:opacity-45 disabled:cursor-not-allowed"
                 >
                   Tap {s.name.split(' ')[0]} ({s.rfid_uid})
                 </button>
@@ -776,12 +831,29 @@ export const AttendanceView: React.FC = () => {
                   }}
                   className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-semibold"
                 >
-                  {sessions.filter((s) => s.is_active).map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name} ({s.start_time} - {s.end_time}){activeSession?.id === s.id ? ' — [Sesi Aktif Otomatis]' : ''}
-                    </option>
-                  ))}
+                  {sessions.filter((s) => s.is_active).map((s) => {
+                    const win = checkSessionAttendanceOpen(s, currentServerTime);
+                    const tag = win.open
+                      ? ' — [Dibuka]'
+                      : win.reason === 'upcoming'
+                      ? ' — [Belum Mulai]'
+                      : ' — [Ditutup]';
+                    return (
+                      <option key={s.id} value={s.id}>
+                        {s.name} ({s.start_time} - {s.end_time}){tag}
+                      </option>
+                    );
+                  })}
                 </select>
+                {!manualSessionWindow.open && (
+                  <div className="mt-2 px-3 py-2 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-rose-800 dark:text-rose-200 flex items-start gap-2 text-[11px]">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="font-bold">Presensi Manual Ditutup</p>
+                      <p>{manualSessionWindow.message}</p>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Persistent Active Search Bar — ALWAYS visible above selected student & list */}
@@ -827,8 +899,7 @@ export const AttendanceView: React.FC = () => {
                       <CheckCircle className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
                       <span>
                         <strong>{manualFeedback.studentName}</strong> ({manualFeedback.status}) di sesi{' '}
-                        <strong>{manualFeedback.sessionName}</strong>{' '}
-                        {manualFeedback.synced ? 'diperbarui & disinkronkan' : 'tersimpan'}.
+                        <strong>{manualFeedback.sessionName}</strong> tersimpan.
                       </span>
                     </span>
                     <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-semibold shrink-0">
@@ -848,14 +919,17 @@ export const AttendanceView: React.FC = () => {
                           <div
                             key={s.nis}
                             onClick={() => {
+                              if (!manualSessionWindow.open) return;
                               setSelectedStudent(s);
                               setManualSearch('');
                               setManualStatus(existingAtt?.status || 'Hadir');
                               setManualNotes(existingAtt?.notes || '');
                             }}
-                            className={`p-2.5 hover:bg-emerald-50/70 dark:hover:bg-slate-700/80 cursor-pointer flex items-center justify-between gap-2 transition-colors group ${
-                              isChosen ? 'bg-emerald-50 dark:bg-emerald-950/30' : ''
-                            }`}
+                            className={`p-2.5 flex items-center justify-between gap-2 transition-colors group ${
+                              !manualSessionWindow.open
+                                ? 'opacity-60 cursor-not-allowed bg-slate-50 dark:bg-slate-800/40'
+                                : 'hover:bg-emerald-50/70 dark:hover:bg-slate-700/80 cursor-pointer'
+                            } ${isChosen ? 'bg-emerald-50 dark:bg-emerald-950/30' : ''}`}
                           >
                             <div className="flex items-center gap-2.5 min-w-0">
                               <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 flex items-center justify-center font-bold text-xs shrink-0 group-hover:bg-emerald-600 group-hover:text-white transition-colors">
@@ -895,9 +969,10 @@ export const AttendanceView: React.FC = () => {
                               )}
                               <button
                                 type="button"
-                                className="px-2.5 py-1 rounded-md text-[10px] font-bold bg-slate-900 dark:bg-slate-600 text-white group-hover:bg-emerald-600 transition-colors"
+                                disabled={!manualSessionWindow.open}
+                                className="px-2.5 py-1 rounded-md text-[10px] font-bold bg-slate-900 dark:bg-slate-600 text-white group-hover:bg-emerald-600 transition-colors disabled:opacity-45 disabled:cursor-not-allowed"
                               >
-                                Pilih
+                                {manualSessionWindow.open ? 'Pilih' : 'Ditutup'}
                               </button>
                             </div>
                           </div>
@@ -966,9 +1041,10 @@ export const AttendanceView: React.FC = () => {
                       <div className="relative">
                         <select
                           id="manual-status-dropdown"
+                          disabled={!manualSessionWindow.open}
                           value={manualStatus}
                           onChange={(e) => setManualStatus(e.target.value as AttendanceStatus)}
-                          className={`pl-3 pr-8 py-2 rounded-lg font-bold text-xs border shadow-xs appearance-none cursor-pointer focus:outline-none focus:ring-2 transition-all ${
+                          className={`pl-3 pr-8 py-2 rounded-lg font-bold text-xs border shadow-xs appearance-none cursor-pointer focus:outline-none focus:ring-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed ${
                             manualStatus === 'Hadir'
                               ? 'bg-emerald-50 text-emerald-800 border-emerald-300 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-700 focus:ring-emerald-500'
                               : manualStatus === 'Terlambat'
@@ -1000,17 +1076,22 @@ export const AttendanceView: React.FC = () => {
                 </label>
                 <input
                   type="text"
+                  disabled={!manualSessionWindow.open}
                   value={manualNotes}
                   onChange={(e) => setManualNotes(e.target.value)}
                   placeholder="Contoh: Mengikuti lomba dinas, dispensasi OSIS, surat dokter..."
-                  className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:bg-slate-100 dark:disabled:bg-slate-900 disabled:opacity-60 disabled:cursor-not-allowed"
                 />
               </div>
 
               {/* Footer Buttons */}
               <div className="flex items-center justify-between pt-2 border-t border-slate-100 dark:border-slate-800 shrink-0">
                 <span className="text-[11px] text-slate-400">
-                  {selectedStudent ? 'Simpan & otomatis kembali ke pencarian' : 'Pilih siswa dari daftar di atas'}
+                  {!manualSessionWindow.open
+                    ? 'Sesi ditutup — pilih sesi yang sedang dibuka'
+                    : selectedStudent
+                    ? 'Simpan & otomatis kembali ke pencarian'
+                    : 'Pilih siswa dari daftar di atas'}
                 </span>
                 <div className="flex items-center gap-2">
                   <button
@@ -1025,11 +1106,11 @@ export const AttendanceView: React.FC = () => {
                   </button>
                   <button
                     type="submit"
-                    disabled={!selectedStudent}
+                    disabled={!selectedStudent || !manualSessionWindow.open || isSubmittingManual}
                     className="px-4 py-1.5 rounded-lg font-bold text-xs text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-xs transition-colors flex items-center gap-1.5"
                   >
                     <CheckCircle className="w-3.5 h-3.5" />
-                    <span>Simpan &amp; Cari Berikutnya</span>
+                    <span>{isSubmittingManual ? 'Menyimpan...' : 'Simpan & Cari Berikutnya'}</span>
                   </button>
                 </div>
               </div>
@@ -1073,15 +1154,22 @@ export const AttendanceView: React.FC = () => {
               <div className="flex items-center justify-between pt-2">
                 <button
                   type="button"
-                  onClick={() => {
+                  disabled={isUpdatingRecord}
+                  onClick={async () => {
+                    if (isUpdatingRecord) return;
                     if (!editReason.trim()) {
                       showToast('Alasan pembatalan wajib diisi.', 'error');
                       return;
                     }
-                    deleteAttendance(editingRecord.id, editReason);
-                    setEditingRecord(null);
+                    setIsUpdatingRecord(true);
+                    try {
+                      const ok = await deleteAttendance(editingRecord.id, editReason);
+                      if (ok) setEditingRecord(null);
+                    } finally {
+                      setIsUpdatingRecord(false);
+                    }
                   }}
-                  className="px-3 py-1.5 rounded text-rose-600 border border-rose-200 hover:bg-rose-50"
+                  className="px-3 py-1.5 rounded text-rose-600 border border-rose-200 hover:bg-rose-50 disabled:opacity-50"
                 >
                   Hapus Data
                 </button>
@@ -1089,24 +1177,32 @@ export const AttendanceView: React.FC = () => {
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
+                    disabled={isUpdatingRecord}
                     onClick={() => setEditingRecord(null)}
-                    className="px-3 py-1.5 text-slate-600"
+                    className="px-3 py-1.5 text-slate-600 disabled:opacity-50"
                   >
                     Batal
                   </button>
                   <button
                     type="button"
-                    onClick={() => {
+                    disabled={isUpdatingRecord}
+                    onClick={async () => {
+                      if (isUpdatingRecord) return;
                       if (!editReason.trim()) {
                         showToast('Alasan koreksi wajib diisi.', 'error');
                         return;
                       }
-                      updateAttendance(editingRecord.id, { status: editStatus }, editReason);
-                      setEditingRecord(null);
+                      setIsUpdatingRecord(true);
+                      try {
+                        const ok = await updateAttendance(editingRecord.id, { status: editStatus }, editReason);
+                        if (ok) setEditingRecord(null);
+                      } finally {
+                        setIsUpdatingRecord(false);
+                      }
                     }}
-                    className="px-3 py-1.5 rounded bg-slate-900 text-white hover:bg-slate-800"
+                    className="px-3 py-1.5 rounded bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50"
                   >
-                    Simpan
+                    {isUpdatingRecord ? 'Menyimpan...' : 'Simpan'}
                   </button>
                 </div>
               </div>
