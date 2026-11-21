@@ -17,6 +17,7 @@ import {
   CheckCircle2,
   AlertCircle,
   FileSpreadsheet,
+  FileText,
   Download,
   X,
   Calendar,
@@ -29,6 +30,7 @@ import { useApp } from '../context/AppContext.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { Student, SchoolClass, AttendanceStatus } from '../types/index.js';
 import { exportToExcel, exportSessionRecapToExcel } from '../utils/excel.js';
+import { exportToPdf, exportSessionRecapToPdf } from '../utils/pdf.js';
 import { buildSessionRecapData, checkSessionAttendanceOpen } from '../utils/sessionHelper.js';
 import { formatIndonesianDate } from '../utils/time.js';
 
@@ -948,7 +950,7 @@ export const DashboardView: React.FC = () => {
                 </select>
                 <button
                   type="button"
-                  onClick={() => {
+                  onClick={async () => {
                     const targetDateVal = recapDate || todayStr;
                     const detailRows = attendance
                       .filter((a) => a.date === targetDateVal && (selectedRecapSessionId === 'all' || a.session_id === selectedRecapSessionId))
@@ -968,7 +970,7 @@ export const DashboardView: React.FC = () => {
                           Metode: a.method,
                         };
                       });
-                    exportSessionRecapToExcel({
+                    await exportSessionRecapToExcel({
                       fileName: `Rekap_Per_Sesi_${targetDateVal}`,
                       targetDate: targetDateVal,
                       sessionSummaries: sessionRecap.sessionSummaries,
@@ -980,7 +982,48 @@ export const DashboardView: React.FC = () => {
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-semibold transition-colors shadow-xs"
                 >
                   <FileSpreadsheet className="w-3.5 h-3.5" />
-                  <span>Ekspor Excel Rekap Sesi</span>
+                  <span>Ekspor Excel Sesi</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const targetDateVal = recapDate || todayStr;
+                      const detailRows = attendance
+                        .filter((a) => a.date === targetDateVal && (selectedRecapSessionId === 'all' || a.session_id === selectedRecapSessionId))
+                        .map((a, idx) => {
+                          const st = students.find((x) => x.nis === a.student_id);
+                          const sess = sessions.find((x) => x.id === a.session_id);
+                          return {
+                            No: idx + 1,
+                            Tanggal: a.date,
+                            Jam_Scan: a.timestamp ? new Date(a.timestamp).toLocaleTimeString('id-ID') : '-',
+                            NIS: a.student_id,
+                            Nama_Siswa: st?.name || '-',
+                            Kelas: st?.class_id || '-',
+                            Sesi: sess?.name || a.session_id,
+                            Status: a.status,
+                            Terlambat_Menit: a.late_minutes || 0,
+                            Metode: a.method,
+                          };
+                        });
+                      await exportSessionRecapToPdf({
+                        fileName: `Rekap_Per_Sesi_${targetDateVal}`,
+                        targetDate: targetDateVal,
+                        schoolName: settings.school_name,
+                        sessionSummaries: sessionRecap.sessionSummaries,
+                        classSessionSummaries: displayedClassSessionRows,
+                        detailRows,
+                      });
+                      showToast('File PDF Rekap Per Sesi berhasil diunduh.', 'success');
+                    } catch {
+                      showToast('Gagal membuat file PDF. Coba lagi.', 'error');
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-rose-600 hover:bg-rose-700 text-white font-semibold transition-colors shadow-xs"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  <span>Ekspor PDF Sesi</span>
                 </button>
               </div>
             </div>
@@ -1558,10 +1601,10 @@ export const DashboardView: React.FC = () => {
                 Menampilkan <strong>{displayedInspectedStudents.length}</strong> dari <strong>{inspectedStudents.length}</strong> siswa kelas {selectedClassForInspection.name}
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => {
+                  onClick={async () => {
                     const exportData = inspectedStudents.map((item, idx) => ({
                       No: idx + 1,
                       NIS: item.student.nis,
@@ -1574,12 +1617,46 @@ export const DashboardView: React.FC = () => {
                       Metode_Scan: item.method,
                       Catatan: item.notes,
                     }));
-                    exportToExcel(exportData, `Rekap_Kehadiran_${selectedClassForInspection.name}_${todayStr}`);
+                    await exportToExcel(exportData, `Rekap_Kehadiran_${selectedClassForInspection.name}_${todayStr}`);
+                    showToast('File Excel kehadiran kelas berhasil diunduh.', 'success');
                   }}
                   className="px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-medium hover:bg-slate-100 dark:hover:bg-slate-700 inline-flex items-center gap-1.5"
                 >
-                  <Download className="w-3.5 h-3.5" />
+                  <Download className="w-3.5 h-3.5 text-emerald-600" />
                   Ekspor Excel (.xlsx)
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const exportData = inspectedStudents.map((item, idx) => ({
+                        No: idx + 1,
+                        NIS: item.student.nis,
+                        Nama: item.student.name,
+                        Kelas: selectedClassForInspection.name,
+                        JK: item.student.gender || 'L',
+                        Status: item.status,
+                        Waktu: item.checkInTime,
+                        Telat_Mnt: item.lateMinutes,
+                        Metode: item.method,
+                        Catatan: item.notes,
+                      }));
+                      await exportToPdf({
+                        data: exportData,
+                        fileName: `Rekap_Kehadiran_${selectedClassForInspection.name}_${todayStr}`,
+                        title: `Rekap Kehadiran Siswa — Kelas ${selectedClassForInspection.name}`,
+                        subtitle: `Tanggal: ${todayStr}`,
+                        schoolName: settings.school_name,
+                      });
+                      showToast('File PDF kehadiran kelas berhasil diunduh.', 'success');
+                    } catch {
+                      showToast('Gagal membuat file PDF. Coba lagi.', 'error');
+                    }
+                  }}
+                  className="px-3 py-1.5 rounded border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 font-semibold hover:bg-rose-100 dark:hover:bg-rose-900/50 inline-flex items-center gap-1.5"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  Ekspor PDF (.pdf)
                 </button>
                 <button
                   type="button"

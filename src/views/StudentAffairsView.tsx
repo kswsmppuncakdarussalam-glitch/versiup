@@ -19,6 +19,12 @@ const StudentAffairsComparisonChart = React.lazy(
 import { useApp } from '../context/AppContext.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { exportToExcel, exportSessionRecapToExcel } from '../utils/excel.js';
+import {
+  exportToPdf,
+  exportSessionRecapToPdf,
+  exportOfficialSchoolReportPdf,
+  exportWarningLetterPdf,
+} from '../utils/pdf.js';
 import { buildSessionRecapData } from '../utils/sessionHelper.js';
 import { DriveImage } from '../components/common/DriveImage.js';
 import { Student } from '../types/index.js';
@@ -141,7 +147,7 @@ export const StudentAffairsView: React.FC = () => {
     });
   }, [classes, attendance, violations, students]);
 
-  const handleExportFullExcel = () => {
+  const handleExportFullExcel = async () => {
     const data = students.map((s) => {
       const sAtt = attendance.filter((a) => a.student_id === s.nis);
       const sVio = violations.filter((v) => v.student_id === s.nis && v.category !== 'prestasi');
@@ -160,8 +166,77 @@ export const StudentAffairsView: React.FC = () => {
         EmailOrangTua: s.parent_email || '-',
       };
     });
-    exportToExcel(data, `laporan_kesiswaan_seluruh_sekolah_${new Date().toISOString().split('T')[0]}`);
+    await exportToExcel(data, `laporan_kesiswaan_seluruh_sekolah_${new Date().toISOString().split('T')[0]}`);
     showToast('Laporan kesiswaan berhasil diekspor ke Excel.', 'success');
+  };
+
+  const handleExportFullPdf = async () => {
+    try {
+      if (activeTab === 'official_report') {
+        const recap = buildSessionRecapData({
+          sessions,
+          classes,
+          students,
+          attendance,
+          targetDate: recapDate,
+        });
+        await exportOfficialSchoolReportPdf({
+          schoolName: settings.school_name,
+          recapDate,
+          classRows: classes.map((cls, idx) => {
+            const sCount = students.filter((s) => s.class_id === cls.id).length;
+            const cAtt = attendance.filter((a) => {
+              const std = students.find((x) => x.nis === a.student_id);
+              return std?.class_id === cls.id;
+            });
+            const cVio = violations.filter((v) => v.class_id === cls.id && v.category !== 'prestasi');
+            const pts = cVio.reduce((acc, curr) => acc + curr.points, 0);
+            return {
+              no: idx + 1,
+              className: cls.name,
+              totalStudents: sCount,
+              hadir: cAtt.filter((a) => a.status === 'Hadir').length,
+              terlambat: cAtt.filter((a) => a.status === 'Terlambat').length,
+              alpha: cAtt.filter((a) => a.status === 'Alpha').length,
+              violationPoints: pts,
+            };
+          }),
+          sessionRows: recap.sessionSummaries,
+        });
+        showToast('Laporan resmi kesiswaan berhasil diunduh sebagai PDF.', 'success');
+        return;
+      }
+
+      const data = filteredStudents.map((s, idx) => {
+        const sAtt = attendance.filter((a) => a.student_id === s.nis);
+        const sVio = violations.filter((v) => v.student_id === s.nis && v.category !== 'prestasi');
+        const pts = sVio.reduce((acc, curr) => acc + curr.points, 0);
+
+        return {
+          No: idx + 1,
+          NIS: s.nis,
+          Nama: s.name,
+          Kelas: s.class_id,
+          JK: s.gender,
+          Hadir: sAtt.filter((a) => a.status === 'Hadir').length,
+          Terlambat: sAtt.filter((a) => a.status === 'Terlambat').length,
+          Alpha: sAtt.filter((a) => a.status === 'Alpha').length,
+          Poin_Pelanggaran: pts,
+          Orang_Tua: s.parent_name || '-',
+        };
+      });
+      await exportToPdf({
+        data,
+        fileName: `laporan_kesiswaan_seluruh_sekolah_${new Date().toISOString().split('T')[0]}`,
+        title: 'Laporan Kesiswaan & Kedisiplinan Seluruh Sekolah',
+        subtitle: filterClass === 'all' ? 'Cakupan: Semua Kelas' : `Filter Kelas: ${filterClass}`,
+        schoolName: settings.school_name,
+        orientation: 'landscape',
+      });
+      showToast('Laporan kesiswaan berhasil diunduh sebagai PDF.', 'success');
+    } catch {
+      showToast('Gagal mengunduh file PDF. Coba lagi.', 'error');
+    }
   };
 
   return (
@@ -183,20 +258,27 @@ export const StudentAffairsView: React.FC = () => {
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               onClick={handleExportFullExcel}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-300"
             >
               <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
-              <span>Ekspor Rekap</span>
+              <span>Ekspor Excel</span>
+            </button>
+            <button
+              onClick={handleExportFullPdf}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/50 text-xs font-semibold text-rose-700 dark:text-rose-300"
+            >
+              <FileText className="w-3.5 h-3.5" />
+              <span>Unduh PDF</span>
             </button>
             <button
               onClick={() => window.print()}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-300"
+              className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-300"
             >
               <Printer className="w-3.5 h-3.5" />
-              <span>Cetak Laporan</span>
+              <span>Cetak</span>
             </button>
             <button
               type="button"
@@ -280,8 +362,8 @@ export const StudentAffairsView: React.FC = () => {
                 </select>
                 <button
                   type="button"
-                  onClick={() => {
-                    exportSessionRecapToExcel({
+                  onClick={async () => {
+                    await exportSessionRecapToExcel({
                       fileName: `Rekap_Kesiswaan_Per_Sesi_${recapDate}`,
                       targetDate: recapDate,
                       sessionSummaries: recap.sessionSummaries,
@@ -293,6 +375,28 @@ export const StudentAffairsView: React.FC = () => {
                 >
                   <FileSpreadsheet className="w-3.5 h-3.5" />
                   <span>Ekspor Excel Per Sesi</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await exportSessionRecapToPdf({
+                        fileName: `Rekap_Kesiswaan_Per_Sesi_${recapDate}`,
+                        targetDate: recapDate,
+                        schoolName: settings.school_name,
+                        title: 'Rekapitulasi Kehadiran Seluruh Sekolah Per Sesi',
+                        sessionSummaries: recap.sessionSummaries,
+                        classSessionSummaries: classRows,
+                      });
+                      showToast('Rekap per sesi sekolah berhasil diunduh sebagai PDF.', 'success');
+                    } catch {
+                      showToast('Gagal mengunduh file PDF. Coba lagi.', 'error');
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-rose-600 hover:bg-rose-700 text-white font-semibold"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  <span>Ekspor PDF Per Sesi</span>
                 </button>
               </div>
             </div>
@@ -699,6 +803,25 @@ export const StudentAffairsView: React.FC = () => {
               <p className="font-bold underline">(.......................................)</p>
             </div>
           </div>
+
+          <div className="pt-4 border-t border-slate-200 flex flex-wrap justify-end gap-2 print:hidden">
+            <button
+              type="button"
+              onClick={handleExportFullExcel}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 font-semibold text-xs"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Ekspor Excel</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleExportFullPdf}
+              className="inline-flex items-center gap-1.5 px-4 py-2 rounded bg-rose-600 hover:bg-rose-700 text-white font-semibold text-xs shadow-xs"
+            >
+              <FileText className="w-3.5 h-3.5" />
+              <span>Unduh Laporan Resmi (PDF)</span>
+            </button>
+          </div>
         </div>
       )}
 
@@ -751,7 +874,7 @@ export const StudentAffairsView: React.FC = () => {
               </div>
             </div>
 
-            <div className="mt-6 pt-3 border-t border-slate-200 flex justify-end gap-2">
+            <div className="mt-6 pt-3 border-t border-slate-200 flex flex-wrap justify-end gap-2">
               <button
                 type="button"
                 onClick={() => setSelectedStudentForLetter(null)}
@@ -761,11 +884,33 @@ export const StudentAffairsView: React.FC = () => {
               </button>
               <button
                 type="button"
+                onClick={async () => {
+                  try {
+                    await exportWarningLetterPdf({
+                      schoolName: settings.school_name,
+                      spLevel: spLetterType,
+                      studentName: selectedStudentForLetter.name,
+                      nis: selectedStudentForLetter.nis,
+                      classId: selectedStudentForLetter.class_id,
+                      parentName: selectedStudentForLetter.parent_name,
+                    });
+                    showToast(`Surat ${spLetterType} berhasil diunduh sebagai PDF.`, 'success');
+                  } catch {
+                    showToast('Gagal mengunduh surat PDF. Coba lagi.', 'error');
+                  }
+                }}
+                className="flex items-center gap-1.5 px-4 py-1.5 rounded bg-rose-600 hover:bg-rose-700 text-white font-semibold text-xs"
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span>Unduh Surat (PDF)</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => window.print()}
                 className="flex items-center gap-1.5 px-4 py-1.5 rounded bg-slate-900 text-white font-semibold text-xs"
               >
                 <Printer className="w-3.5 h-3.5" />
-                <span>Cetak Surat Ini</span>
+                <span>Cetak</span>
               </button>
             </div>
           </div>

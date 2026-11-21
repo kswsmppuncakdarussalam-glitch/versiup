@@ -5,6 +5,7 @@ import {
   Calendar,
   Award,
   FileSpreadsheet,
+  FileText,
   Printer,
   Check,
   X,
@@ -20,6 +21,7 @@ const HomeroomTrendChart = React.lazy(
 import { useApp } from '../context/AppContext.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { exportToExcel, exportSessionRecapToExcel } from '../utils/excel.js';
+import { exportToPdf, exportSessionRecapToPdf } from '../utils/pdf.js';
 import { buildSessionRecapData } from '../utils/sessionHelper.js';
 import { Student, LeaveRequest } from '../types/index.js';
 
@@ -150,7 +152,7 @@ export const HomeroomView: React.FC = () => {
     });
   }, [classStudents, classAttendance, classOutOfClass, classViolations, settings]);
 
-  const handleExportExcel = () => {
+  const handleExportExcel = async () => {
     const data = studentRecapData.map((row) => ({
       NIS: row.student.nis,
       Nama: row.student.name,
@@ -166,8 +168,38 @@ export const HomeroomView: React.FC = () => {
       'Menit Telat Kembali': row.lateRetMins,
       'Skor Disiplin': row.score,
     }));
-    exportToExcel(data, `rekap_kelas_${classId}_${new Date().toISOString().split('T')[0]}`);
+    await exportToExcel(data, `rekap_kelas_${classId}_${new Date().toISOString().split('T')[0]}`);
     showToast('Rekap kelas berhasil diekspor ke Excel.', 'success');
+  };
+
+  const handleExportPdf = async () => {
+    try {
+      const data = studentRecapData.map((row, idx) => ({
+        No: idx + 1,
+        NIS: row.student.nis,
+        Nama: row.student.name,
+        Hadir: row.hadir,
+        Telat: row.terlambat,
+        Mnt_Telat: row.totalLateMins,
+        Izin: row.izin,
+        Sakit: row.sakit,
+        Alpha: row.alpha,
+        Poin_Pelanggaran: row.penaltyPts,
+        Poin_Prestasi: row.achievementPts,
+        Skor: row.score,
+      }));
+      await exportToPdf({
+        data,
+        fileName: `rekap_kelas_${classId}_${new Date().toISOString().split('T')[0]}`,
+        title: `Rekapitulasi Kedisiplinan & Presensi — Kelas ${currentClass?.name || classId}`,
+        subtitle: `Wali Kelas: ${session?.name || currentClass?.homeroom_teacher_name || '-'}`,
+        schoolName: settings.school_name,
+        orientation: 'landscape',
+      });
+      showToast('Rekap kelas berhasil diunduh sebagai PDF.', 'success');
+    } catch {
+      showToast('Gagal mengunduh file PDF. Coba lagi.', 'error');
+    }
   };
 
   return (
@@ -214,11 +246,18 @@ export const HomeroomView: React.FC = () => {
               <span>Ekspor Excel</span>
             </button>
             <button
+              onClick={handleExportPdf}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/50 text-xs font-semibold text-rose-700 dark:text-rose-300"
+            >
+              <FileText className="w-3.5 h-3.5" />
+              <span>Unduh PDF</span>
+            </button>
+            <button
               onClick={() => window.print()}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-300"
+              className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-300"
             >
               <Printer className="w-3.5 h-3.5" />
-              <span>Cetak PDF</span>
+              <span>Cetak</span>
             </button>
             <button
               type="button"
@@ -310,7 +349,7 @@ export const HomeroomView: React.FC = () => {
                   Rekapitulasi Presensi Per Sesi — Kelas {currentClass?.name || classId}
                 </h2>
                 <p className="text-xs text-slate-500">
-                  Pantau kehadiran per sesi (Masuk Pagi, Salat Dhuha, Zuhur, Pulang, dll.) atau ekspor ke Excel.
+                  Pantau kehadiran per sesi (Masuk Pagi, Salat Dhuha, Zuhur, Pulang, dll.) atau ekspor ke Excel &amp; PDF.
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2 text-xs">
@@ -334,7 +373,7 @@ export const HomeroomView: React.FC = () => {
                 </select>
                 <button
                   type="button"
-                  onClick={() => {
+                  onClick={async () => {
                     const detailRows = classStudents.map((st, idx) => {
                       const rec = filteredRecs.find((a) => a.student_id === st.nis);
                       const sess = sessions.find((s) => s.id === (rec?.session_id || targetSessId));
@@ -350,7 +389,7 @@ export const HomeroomView: React.FC = () => {
                         Terlambat_Menit: rec?.late_minutes || 0,
                       };
                     });
-                    exportSessionRecapToExcel({
+                    await exportSessionRecapToExcel({
                       fileName: `Rekap_Sesi_${currentClass?.name || classId}_${selectedDate}`,
                       targetDate: selectedDate,
                       sessionSummaries: recap.sessionSummaries,
@@ -363,6 +402,44 @@ export const HomeroomView: React.FC = () => {
                 >
                   <FileSpreadsheet className="w-3.5 h-3.5" />
                   <span>Ekspor Excel Sesi</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const detailRows = classStudents.map((st, idx) => {
+                        const rec = filteredRecs.find((a) => a.student_id === st.nis);
+                        const sess = sessions.find((s) => s.id === (rec?.session_id || targetSessId));
+                        return {
+                          No: idx + 1,
+                          Tanggal: selectedDate,
+                          NIS: st.nis,
+                          Nama: st.name,
+                          Kelas: currentClass?.name || classId,
+                          Sesi: sess?.name || '-',
+                          Status: rec?.status || 'Belum Presensi',
+                          Jam_Scan: rec?.timestamp ? new Date(rec.timestamp).toLocaleTimeString('id-ID') : '-',
+                          Telat_Mnt: rec?.late_minutes || 0,
+                        };
+                      });
+                      await exportSessionRecapToPdf({
+                        fileName: `Rekap_Sesi_${currentClass?.name || classId}_${selectedDate}`,
+                        targetDate: selectedDate,
+                        schoolName: settings.school_name,
+                        title: `Rekapitulasi Presensi Per Sesi — Kelas ${currentClass?.name || classId}`,
+                        sessionSummaries: recap.sessionSummaries,
+                        classSessionSummaries: recap.classSessionSummaries,
+                        detailRows,
+                      });
+                      showToast('Rekap per sesi kelas berhasil diunduh sebagai PDF.', 'success');
+                    } catch {
+                      showToast('Gagal mengunduh file PDF. Coba lagi.', 'error');
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-rose-600 hover:bg-rose-700 text-white font-semibold"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  <span>Ekspor PDF Sesi</span>
                 </button>
               </div>
             </div>

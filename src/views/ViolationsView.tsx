@@ -6,6 +6,7 @@ import {
   Award,
   Filter,
   FileSpreadsheet,
+  FileText,
   Printer,
   Trash2,
   CheckCircle,
@@ -17,6 +18,7 @@ import { useApp } from '../context/AppContext.js';
 import { CameraCaptureModal } from '../components/modals/CameraCaptureModal.js';
 import { StudentProfileModal } from '../components/modals/StudentProfileModal.js';
 import { exportToExcel } from '../utils/excel.js';
+import { exportToPdf } from '../utils/pdf.js';
 import { DriveImage } from '../components/common/DriveImage.js';
 import { Student, ViolationType, ViolationRecord } from '../types/index.js';
 
@@ -144,7 +146,7 @@ export const ViolationsView: React.FC = () => {
     return true;
   });
 
-  const handleExportExcel = () => {
+  const handleExportExcel = async () => {
     const data = filteredViolations.map((v) => {
       const student = students.find((s) => s.nis === v.student_id);
       return {
@@ -161,8 +163,39 @@ export const ViolationsView: React.FC = () => {
         'Pencatat': v.recorded_by,
       };
     });
-    exportToExcel(data, `rekap_pelanggaran_${new Date().toISOString().split('T')[0]}`);
+    await exportToExcel(data, `rekap_pelanggaran_${new Date().toISOString().split('T')[0]}`);
     showToast('Rekap pelanggaran berhasil diekspor ke Excel.', 'success');
+  };
+
+  const handleExportPdf = async () => {
+    try {
+      const data = filteredViolations.map((v, idx) => {
+        const student = students.find((s) => s.nis === v.student_id);
+        return {
+          No: idx + 1,
+          Tanggal: new Date(v.recorded_at).toLocaleDateString('id-ID'),
+          NIS: v.student_id,
+          Nama_Siswa: student?.name || '-',
+          Kelas: v.class_id,
+          Kategori: v.category,
+          Jenis_Pelanggaran: v.type_name,
+          Poin: v.points,
+          Lokasi: v.location || '-',
+          Catatan: v.notes || '-',
+        };
+      });
+      await exportToPdf({
+        data,
+        fileName: `rekap_pelanggaran_${new Date().toISOString().split('T')[0]}`,
+        title: 'Rekapitulasi Pelanggaran & Prestasi Siswa',
+        subtitle: `Filter Kelas: ${filterClass === 'all' ? 'Semua' : filterClass} • Kategori: ${filterCategory === 'all' ? 'Semua' : filterCategory}`,
+        schoolName: settings.school_name,
+        orientation: 'landscape',
+      });
+      showToast('Rekap pelanggaran berhasil diunduh sebagai PDF.', 'success');
+    } catch {
+      showToast('Gagal mengunduh file PDF. Coba lagi.', 'error');
+    }
   };
 
   const handlePrint = () => {
@@ -530,7 +563,7 @@ export const ViolationsView: React.FC = () => {
               />
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={handleExportExcel}
@@ -541,11 +574,19 @@ export const ViolationsView: React.FC = () => {
               </button>
               <button
                 type="button"
+                onClick={handleExportPdf}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/50 text-rose-700 dark:text-rose-300 font-semibold"
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span>Unduh PDF</span>
+              </button>
+              <button
+                type="button"
                 onClick={handlePrint}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300"
+                className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300"
               >
                 <Printer className="w-3.5 h-3.5" />
-                <span>Cetak PDF</span>
+                <span>Cetak</span>
               </button>
             </div>
           </div>

@@ -12,6 +12,7 @@ import {
   RefreshCw,
   FlaskConical,
   FileSpreadsheet,
+  FileText,
   Download,
   Upload,
   Plus,
@@ -51,6 +52,7 @@ import {
   exportToExcel,
   StudentImportRow,
 } from '../utils/excel.js';
+import { exportToPdf } from '../utils/pdf.js';
 import { uploadPhotoToBackend } from '../utils/photo.js';
 import { DriveImage } from '../components/common/DriveImage.js';
 import { apiFetch } from '../utils/apiClient.js';
@@ -869,11 +871,47 @@ export const AdminView: React.FC = () => {
               {/* Ekspor Excel */}
               <button
                 type="button"
-                onClick={() => exportToExcel(students, `data_siswa_${Date.now()}`)}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-300"
+                onClick={async () => {
+                  await exportToExcel(students, `data_siswa_${Date.now()}`);
+                  showToast('Data siswa berhasil diekspor ke Excel.', 'success');
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300"
               >
                 <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
                 <span>Ekspor Excel</span>
+              </button>
+
+              {/* Ekspor PDF */}
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const pdfRows = students.map((s, idx) => ({
+                      No: idx + 1,
+                      NIS: s.nis,
+                      Nama: s.name,
+                      Kelas: s.class_id,
+                      JK: s.gender || 'L',
+                      UID_RFID: s.rfid_uid || '-',
+                      Orang_Tua: s.parent_name || '-',
+                      Email_Ortu: s.parent_email || '-',
+                    }));
+                    await exportToPdf({
+                      data: pdfRows,
+                      fileName: `data_siswa_${new Date().toISOString().split('T')[0]}`,
+                      title: 'Daftar Basis Data Siswa Terdaftar',
+                      schoolName: settings.school_name,
+                      orientation: 'landscape',
+                    });
+                    showToast('Data siswa berhasil diunduh sebagai PDF.', 'success');
+                  } catch {
+                    showToast('Gagal mengunduh PDF data siswa. Coba lagi.', 'error');
+                  }
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/50 text-rose-700 dark:text-rose-300 font-semibold"
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span>Ekspor PDF</span>
               </button>
 
               {/* Tambah Manual */}
