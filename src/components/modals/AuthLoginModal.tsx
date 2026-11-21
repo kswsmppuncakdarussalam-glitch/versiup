@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext.js';
 import { DriveImage } from '../common/DriveImage.js';
+import { ParentAttendanceCheckPanel } from '../auth/ParentAttendanceCheckPanel.js';
 
 export const DutyLoginScreen: React.FC = () => {
   const {
@@ -83,8 +84,8 @@ export const DutyLoginScreen: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen min-h-[100dvh] flex items-center justify-center bg-slate-50 dark:bg-slate-950 p-4">
-      <div className="w-full max-w-md bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 shadow-md">
+    <div className="min-h-screen min-h-[100dvh] flex items-center justify-center bg-slate-50 dark:bg-slate-950 p-4 py-6">
+      <div className="w-full max-w-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 shadow-md">
         {/* Brand / Logo */}
         <div className="text-center mb-5">
           {settings.logo_url ? (
@@ -253,6 +254,11 @@ export const DutyLoginScreen: React.FC = () => {
               {loading ? 'Memeriksa kredensial...' : 'Masuk ke Aplikasi'}
             </button>
           </form>
+
+          {/* Kolom Cek Presensi Wali Murid tepat di bawah form username & password */}
+          <div className="mt-6 pt-5 border-t border-slate-200 dark:border-slate-800">
+            <ParentAttendanceCheckPanel />
+          </div>
         </>
 
         <div className="mt-6 pt-4 border-t border-slate-100 dark:border-slate-800 text-center">
