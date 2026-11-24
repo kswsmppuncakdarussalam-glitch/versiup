@@ -3336,6 +3336,7 @@ function autoCloseOverdueOutOfClass_(ss) {
 }
 
 function startOutOfClass_(ss, record, actorName, dbOpt) {
+  var normClassId = function (v) { return String(v || '').trim().toLowerCase(); };
   var outList = (dbOpt && dbOpt.out_of_class) || activeOnly_(readTabWithRowNumbers_(ss, SHEET_TABS.IZIN_KELUAR)).map(function (r) {
     return {
       student_id: r.student_id,
@@ -3353,9 +3354,12 @@ function startOutOfClass_(ss, record, actorName, dbOpt) {
     return { success: false, error: 'Siswa ini sedang memiliki izin keluar yang masih aktif.' };
   }
 
-  var cls = classesList.filter(function (c) { return c.id === record.class_id; })[0];
-  var maxPerClass = (cls && cls.quota_limit) || appSettings.out_of_class_max_per_class || 2;
-  var classActiveCount = active.filter(function (r) { return r.class_id === record.class_id; }).length;
+  var targetClassNorm = normClassId(record.class_id);
+  var cls = classesList.filter(function (c) {
+    return normClassId(c.id) === targetClassNorm || normClassId(c.name) === targetClassNorm;
+  })[0];
+  var maxPerClass = Math.max(1, Number((cls && cls.quota_limit) || appSettings.out_of_class_max_per_class || 2));
+  var classActiveCount = active.filter(function (r) { return normClassId(r.class_id) === targetClassNorm; }).length;
   if (classActiveCount >= maxPerClass) {
     return { success: false, error: 'Kuota izin keluar untuk kelas ' + record.class_id + ' penuh (' + classActiveCount + '/' + maxPerClass + ' siswa sedang di luar).' };
   }
@@ -3372,6 +3376,10 @@ function startOutOfClass_(ss, record, actorName, dbOpt) {
   }
 
   var nowIso = new Date().toISOString();
+  record.created_at = nowIso;
+  record.updated_at = nowIso;
+  record.diubah_pada = nowIso;
+
   appendRows_(ss, SHEET_TABS.IZIN_KELUAR, [{
     id: record.id,
     student_id: record.student_id,
@@ -4456,7 +4464,7 @@ function dispatchRoute_(req) {
               diubah_pada: nowRetIso,
             },
             expectedUpdatedAt: body.expected_updated_at,
-            forceOverwrite: Boolean(body.forceOverwrite),
+            forceOverwrite: true,
             actorName: actorOocPut,
             reason: body.auditReason || 'Konfirmasi kembali ke kelas',
             skipBump: true,

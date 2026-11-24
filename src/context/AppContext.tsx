@@ -3010,15 +3010,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: false, error: 'Siswa tidak ditemukan.' };
     }
 
+    const normClassId = (v?: string) => String(v || '').trim().toLowerCase();
+    const targetClassNorm = normClassId(targetStudent.class_id);
+
     const activeList = outOfClass.filter((r) => r.status === 'active' || r.status === 'overdue');
     if (activeList.some((r) => r.student_id === studentId)) {
       soundEffects.playErrorBeep();
       return { success: false, error: 'Siswa ini sedang memiliki izin keluar yang masih aktif.' };
     }
 
-    const cls = classes.find((c) => c.id === targetStudent.class_id);
-    const maxPerClass = (cls && cls.quota_limit) || settings.out_of_class_max_per_class || 2;
-    const classActiveCount = activeList.filter((r) => r.class_id === targetStudent.class_id).length;
+    const cls = classes.find(
+      (c) => normClassId(c.id) === targetClassNorm || normClassId(c.name) === targetClassNorm
+    );
+    const maxPerClass = Math.max(1, Number((cls && cls.quota_limit) || settings.out_of_class_max_per_class || 2));
+    const classActiveCount = activeList.filter((r) => normClassId(r.class_id) === targetClassNorm).length;
     if (classActiveCount >= maxPerClass) {
       soundEffects.playErrorBeep();
       return {
@@ -3028,10 +3033,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     const now = getServerNow();
-    const todayStr = now.toISOString().split('T')[0];
+    const toLocalYmd = (d: Date) =>
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const todayLocal = toLocalYmd(now);
     const dailyCount = outOfClass.filter((r) => {
       if (r.student_id !== studentId) return false;
-      return String(r.started_at || '').startsWith(todayStr);
+      if (!r.started_at) return false;
+      const parsed = new Date(r.started_at);
+      if (!Number.isNaN(parsed.getTime())) {
+        return toLocalYmd(parsed) === todayLocal;
+      }
+      return String(r.started_at).startsWith(todayLocal);
     }).length;
     const maxDaily = settings.out_of_class_max_per_student_daily || 3;
     if (dailyCount >= maxDaily) {
@@ -3071,9 +3083,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         idempotencyKey: optimisticRecord.idempotency_key,
       },
       applyOptimistic: () => {
-        const snapshot = outOfClass;
         setOutOfClass((prev) => [optimisticRecord, ...prev]);
-        return () => setOutOfClass(snapshot);
+        return () => setOutOfClass((prev) => prev.filter((o) => o.id !== optimisticRecord.id));
       },
       onOptimisticBroadcast: () => {
         broadcastSyncEvent('DATA_OPTIMISTIC_OUT_OF_CLASS', { record: optimisticRecord });
@@ -3099,6 +3110,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     notes?: string,
     auditReason?: string
   ) => {
+    if (id.startsWith('opt_')) {
+      return {
+        success: false,
+        error: 'Data izin masih dalam proses sinkronisasi ke server, silakan klik ulang sesaat lagi.',
+      };
+    }
+
     const existing = outOfClass.find((o) => o.id === id);
     const nowRet = getServerNow();
     const nowRetIso = nowRet.toISOString();
@@ -3136,11 +3154,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       conflictTitle: 'Konflik Konfirmasi Kepulangan',
       applyOptimistic: existing
         ? () => {
-            const snapshot = outOfClass;
+            const previousRecord = existing;
             setOutOfClass((prev) =>
               prev.map((o) => (o.id === id && optimisticUpdatedRecord ? optimisticUpdatedRecord : o))
             );
-            return () => setOutOfClass(snapshot);
+            return () =>
+              setOutOfClass((prev) => prev.map((o) => (o.id === id ? previousRecord : o)));
           }
         : undefined,
       optimisticData: { record: optimisticUpdatedRecord },
